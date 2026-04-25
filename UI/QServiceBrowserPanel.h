@@ -58,6 +58,8 @@ public:
 	QTreeWidget* GetTreeWidget() const;
 	QTextEdit* GetDetailsTextEdit() const;
 
+	bool HasArcGISRestConnectionDisplayName(const QString& displayName, const QString& ignoredUid = QString()) const;
+
 	void ClearArcGISRestServices();
 	void SetArcGISRestRootChildren(const std::vector<ArcGISRestServiceTreeNode>& nodes);
 	bool AddArcGISRestServiceNode(const ArcGISRestServiceTreeNode& node, bool recursive = true);
@@ -106,6 +108,8 @@ private:
 	bool UpdateArcGISRestServiceNodeInternal(const ArcGISRestServiceTreeNode& node, bool recursive);
 
 	QTreeWidgetItem* FindItemByUid(const QString& uid) const;
+	QString GetCurrentSelectableNodeUid() const;
+	void RestoreCurrentSelectableNodeByUid(const QString& uid, const QString& fallbackUid = QString());
 	void RegisterItemRecursively(QTreeWidgetItem* item);
 	void UnregisterItemRecursively(QTreeWidgetItem* item);
 	void RemoveChildrenAndUnregister(QTreeWidgetItem* item);

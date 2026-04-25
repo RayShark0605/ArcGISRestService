@@ -13,6 +13,7 @@
 #include <QHash>
 #include <QAbstractItemView>
 #include <QHeaderView>
+#include <QItemSelectionModel>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMenu>
@@ -549,7 +550,9 @@ private:
 				return;
 			}
 
+			const QString currentUidBeforeUpdate = panel->GetCurrentSelectableNodeUid();
 			const QString loadedUid = ToQString(result.loadedNode.uid);
+			const QString fallbackUid = (currentUidBeforeUpdate == result.sourceUid) ? loadedUid : QString();
 			bool updateSucceeded = false;
 			if (loadedUid == result.sourceUid)
 			{
@@ -570,7 +573,7 @@ private:
 
 			panel->MoveArcGISRestConnectionSettings(result.sourceUid, loadedUid);
 			panel->SetArcGISRestConnectionSettings(loadedUid, result.settings);
-			panel->SelectNode(loadedUid);
+			panel->RestoreCurrentSelectableNodeByUid(currentUidBeforeUpdate, fallbackUid);
 			if (!result.loadedNode.children.empty())
 			{
 				panel->ExpandNodeByUid(loadedUid);
@@ -691,6 +694,7 @@ private:
 				return;
 			}
 
+			const QString currentUidBeforeUpdate = panel->GetCurrentSelectableNodeUid();
 			if (!panel->UpdateArcGISRestServiceNode(result.expandedNode, true))
 			{
 				panel->RestoreArcGISRestNodeLazyExpansionState(result.sourceNode, QStringLiteral("状态：展开成功，但更新服务浏览树失败。"));
@@ -699,7 +703,7 @@ private:
 			}
 
 			const QString expandedUid = ToQString(result.expandedNode.uid);
-			panel->SelectNode(expandedUid);
+			panel->RestoreCurrentSelectableNodeByUid(currentUidBeforeUpdate);
 			if (!result.expandedNode.children.empty())
 			{
 				panel->ExpandNodeByUid(expandedUid);
@@ -802,6 +806,39 @@ QTreeWidget* QServiceBrowserPanel::GetTreeWidget() const
 QTextEdit* QServiceBrowserPanel::GetDetailsTextEdit() const
 {
 	return detailsTextEdit;
+}
+
+bool QServiceBrowserPanel::HasArcGISRestConnectionDisplayName(const QString& displayName, const QString& ignoredUid) const
+{
+	const QString normalizedDisplayName = displayName.trimmed();
+	if (normalizedDisplayName.isEmpty() || !arcGISRestCategoryItem)
+	{
+		return false;
+	}
+
+	const QString normalizedIgnoredUid = ignoredUid.trimmed();
+	for (int childIndex = 0; childIndex < arcGISRestCategoryItem->childCount(); childIndex++)
+	{
+		const QTreeWidgetItem* childItem = arcGISRestCategoryItem->child(childIndex);
+		if (!childItem || !IsArcGISRestConnectionRootItem(childItem))
+		{
+			continue;
+		}
+
+		const QString childUid = childItem->data(0, RoleUid).toString().trimmed();
+		if (!normalizedIgnoredUid.isEmpty() && childUid == normalizedIgnoredUid)
+		{
+			continue;
+		}
+
+		const QString childDisplayName = childItem->data(0, RoleText).toString().trimmed();
+		if (QString::compare(childDisplayName, normalizedDisplayName, Qt::CaseInsensitive) == 0)
+		{
+			return true;
+		}
+	}
+
+	return false;
 }
 
 void QServiceBrowserPanel::ClearArcGISRestServices()
@@ -1131,6 +1168,10 @@ void QServiceBrowserPanel::OnCustomContextMenuRequested(const QPoint& position)
 void QServiceBrowserPanel::OnNewArcGISRestConnectionRequested()
 {
 	QArcGISRestConnectionDialog dialog(this);
+	dialog.SetConnectionNameExistsChecker([this](const QString& connectionName) -> bool
+		{
+			return HasArcGISRestConnectionDisplayName(connectionName);
+		});
 	if (dialog.exec() != QDialog::Accepted)
 	{
 		return;
@@ -1378,6 +1419,54 @@ QTreeWidgetItem* QServiceBrowserPanel::FindItemByUid(const QString& uid) const
 	}
 
 	return itemByUid.value(uid, nullptr);
+}
+
+QString QServiceBrowserPanel::GetCurrentSelectableNodeUid() const
+{
+	if (!treeWidget)
+	{
+		return QString();
+	}
+
+	QTreeWidgetItem* currentItem = treeWidget->currentItem();
+	if (!currentItem || IsPlaceholderItem(currentItem))
+	{
+		return QString();
+	}
+
+	return currentItem->data(0, RoleUid).toString();
+}
+
+void QServiceBrowserPanel::RestoreCurrentSelectableNodeByUid(const QString& uid, const QString& fallbackUid)
+{
+	if (!treeWidget)
+	{
+		return;
+	}
+
+	QTreeWidgetItem* targetItem = nullptr;
+	if (!uid.isEmpty())
+	{
+		targetItem = FindItemByUid(uid);
+	}
+
+	if ((!targetItem || IsPlaceholderItem(targetItem)) && !fallbackUid.isEmpty())
+	{
+		targetItem = FindItemByUid(fallbackUid);
+	}
+
+	if (!targetItem || IsPlaceholderItem(targetItem))
+	{
+		UpdateDetailsForItem(treeWidget->currentItem());
+		return;
+	}
+
+	if (treeWidget->currentItem() != targetItem)
+	{
+		treeWidget->setCurrentItem(targetItem, 0, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Current);
+	}
+
+	UpdateDetailsForItem(targetItem);
 }
 
 void QServiceBrowserPanel::RegisterItemRecursively(QTreeWidgetItem* item)
@@ -2128,9 +2217,15 @@ void QServiceBrowserPanel::EditArcGISRestConnection(QTreeWidgetItem* item)
 
 	oldSettings.displayName = ToStdString(item->data(0, RoleText).toString());
 
+	const QString sourceUid = item->data(0, RoleUid).toString();
+
 	QArcGISRestConnectionDialog dialog(this);
 	dialog.setWindowTitle(QStringLiteral("编辑 ArcGIS REST Server 连接"));
 	dialog.SetSettings(oldSettings);
+	dialog.SetConnectionNameExistsChecker([this, sourceUid](const QString& connectionName) -> bool
+		{
+			return HasArcGISRestConnectionDisplayName(connectionName, sourceUid);
+		});
 	if (dialog.exec() != QDialog::Accepted)
 	{
 		return;
@@ -2155,7 +2250,6 @@ void QServiceBrowserPanel::EditArcGISRestConnection(QTreeWidgetItem* item)
 		return;
 	}
 
-	const QString sourceUid = item->data(0, RoleUid).toString();
 	ArcGISRestServiceTreeNode connectionNode = CreateArcGISRestConnectionNodeFromSettings(newSettings, serviceBaseUrl);
 	connectionNode.uid = ToStdString(sourceUid);
 	connectionNode.parentUid = ToStdString(GetArcGISRestCategoryUid());

@@ -3,6 +3,8 @@
 
 #include <QDialog>
 
+#include <functional>
+
 #include "ArcGISRestCapabilities.h"
 
 class QAction;
@@ -23,11 +25,15 @@ class QArcGISRestConnectionDialog : public QDialog
     Q_OBJECT
 
 public:
+    typedef std::function<bool(const QString& connectionName)> ConnectionNameExistsChecker;
+
     explicit QArcGISRestConnectionDialog(QWidget* parent = nullptr);
     ~QArcGISRestConnectionDialog() override;
 
     void SetSettings(const ArcGISRestConnectionSettings& settings);
     ArcGISRestConnectionSettings GetSettings() const;
+
+    void SetConnectionNameExistsChecker(const ConnectionNameExistsChecker& checker);
 
     void Clear();
 
@@ -48,7 +54,6 @@ private slots:
     void OnHeaderSelectionChanged();
     void OnAdvancedToggled(bool checked);
     void OnPasswordVisibleActionTriggered();
-    void OnHelpButtonClicked();
 
 private:
     void InitializeUi();
@@ -89,6 +94,7 @@ private:
 
     QDialogButtonBox* mButtonBox = nullptr;
     QPushButton* mOkButton = nullptr;
+    ConnectionNameExistsChecker mConnectionNameExistsChecker;
 };
 
 #ifdef _MSC_VER

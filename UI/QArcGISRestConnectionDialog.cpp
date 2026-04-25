@@ -211,6 +211,12 @@ ArcGISRestConnectionSettings QArcGISRestConnectionDialog::GetSettings() const
     return settings;
 }
 
+
+void QArcGISRestConnectionDialog::SetConnectionNameExistsChecker(const ConnectionNameExistsChecker& checker)
+{
+    mConnectionNameExistsChecker = checker;
+}
+
 void QArcGISRestConnectionDialog::Clear()
 {
     if (!mNameLineEdit || !mHeaderTableWidget)
@@ -377,6 +383,19 @@ void QArcGISRestConnectionDialog::accept()
         return;
     }
 
+    const QString connectionName = mNameLineEdit ? mNameLineEdit->text().trimmed() : QString();
+    if (mConnectionNameExistsChecker && mConnectionNameExistsChecker(connectionName))
+    {
+        QMessageBox::warning(this, windowTitle(), QString::fromUtf8("链接名称已存在，请使用其它名称。"));
+
+        if (mNameLineEdit)
+        {
+            mNameLineEdit->setFocus(Qt::OtherFocusReason);
+            mNameLineEdit->selectAll();
+        }
+        return;
+    }
+
     QDialog::accept();
 }
 
@@ -446,22 +465,9 @@ void QArcGISRestConnectionDialog::OnPasswordVisibleActionTriggered()
     SetPasswordVisible(!mPasswordVisible);
 }
 
-void QArcGISRestConnectionDialog::OnHelpButtonClicked()
-{
-    if (receivers(SIGNAL(HelpRequested())) > 0)
-    {
-        emit HelpRequested();
-        return;
-    }
-
-    QMessageBox::information(this,
-        QString::fromUtf8("帮助"),
-        QString::fromUtf8("请填写 ArcGIS REST 服务连接信息。名称和 URL 为必填项；认证信息会作为当前连接设置的一部分保存。"));
-}
-
 void QArcGISRestConnectionDialog::InitializeUi()
 {
-    setWindowTitle(QString::fromUtf8("新建 ArcGIS REST Server 连接"));
+    setWindowTitle(QString::fromUtf8("新建 ArcGIS REST Server 链接"));
     setModal(true);
     setSizeGripEnabled(true);
     resize(744, 836);
@@ -504,7 +510,7 @@ void QArcGISRestConnectionDialog::InitializeUi()
 
 QWidget* QArcGISRestConnectionDialog::CreateConnectionDetailsWidget()
 {
-    QGroupBox* groupBox = new BoldTitleGroupBox(QString::fromUtf8("连接详情"), this);
+    QGroupBox* groupBox = new BoldTitleGroupBox(QString::fromUtf8("链接详情"), this);
     QFormLayout* formLayout = new QFormLayout(groupBox);
     formLayout->setContentsMargins(17, 16, 13, 13);
     formLayout->setHorizontalSpacing(10);
