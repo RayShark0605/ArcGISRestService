@@ -23,9 +23,6 @@ private:
 	QServiceBrowserPanel* serviceBrowserPanel = nullptr;
 
 	void InitializeUi();
-
-
-
 };
 
 

@@ -5,14 +5,10 @@
 #endif
 
 #include <QAbstractItemView>
-#include <QApplication>
-#include <QBrush>
 #include <QByteArray>
 #include <QColor>
 #include <QAction>
 #include <QDialogButtonBox>
-#include <QFont>
-#include <QFrame>
 #include <QGroupBox>
 #include <QHeaderView>
 #include <QIcon>
@@ -29,7 +25,6 @@
 #include <QStringList>
 #include <QSize>
 #include <QSizePolicy>
-#include <QStyle>
 #include <QTableWidget>
 #include <QTableWidgetItem>
 #include <QToolButton>
@@ -111,15 +106,6 @@ namespace
         }
 
         return QIcon(pixmap);
-    }
-
-    QLabel* CreateBoldLabel(const QString& text, QWidget* parent)
-    {
-        QLabel* label = new QLabel(text, parent);
-        QFont font = label->font();
-        //font.setBold(true);
-        label->setFont(font);
-        return label;
     }
 
     void SetFixedFieldHeight(QLineEdit* lineEdit)
@@ -565,28 +551,15 @@ QWidget* QArcGISRestConnectionDialog::CreatePortalDetailsWidget()
 
 QWidget* QArcGISRestConnectionDialog::CreateAuthenticationWidget()
 {
-    QWidget* authWidget = new QWidget(this);
-    QVBoxLayout* outerLayout = new QVBoxLayout(authWidget);
-    outerLayout->setContentsMargins(0, 0, 0, 0);
-    outerLayout->setSpacing(4);
-
-    outerLayout->addWidget(CreateBoldLabel(QString::fromUtf8("认证"), authWidget));
-
-    QFrame* frame = new QFrame(authWidget);
-    frame->setFrameShape(QFrame::StyledPanel);
-    frame->setFrameShadow(QFrame::Plain);
-
-    QVBoxLayout* frameLayout = new QVBoxLayout(frame);
-    frameLayout->setContentsMargins(17, 10, 13, 10);
-    frameLayout->setSpacing(7);
-
-    QFormLayout* formLayout = new QFormLayout();
+    QGroupBox* groupBox = new BoldTitleGroupBox(QString::fromUtf8("认证"), this);
+    QFormLayout* formLayout = new QFormLayout(groupBox);
+    formLayout->setContentsMargins(17, 16, 13, 13);
     formLayout->setHorizontalSpacing(10);
-    formLayout->setVerticalSpacing(7);
+    formLayout->setVerticalSpacing(8);
     formLayout->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
 
-    mUsernameLineEdit = new QLineEdit(frame);
-    mPasswordLineEdit = new QLineEdit(frame);
+    mUsernameLineEdit = new QLineEdit(groupBox);
+    mPasswordLineEdit = new QLineEdit(groupBox);
     mPasswordLineEdit->setPlaceholderText(QString::fromUtf8("可选"));
     mPasswordLineEdit->setEchoMode(QLineEdit::Password);
     mPasswordVisibleAction = mPasswordLineEdit->addAction(CreateEyeIcon(false), QLineEdit::TrailingPosition);
@@ -598,22 +571,8 @@ QWidget* QArcGISRestConnectionDialog::CreateAuthenticationWidget()
 
     formLayout->addRow(QString::fromUtf8("用户名(&U)"), mUsernameLineEdit);
     formLayout->addRow(QString::fromUtf8("密码(&D)"), mPasswordLineEdit);
-    frameLayout->addLayout(formLayout);
 
-    //QHBoxLayout* warningLayout = new QHBoxLayout();
-    //warningLayout->setContentsMargins(61, 0, 0, 0);
-    //warningLayout->setSpacing(8);
-    //
-    //QLabel* warningIcon = new QLabel(frame);
-    //const QIcon icon = style()->standardIcon(QStyle::SP_MessageBoxWarning);
-    //warningIcon->setPixmap(icon.pixmap(22, 22));
-    //warningIcon->setFixedSize(24, 24);
-    //
-    //warningLayout->addWidget(warningIcon);
-    //frameLayout->addLayout(warningLayout);
-
-    outerLayout->addWidget(frame);
-    return authWidget;
+    return groupBox;
 }
 
 QWidget* QArcGISRestConnectionDialog::CreateHttpHeadersWidget()

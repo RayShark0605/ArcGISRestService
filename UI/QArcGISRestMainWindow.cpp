@@ -10,7 +10,7 @@ QArcGISRestMainWindow::QArcGISRestMainWindow(QWidget* parent) : QMainWindow(pare
 void QArcGISRestMainWindow::InitializeUi()
 {
 	setObjectName(QStringLiteral("QArcGISRestMainWindow"));
-	setWindowTitle(QStringLiteral("ArcGIS REST 服务浏览"));
+	setWindowTitle(QStringLiteral("MapWeaver"));
 	resize(1280, 800);
 
 	setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowNestedDocks | QMainWindow::AllowTabbedDocks);

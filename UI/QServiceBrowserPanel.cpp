@@ -1227,7 +1227,7 @@ QTreeWidgetItem* QServiceBrowserPanel::CreateArcGISRestCategoryItem() const
 	item->setData(0, RoleNodeType, static_cast<int>(ArcGISRestServiceTreeNode::NodeType::Root));
 	item->setData(0, RoleCanDrag, false);
 	item->setData(0, RoleCanShowContextMenu, true);
-	item->setData(0, RoleDetails, QStringLiteral("ArcGIS Rest 服务根分类。\n\n该节点本身不是地图图层，不能拖入主画布。它下面用于放置各个 ArcGIS REST 服务连接或服务资源节点。"));
+	item->setData(0, RoleDetails, QStringLiteral("ArcGIS Rest 服务根分类。"));
 	item->setData(0, RoleIsArcGISRestNode, false);
 	item->setData(0, RoleIsCategoryNode, true);
 	item->setData(0, RoleHasLazyChildren, false);
@@ -2394,10 +2394,9 @@ QString QServiceBrowserPanel::CreateDetailTextForArcGISRestNode(const ArcGISRest
 	QStringList lines;
 	lines << QStringLiteral("名称：%1").arg(ToQString(node.text));
 	lines << QStringLiteral("类型：%1").arg(NodeTypeToDisplayText(static_cast<int>(node.type)));
-	lines << QStringLiteral("URL：%1").arg(ToQString(node.url));
-	lines << QStringLiteral("UID：%1").arg(NormalizeUid(node));
-	lines << QStringLiteral("可拖入主画布：%1").arg(BoolToText(canDrag));
-	lines << QStringLiteral("可延迟展开：%1").arg(BoolToText(hasLazyChildren));
+	lines << QStringLiteral("Url：%1").arg(ToQString(node.url));
+	lines << QStringLiteral("Uid：%1").arg(NormalizeUid(node));
+	lines << QStringLiteral("可导入：%1").arg(BoolToText(canDrag));
 
 	if (!node.serviceInfo.currentVersion.empty())
 	{
