@@ -278,6 +278,64 @@ namespace
 		return networkOptions;
 	}
 
+
+	bool IsArcGISRestServiceNodeType(ArcGISRestServiceTreeNode::NodeType nodeType)
+	{
+		switch (nodeType)
+		{
+		case ArcGISRestServiceTreeNode::NodeType::MapService:
+		case ArcGISRestServiceTreeNode::NodeType::ImageService:
+		case ArcGISRestServiceTreeNode::NodeType::FeatureService:
+			return true;
+		case ArcGISRestServiceTreeNode::NodeType::Unknown:
+		case ArcGISRestServiceTreeNode::NodeType::Root:
+		case ArcGISRestServiceTreeNode::NodeType::Folder:
+		case ArcGISRestServiceTreeNode::NodeType::AllLayers:
+		case ArcGISRestServiceTreeNode::NodeType::UnknownVectorLayer:
+		case ArcGISRestServiceTreeNode::NodeType::PointVectorLayer:
+		case ArcGISRestServiceTreeNode::NodeType::LineVectorLayer:
+		case ArcGISRestServiceTreeNode::NodeType::PolygonVectorLayer:
+		case ArcGISRestServiceTreeNode::NodeType::RasterLayer:
+		case ArcGISRestServiceTreeNode::NodeType::Table:
+		default:
+			return false;
+		}
+	}
+
+	std::string JoinArcGISRestLayerIds(const ArcGISRestServiceInfo& serviceInfo)
+	{
+		std::string result;
+		for (const ArcGISMapServiceLayerEntry& layer : serviceInfo.layers)
+		{
+			if (layer.id.empty())
+			{
+				continue;
+			}
+
+			if (!result.empty())
+			{
+				result += ',';
+			}
+			result += layer.id;
+		}
+		return result;
+	}
+
+	std::string ExtractFirstUrlPathSegment(const std::string& text)
+	{
+		if (text.empty())
+		{
+			return std::string();
+		}
+
+		const size_t slashIndex = text.find('/');
+		if (slashIndex == std::string::npos)
+		{
+			return text;
+		}
+		return text.substr(0, slashIndex);
+	}
+
 	void ShowArcGISRestConnectionError(QWidget* parent, const QString& mainText, const QString& detailText)
 	{
 		QMessageBox messageBox(parent);
@@ -418,6 +476,13 @@ namespace
 	};
 
 
+}
+
+bool ArcGISRestLayerImportRequest::IsValid() const
+{
+	return !nodeUid.empty() && !serviceUrl.empty() && !connectionSettings.serviceUrl.empty() && serviceInfo != nullptr &&
+		nodeType != ArcGISRestServiceTreeNode::NodeType::Unknown &&
+		IsArcGISRestServiceNodeType(serviceNodeType);
 }
 
 class QServiceBrowserPanel::ArcGISRestConnectionLoadThread : public QThread
@@ -719,6 +784,8 @@ private:
 
 QServiceBrowserPanel::QServiceBrowserPanel(QWidget* parent) : QDockWidget(QStringLiteral("服务浏览"), parent)
 {
+	qRegisterMetaType<ArcGISRestLayerImportRequest>("ArcGISRestLayerImportRequest");
+
 	setObjectName(QStringLiteral("QServiceBrowserPanel"));
 	setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
 	setFeatures(QDockWidget::DockWidgetClosable | QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable);
@@ -785,6 +852,7 @@ QServiceBrowserPanel::~QServiceBrowserPanel()
 {
 	arcGISRestConnectionLoadTokenByUid.clear();
 	arcGISRestConnectionSettingsByUid.clear();
+	arcGISRestServiceInfoByUid.clear();
 	itemByUid.clear();
 }
 
@@ -847,6 +915,7 @@ void QServiceBrowserPanel::ClearArcGISRestServices()
 	RemoveChildrenAndUnregister(arcGISRestCategoryItem);
 	arcGISRestConnectionLoadTokenByUid.clear();
 	arcGISRestConnectionSettingsByUid.clear();
+	arcGISRestServiceInfoByUid.clear();
 	arcGISRestCategoryItem->setExpanded(true);
 	UpdateLoadingAnimationTimerState();
 	UpdateDetailsForItem(treeWidget ? treeWidget->currentItem() : nullptr);
@@ -858,6 +927,7 @@ void QServiceBrowserPanel::SetArcGISRestRootChildren(const std::vector<ArcGISRes
 	RemoveChildrenAndUnregister(arcGISRestCategoryItem);
 	arcGISRestConnectionLoadTokenByUid.clear();
 	arcGISRestConnectionSettingsByUid.clear();
+	arcGISRestServiceInfoByUid.clear();
 
 	if (treeWidget)
 	{
@@ -1007,6 +1077,32 @@ bool QServiceBrowserPanel::GetSelectedNodeInfo(ServiceBrowserNodeInfo& outNodeIn
 
 	outNodeInfo = GetNodeInfo(treeWidget->currentItem());
 	return !outNodeInfo.uid.isEmpty();
+}
+
+bool QServiceBrowserPanel::BindMainCanvas(QMainCanvas* mainCanvas)
+{
+	if (!mainCanvas)
+	{
+		return false;
+	}
+
+	const QMetaObject::Connection connection = connect(mainCanvas,
+		&QMainCanvas::LayerDropRequested,
+		this,
+		&QServiceBrowserPanel::HandleCanvasLayerDropRequested,
+		Qt::UniqueConnection);
+	return static_cast<bool>(connection);
+}
+
+bool QServiceBrowserPanel::ImportArcGISRestNodeByUid(const QString& uid)
+{
+	QTreeWidgetItem* item = FindItemByUid(uid);
+	if (!item || IsPlaceholderItem(item))
+	{
+		return false;
+	}
+
+	return EmitArcGISRestLayerImportRequest(item);
 }
 
 void QServiceBrowserPanel::SetDefaultContextMenuEnabled(bool enabled)
@@ -1216,6 +1312,15 @@ void QServiceBrowserPanel::OnLoadingAnimationTimerTimeout()
 	UpdateLoadingAnimationTimerState();
 }
 
+void QServiceBrowserPanel::HandleCanvasLayerDropRequested(const QString& nodeUid, const QString& url, const QString& text, int nodeType)
+{
+	Q_UNUSED(url);
+	Q_UNUSED(text);
+	Q_UNUSED(nodeType);
+
+	ImportArcGISRestNodeByUid(nodeUid);
+}
+
 QTreeWidgetItem* QServiceBrowserPanel::CreateArcGISRestCategoryItem() const
 {
 	QTreeWidgetItem* item = new QTreeWidgetItem();
@@ -1358,6 +1463,7 @@ bool QServiceBrowserPanel::AddArcGISRestServiceNodeInternal(const ArcGISRestServ
 
 	parentItem->addChild(item);
 	RegisterItemRecursively(item);
+	RegisterArcGISRestServiceInfoRecursively(node, recursive);
 	parentItem->setExpanded(true);
 	UpdateLoadingAnimationTimerState();
 	return true;
@@ -1401,6 +1507,7 @@ bool QServiceBrowserPanel::UpdateArcGISRestServiceNodeInternal(const ArcGISRestS
 	delete parentItem->takeChild(childIndex);
 	parentItem->insertChild(childIndex, newItem);
 	RegisterItemRecursively(newItem);
+	RegisterArcGISRestServiceInfoRecursively(node, recursive);
 	newItem->setExpanded(wasExpanded);
 	if (wasCurrent && treeWidget)
 	{
@@ -1488,6 +1595,25 @@ void QServiceBrowserPanel::RegisterItemRecursively(QTreeWidgetItem* item)
 	}
 }
 
+void QServiceBrowserPanel::RegisterArcGISRestServiceInfoRecursively(const ArcGISRestServiceTreeNode& node, bool recursive)
+{
+	const QString uid = NormalizeUid(node);
+	if (!uid.isEmpty() && node.serviceInfo.resourceType != ArcGISRestResourceType::Unknown)
+	{
+		arcGISRestServiceInfoByUid.insert(uid, std::make_shared<ArcGISRestServiceInfo>(node.serviceInfo));
+	}
+
+	if (!recursive)
+	{
+		return;
+	}
+
+	for (const ArcGISRestServiceTreeNode& childNode : node.children)
+	{
+		RegisterArcGISRestServiceInfoRecursively(childNode, true);
+	}
+}
+
 void QServiceBrowserPanel::UnregisterItemRecursively(QTreeWidgetItem* item)
 {
 	if (!item)
@@ -1499,6 +1625,7 @@ void QServiceBrowserPanel::UnregisterItemRecursively(QTreeWidgetItem* item)
 	if (!uid.isEmpty())
 	{
 		itemByUid.remove(uid);
+		arcGISRestServiceInfoByUid.remove(uid);
 	}
 
 	for (int childIndex = 0; childIndex < item->childCount(); childIndex++)
@@ -2198,7 +2325,194 @@ void QServiceBrowserPanel::RefreshArcGISRestChildNode(QTreeWidgetItem* item)
 
 void QServiceBrowserPanel::ImportArcGISRestNode(QTreeWidgetItem* item)
 {
-	Q_UNUSED(item);
+	EmitArcGISRestLayerImportRequest(item);
+}
+
+bool QServiceBrowserPanel::EmitArcGISRestLayerImportRequest(QTreeWidgetItem* item)
+{
+	ArcGISRestLayerImportRequest request;
+	QString errorMessage;
+	if (!BuildArcGISRestLayerImportRequest(item, request, &errorMessage))
+	{
+		if (!errorMessage.trimmed().isEmpty())
+		{
+			ShowArcGISRestConnectionError(this, QStringLiteral("无法导入该 ArcGIS REST 图层。"), errorMessage);
+		}
+		return false;
+	}
+
+	emit ArcGISRestLayerImportRequested(request);
+	return true;
+}
+
+bool QServiceBrowserPanel::BuildArcGISRestLayerImportRequest(QTreeWidgetItem* item, ArcGISRestLayerImportRequest& outRequest, QString* errorMessage) const
+{
+	outRequest = ArcGISRestLayerImportRequest();
+	if (errorMessage)
+	{
+		errorMessage->clear();
+	}
+
+	if (!item || IsPlaceholderItem(item))
+	{
+		if (errorMessage)
+		{
+			*errorMessage = QStringLiteral("当前节点无效。 ");
+		}
+		return false;
+	}
+
+	const ServiceBrowserNodeInfo nodeInfo = GetNodeInfo(item);
+	if (!nodeInfo.isArcGISRestNode || !nodeInfo.canDrag)
+	{
+		if (errorMessage)
+		{
+			*errorMessage = QStringLiteral("当前节点不是可导入的 ArcGIS REST 图层节点。 ");
+		}
+		return false;
+	}
+
+	const QTreeWidgetItem* serviceItem = FindArcGISRestServiceItemForImport(item);
+	if (!serviceItem)
+	{
+		if (errorMessage)
+		{
+			*errorMessage = QStringLiteral("无法找到当前图层所属的 MapServer / ImageServer / FeatureServer 服务节点。 ");
+		}
+		return false;
+	}
+
+	std::shared_ptr<const ArcGISRestServiceInfo> serviceInfoHolder = GetArcGISRestServiceInfoForItem(serviceItem);
+	if (!serviceInfoHolder || serviceInfoHolder->resourceType != ArcGISRestResourceType::Service)
+	{
+		if (errorMessage)
+		{
+			*errorMessage = QStringLiteral("无法取得与服务 URL 匹配的 ArcGISRestServiceInfo。请先展开或刷新对应服务节点。 ");
+		}
+		return false;
+	}
+
+	const std::string serviceUrl = NormalizeArcGISRestServiceUrl(ToStdString(serviceItem->data(0, RoleUrl).toString()));
+	if (serviceUrl.empty())
+	{
+		if (errorMessage)
+		{
+			*errorMessage = QStringLiteral("服务 URL 为空。 ");
+		}
+		return false;
+	}
+
+	ArcGISRestConnectionSettings connectionSettings;
+	if (!GetArcGISRestConnectionSettingsForNodeItem(item, connectionSettings))
+	{
+		if (errorMessage)
+		{
+			*errorMessage = QStringLiteral("无法取得当前节点所属 ArcGIS REST 服务连接信息。 ");
+		}
+		return false;
+	}
+
+	// connectionSettings 表示用户添加/维护的 ArcGIS REST 根连接信息，
+	// 其中 serviceUrl 必须保持为连接根 URL（例如 /arcgis/rest/services），
+	// 不能覆盖成当前图层所属的 MapServer / FeatureServer / ImageServer URL。
+	// 当前图层所属的具体服务 URL 写入 outRequest.serviceUrl。
+	connectionSettings = NormalizeArcGISRestConnectionSettings(connectionSettings);
+
+	const ArcGISRestServiceTreeNode::NodeType requestNodeType = static_cast<ArcGISRestServiceTreeNode::NodeType>(nodeInfo.nodeType);
+	const ArcGISRestServiceTreeNode::NodeType serviceNodeType = static_cast<ArcGISRestServiceTreeNode::NodeType>(serviceItem->data(0, RoleNodeType).toInt());
+	const std::string layerId = ExtractLayerIdForImport(item, serviceUrl, serviceInfoHolder.get());
+	if (requestNodeType != ArcGISRestServiceTreeNode::NodeType::AllLayers && layerId.empty() && !IsArcGISRestServiceNodeType(requestNodeType))
+	{
+		if (errorMessage)
+		{
+			*errorMessage = QStringLiteral("无法从当前节点 URL 中解析图层 ID。 ");
+		}
+		return false;
+	}
+
+	outRequest.nodeUid = ToStdString(nodeInfo.uid);
+	outRequest.nodeText = ToStdString(nodeInfo.text);
+	outRequest.nodeUrl = NormalizeArcGISRestRequestUrl(ToStdString(nodeInfo.url));
+	outRequest.serviceNodeUid = ToStdString(serviceItem->data(0, RoleUid).toString());
+	outRequest.serviceUrl = serviceUrl;
+	outRequest.connectionSettings = connectionSettings;
+	outRequest.serviceInfoHolder = serviceInfoHolder;
+	outRequest.serviceInfo = outRequest.serviceInfoHolder.get();
+	outRequest.layerId = layerId;
+	outRequest.nodeType = requestNodeType;
+	outRequest.serviceNodeType = serviceNodeType;
+
+	if (!outRequest.IsValid())
+	{
+		if (errorMessage)
+		{
+			*errorMessage = QStringLiteral("导入请求结构体不完整。 ");
+		}
+		outRequest = ArcGISRestLayerImportRequest();
+		return false;
+	}
+	return true;
+}
+
+const QTreeWidgetItem* QServiceBrowserPanel::FindArcGISRestServiceItemForImport(const QTreeWidgetItem* item) const
+{
+	const QTreeWidgetItem* currentItem = item;
+	while (currentItem && !IsPlaceholderItem(currentItem))
+	{
+		const ArcGISRestServiceTreeNode::NodeType currentNodeType = static_cast<ArcGISRestServiceTreeNode::NodeType>(currentItem->data(0, RoleNodeType).toInt());
+		if (IsArcGISRestServiceNodeType(currentNodeType))
+		{
+			return currentItem;
+		}
+
+		currentItem = currentItem->parent();
+	}
+	return nullptr;
+}
+
+std::shared_ptr<const ArcGISRestServiceInfo> QServiceBrowserPanel::GetArcGISRestServiceInfoForItem(const QTreeWidgetItem* item) const
+{
+	if (!item || IsPlaceholderItem(item))
+	{
+		return std::shared_ptr<const ArcGISRestServiceInfo>();
+	}
+
+	const QString uid = item->data(0, RoleUid).toString();
+	const auto serviceInfoIter = arcGISRestServiceInfoByUid.constFind(uid);
+	if (serviceInfoIter == arcGISRestServiceInfoByUid.constEnd())
+	{
+		return std::shared_ptr<const ArcGISRestServiceInfo>();
+	}
+	return serviceInfoIter.value();
+}
+
+std::string QServiceBrowserPanel::ExtractLayerIdForImport(const QTreeWidgetItem* item, const std::string& serviceUrl, const ArcGISRestServiceInfo* serviceInfo) const
+{
+	if (!item)
+	{
+		return std::string();
+	}
+
+	const ArcGISRestServiceTreeNode::NodeType nodeType = static_cast<ArcGISRestServiceTreeNode::NodeType>(item->data(0, RoleNodeType).toInt());
+	if (nodeType == ArcGISRestServiceTreeNode::NodeType::AllLayers)
+	{
+		return serviceInfo ? JoinArcGISRestLayerIds(*serviceInfo) : std::string();
+	}
+
+	const std::string normalizedServiceUrl = NormalizeArcGISRestServiceUrl(serviceUrl);
+	const std::string normalizedNodeUrl = NormalizeArcGISRestServiceUrl(ToStdString(item->data(0, RoleUrl).toString()));
+	if (normalizedServiceUrl.empty() || normalizedNodeUrl.empty())
+	{
+		return std::string();
+	}
+
+	const std::string prefix = normalizedServiceUrl + "/";
+	if (normalizedNodeUrl.size() <= prefix.size() || normalizedNodeUrl.compare(0, prefix.size(), prefix) != 0)
+	{
+		return std::string();
+	}
+
+	return ExtractFirstUrlPathSegment(normalizedNodeUrl.substr(prefix.size()));
 }
 
 void QServiceBrowserPanel::EditArcGISRestConnection(QTreeWidgetItem* item)

@@ -5,12 +5,15 @@
 #include <QIcon>
 #include <QPoint>
 #include <QString>
+#include <QMetaType>
 
 #include <functional>
+#include <memory>
 #include <vector>
 
 #include "ArcGISRestCapabilities.h"
 
+class QMainCanvas;
 class QMenu;
 class QTextEdit;
 class QTreeWidget;
@@ -37,6 +40,28 @@ enum class ArcGISRestConnectionLoadMode
 	RefreshExisting,
 	EditExisting
 };
+
+
+struct ArcGISRestLayerImportRequest
+{
+	std::string nodeUid = "";        // 被导入节点的 UID。
+	std::string nodeText = "";       // 被导入节点的显示名称。
+	std::string nodeUrl = "";        // 被导入节点原始 URL，可能带 layerId。
+	std::string serviceNodeUid = ""; // 所属 MapServer / ImageServer / FeatureServer 服务节点 UID。
+
+	std::string serviceUrl = "";     // 服务 URL，例如 MapServer、ImageServer、FeatureServer 的 URL，不带 layerId。
+	ArcGISRestConnectionSettings connectionSettings; // 当前导入节点所属 ArcGIS REST 根连接信息；
+	std::shared_ptr<const ArcGISRestServiceInfo> serviceInfoHolder; // 保证 serviceInfo 指针在信号投递期间有效。
+	const ArcGISRestServiceInfo* serviceInfo = nullptr;             // 跟 serviceUrl 匹配的服务信息。
+
+	std::string layerId = "";        // 图层 ID；全部图层节点为逗号分隔的全部图层 ID。
+	ArcGISRestServiceTreeNode::NodeType nodeType = ArcGISRestServiceTreeNode::NodeType::Unknown;
+	ArcGISRestServiceTreeNode::NodeType serviceNodeType = ArcGISRestServiceTreeNode::NodeType::Unknown;
+
+	bool IsValid() const;
+};
+
+Q_DECLARE_METATYPE(ArcGISRestLayerImportRequest)
 
 class QServiceBrowserPanel : public QDockWidget
 {
@@ -74,6 +99,9 @@ public:
 
 	bool GetSelectedNodeInfo(ServiceBrowserNodeInfo& outNodeInfo) const;
 
+	bool BindMainCanvas(QMainCanvas* mainCanvas);
+	bool ImportArcGISRestNodeByUid(const QString& uid);
+
 	void SetDefaultContextMenuEnabled(bool enabled);
 	bool IsDefaultContextMenuEnabled() const;
 
@@ -82,12 +110,16 @@ public:
 	void SetShowLazyExpandableIndicators(bool enabled);
 	bool IsShowLazyExpandableIndicatorsEnabled() const;
 
+public slots:
+	void HandleCanvasLayerDropRequested(const QString& nodeUid, const QString& url, const QString& text, int nodeType);
+
 signals:
 	void CurrentNodeChanged(const QString& nodeUid, const QString& url, const QString& text, int nodeType);
 	void NodeActivated(const QString& nodeUid, const QString& url, const QString& text, int nodeType);
 	void NodeDoubleClicked(const QString& nodeUid, const QString& url, const QString& text, int nodeType);
 	void ArcGISRestNodeExpandRequested(const QString& nodeUid, const QString& url, const QString& text, int nodeType);
 	void NodeRefreshRequested(const QString& nodeUid, const QString& url, const QString& text, int nodeType);
+	void ArcGISRestLayerImportRequested(const ArcGISRestLayerImportRequest& request);
 
 private slots:
 	void OnCurrentItemChanged(QTreeWidgetItem* currentItem, QTreeWidgetItem* previousItem);
@@ -111,6 +143,7 @@ private:
 	QString GetCurrentSelectableNodeUid() const;
 	void RestoreCurrentSelectableNodeByUid(const QString& uid, const QString& fallbackUid = QString());
 	void RegisterItemRecursively(QTreeWidgetItem* item);
+	void RegisterArcGISRestServiceInfoRecursively(const ArcGISRestServiceTreeNode& node, bool recursive);
 	void UnregisterItemRecursively(QTreeWidgetItem* item);
 	void RemoveChildrenAndUnregister(QTreeWidgetItem* item);
 
@@ -151,6 +184,11 @@ private:
 	void RefreshArcGISRestConnection(QTreeWidgetItem* item);
 	void RefreshArcGISRestChildNode(QTreeWidgetItem* item);
 	void ImportArcGISRestNode(QTreeWidgetItem* item);
+	bool EmitArcGISRestLayerImportRequest(QTreeWidgetItem* item);
+	bool BuildArcGISRestLayerImportRequest(QTreeWidgetItem* item, ArcGISRestLayerImportRequest& outRequest, QString* errorMessage = nullptr) const;
+	const QTreeWidgetItem* FindArcGISRestServiceItemForImport(const QTreeWidgetItem* item) const;
+	std::shared_ptr<const ArcGISRestServiceInfo> GetArcGISRestServiceInfoForItem(const QTreeWidgetItem* item) const;
+	std::string ExtractLayerIdForImport(const QTreeWidgetItem* item, const std::string& serviceUrl, const ArcGISRestServiceInfo* serviceInfo) const;
 	void EditArcGISRestConnection(QTreeWidgetItem* item);
 	void DeleteArcGISRestConnection(QTreeWidgetItem* item);
 	void StartArcGISRestConnectionLoad(const QString& sourceUid, const ArcGISRestConnectionSettings& settings, const ArcGISRestServiceTreeNode& connectionNode, ArcGISRestConnectionLoadMode mode);
@@ -170,6 +208,7 @@ private:
 	QTreeWidgetItem* arcGISRestCategoryItem = nullptr;
 	QHash<QString, QTreeWidgetItem*> itemByUid;
 	QHash<QString, ArcGISRestConnectionSettings> arcGISRestConnectionSettingsByUid;
+	QHash<QString, std::shared_ptr<const ArcGISRestServiceInfo>> arcGISRestServiceInfoByUid;
 	QHash<QString, quint64> arcGISRestConnectionLoadTokenByUid;
 	quint64 nextArcGISRestConnectionLoadToken = 1;
 	ContextMenuBuilder contextMenuBuilder;

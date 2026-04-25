@@ -60,12 +60,12 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Debug|x64'">
-    <TargetName>ArcGISRestServiceLoader</TargetName>
+    <TargetName>MapWeaver</TargetName>
     <IncludePath>../ArcGISRestService;$(IncludePath)</IncludePath>
     <LibraryPath>..\x64\Debug;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Release|x64'">
-    <TargetName>ArcGISRestServiceLoader</TargetName>
+    <TargetName>MapWeaver</TargetName>
     <IncludePath>../ArcGISRestService;$(IncludePath)</IncludePath>
     <LibraryPath>..\x64\Release;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
@@ -119,6 +119,7 @@
   <ItemGroup>
     <ClCompile Include="DataDef.cpp" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="MapRefresher.cpp" />
     <ClCompile Include="QArcGISRestConnectionDialog.cpp" />
     <ClCompile Include="QArcGISRestMainWindow.cpp" />
     <ClCompile Include="QMainCanvas.cpp" />
@@ -126,6 +127,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="DataDef.h" />
+    <QtMoc Include="MapRefresher.h" />
     <QtMoc Include="QArcGISRestConnectionDialog.h" />
     <QtMoc Include="QArcGISRestMainWindow.h" />
     <QtMoc Include="QServiceBrowserPanel.h" />
