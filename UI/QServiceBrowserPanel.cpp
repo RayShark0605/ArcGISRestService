@@ -868,7 +868,7 @@ bool QServiceBrowserPanel::RemoveNode(const QString& uid)
 		return false;
 	}
 
-	QTreeWidgetItem* parentItem = item->parent();
+	QTreeWidgetItem* const parentItem = item->parent();
 	CancelArcGISRestConnectionLoadsRecursively(item);
 	RemoveArcGISRestConnectionSettingsRecursively(item);
 	UnregisterItemRecursively(item);
@@ -1050,7 +1050,7 @@ void QServiceBrowserPanel::OnItemExpanded(QTreeWidgetItem* item)
 	sourceNode.url = ToStdString(nodeInfo.url);
 	sourceNode.uid = ToStdString(nodeInfo.uid);
 
-	QTreeWidgetItem* parentItem = item->parent();
+	QTreeWidgetItem* const parentItem = item->parent();
 	if (parentItem && !IsPlaceholderItem(parentItem))
 	{
 		sourceNode.parentUid = ToStdString(parentItem->data(0, RoleUid).toString());
@@ -1089,9 +1089,21 @@ void QServiceBrowserPanel::OnCustomContextMenuRequested(const QPoint& position)
 	}
 
 	QMenu menu(this);
-	if (IsArcGISRestConnectionRootItem(item))
+	const bool isArcGISRestCategoryNode = IsArcGISRestCategoryNode(nodeInfo);
+	if (isArcGISRestCategoryNode)
+	{
+		if (defaultContextMenuEnabled)
+		{
+			AddDefaultContextMenuActions(&menu, nodeInfo, item);
+		}
+	}
+	else if (IsArcGISRestConnectionRootItem(item))
 	{
 		AddArcGISRestConnectionContextMenuActions(&menu, nodeInfo, item);
+	}
+	else if (nodeInfo.isArcGISRestNode && FindArcGISRestConnectionRootItem(item))
+	{
+		AddArcGISRestChildNodeContextMenuActions(&menu, nodeInfo, item);
 	}
 	else
 	{
@@ -1100,8 +1112,7 @@ void QServiceBrowserPanel::OnCustomContextMenuRequested(const QPoint& position)
 			AddDefaultContextMenuActions(&menu, nodeInfo, item);
 		}
 
-		const bool isArcGISRestCategoryNode = IsArcGISRestCategoryNode(nodeInfo);
-		if (contextMenuBuilder && !isArcGISRestCategoryNode)
+		if (contextMenuBuilder)
 		{
 			if (!menu.actions().isEmpty())
 			{
@@ -1796,6 +1807,40 @@ void QServiceBrowserPanel::AddArcGISRestConnectionContextMenuActions(QMenu* menu
 	Q_UNUSED(nodeInfo);
 }
 
+void QServiceBrowserPanel::AddArcGISRestChildNodeContextMenuActions(QMenu* menu, const ServiceBrowserNodeInfo& nodeInfo, QTreeWidgetItem* item)
+{
+	if (!menu || !item)
+	{
+		return;
+	}
+
+	const bool isLoading = item->data(0, RoleIsLoading).toBool();
+	const ArcGISRestServiceTreeNode::NodeType nodeType = static_cast<ArcGISRestServiceTreeNode::NodeType>(nodeInfo.nodeType);
+	const bool canRefreshService = nodeInfo.isArcGISRestNode && !nodeInfo.url.isEmpty() && IsNetworkExpandableArcGISRestNodeType(nodeType);
+	if (canRefreshService)
+	{
+		QAction* const refreshAction = menu->addAction(QStringLiteral("刷新服务"));
+		refreshAction->setEnabled(!isLoading);
+		connect(refreshAction, &QAction::triggered, this, [this, item]() {
+			RefreshArcGISRestChildNode(item);
+			});
+	}
+
+	if (nodeInfo.canDrag)
+	{
+		if (!menu->actions().isEmpty())
+		{
+			menu->addSeparator();
+		}
+
+		QAction* const importAction = menu->addAction(QStringLiteral("导入"));
+		importAction->setEnabled(!isLoading);
+		connect(importAction, &QAction::triggered, this, [this, item]() {
+			ImportArcGISRestNode(item);
+			});
+	}
+}
+
 bool QServiceBrowserPanel::IsArcGISRestCategoryNode(const ServiceBrowserNodeInfo& nodeInfo) const
 {
 	return nodeInfo.uid == GetArcGISRestCategoryUid();
@@ -2018,6 +2063,53 @@ void QServiceBrowserPanel::RefreshArcGISRestConnection(QTreeWidgetItem* item)
 	SetArcGISRestConnectionSettings(item->data(0, RoleUid).toString(), settings);
 	SetItemLoadingState(item, true);
 	StartArcGISRestConnectionLoad(ToQString(connectionNode.uid), settings, connectionNode, ArcGISRestConnectionLoadMode::RefreshExisting);
+}
+
+void QServiceBrowserPanel::RefreshArcGISRestChildNode(QTreeWidgetItem* item)
+{
+	if (!item || IsPlaceholderItem(item) || IsArcGISRestConnectionRootItem(item) || item->data(0, RoleIsLoading).toBool())
+	{
+		return;
+	}
+
+	const ServiceBrowserNodeInfo nodeInfo = GetNodeInfo(item);
+	const ArcGISRestServiceTreeNode::NodeType nodeType = static_cast<ArcGISRestServiceTreeNode::NodeType>(nodeInfo.nodeType);
+	if (!nodeInfo.isArcGISRestNode || nodeInfo.url.isEmpty() || !IsNetworkExpandableArcGISRestNodeType(nodeType))
+	{
+		return;
+	}
+
+	ArcGISRestConnectionSettings settings;
+	if (!GetArcGISRestConnectionSettingsForNodeItem(item, settings))
+	{
+		ShowArcGISRestConnectionError(this, QStringLiteral("无法获取该 ArcGIS REST 节点所属服务连接的原始连接信息。"), QString());
+		return;
+	}
+
+	ArcGISRestServiceTreeNode sourceNode;
+	sourceNode.type = nodeType;
+	sourceNode.text = ToStdString(nodeInfo.text);
+	sourceNode.url = NormalizeArcGISRestRequestUrl(ToStdString(nodeInfo.url));
+	sourceNode.uid = ToStdString(nodeInfo.uid);
+
+	QTreeWidgetItem* const parentItem = item->parent();
+	if (parentItem && !IsPlaceholderItem(parentItem))
+	{
+		sourceNode.parentUid = ToStdString(parentItem->data(0, RoleUid).toString());
+	}
+
+	settings = NormalizeArcGISRestConnectionSettings(settings);
+	settings.serviceUrl = sourceNode.url;
+
+	SetItemLoadingState(item, true);
+	ArcGISRestNodeExpandThread* expandThread = new ArcGISRestNodeExpandThread(QPointer<QServiceBrowserPanel>(this), sourceNode, settings);
+	connect(expandThread, &QThread::finished, expandThread, &QObject::deleteLater);
+	expandThread->start();
+}
+
+void QServiceBrowserPanel::ImportArcGISRestNode(QTreeWidgetItem* item)
+{
+	Q_UNUSED(item);
 }
 
 void QServiceBrowserPanel::EditArcGISRestConnection(QTreeWidgetItem* item)
@@ -2262,9 +2354,6 @@ bool QServiceBrowserPanel::CanDragArcGISRestNodeByDefault(ArcGISRestServiceTreeN
 {
 	switch (nodeType)
 	{
-	case ArcGISRestServiceTreeNode::NodeType::MapService:
-	case ArcGISRestServiceTreeNode::NodeType::ImageService:
-	case ArcGISRestServiceTreeNode::NodeType::FeatureService:
 	case ArcGISRestServiceTreeNode::NodeType::AllLayers:
 	case ArcGISRestServiceTreeNode::NodeType::UnknownVectorLayer:
 	case ArcGISRestServiceTreeNode::NodeType::PointVectorLayer:
@@ -2275,6 +2364,9 @@ bool QServiceBrowserPanel::CanDragArcGISRestNodeByDefault(ArcGISRestServiceTreeN
 	case ArcGISRestServiceTreeNode::NodeType::Unknown:
 	case ArcGISRestServiceTreeNode::NodeType::Root:
 	case ArcGISRestServiceTreeNode::NodeType::Folder:
+	case ArcGISRestServiceTreeNode::NodeType::MapService:
+	case ArcGISRestServiceTreeNode::NodeType::ImageService:
+	case ArcGISRestServiceTreeNode::NodeType::FeatureService:
 	case ArcGISRestServiceTreeNode::NodeType::Table:
 	default:
 		return false;

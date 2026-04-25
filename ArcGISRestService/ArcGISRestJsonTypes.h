@@ -381,6 +381,7 @@ struct ArcGISRestServiceInfo
 
     std::string cimVersion = "";
     std::string serviceDescription = "";
+    std::string name = "";
     std::string mapName = "";
     std::string description = "";
     std::string copyrightText = "";

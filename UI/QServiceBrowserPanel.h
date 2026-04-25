@@ -127,6 +127,7 @@ private:
 	void ApplyStandardItemFlags(QTreeWidgetItem* item, bool canDrag) const;
 	void AddDefaultContextMenuActions(QMenu* menu, const ServiceBrowserNodeInfo& nodeInfo, QTreeWidgetItem* item);
 	void AddArcGISRestConnectionContextMenuActions(QMenu* menu, const ServiceBrowserNodeInfo& nodeInfo, QTreeWidgetItem* item);
+	void AddArcGISRestChildNodeContextMenuActions(QMenu* menu, const ServiceBrowserNodeInfo& nodeInfo, QTreeWidgetItem* item);
 	bool IsArcGISRestCategoryNode(const ServiceBrowserNodeInfo& nodeInfo) const;
 	bool IsArcGISRestConnectionRootItem(const QTreeWidgetItem* item) const;
 	void EnsureArcGISRestCategoryItem();
@@ -144,6 +145,8 @@ private:
 	void CancelArcGISRestConnectionLoadsRecursively(const QTreeWidgetItem* item);
 
 	void RefreshArcGISRestConnection(QTreeWidgetItem* item);
+	void RefreshArcGISRestChildNode(QTreeWidgetItem* item);
+	void ImportArcGISRestNode(QTreeWidgetItem* item);
 	void EditArcGISRestConnection(QTreeWidgetItem* item);
 	void DeleteArcGISRestConnection(QTreeWidgetItem* item);
 	void StartArcGISRestConnectionLoad(const QString& sourceUid, const ArcGISRestConnectionSettings& settings, const ArcGISRestServiceTreeNode& connectionNode, ArcGISRestConnectionLoadMode mode);

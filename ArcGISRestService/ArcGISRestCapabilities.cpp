@@ -1035,6 +1035,7 @@ bool ParseArcGISRestJson(const std::string& json, const std::string& baseUrl, Ar
 	}
 	root.cimVersion = jsonMap["cimVersion"].ToString();
 	root.serviceDescription = jsonMap["serviceDescription"].ToString();
+	root.name = jsonMap["name"].ToString();
 	root.mapName = jsonMap["mapName"].ToString();
 	root.description = jsonMap["description"].ToString();
 	root.copyrightText = jsonMap["copyrightText"].ToString();
@@ -1471,6 +1472,7 @@ bool BuildArcGISRestServiceTree(const ArcGISRestServiceInfo& serviceInfo, ArcGIS
 	{
 		// 根据 capabilities 字段判断服务是否具有 Vector（Query）和 Raster（Map）能力
 		bool hasVectorEntry = false, hasRasterEntry = false;
+		bool isImageService = false;
 		{
 			for (const std::string& capability : serviceInfo.capabilities)
 			{
@@ -1489,6 +1491,7 @@ bool BuildArcGISRestServiceTree(const ArcGISRestServiceInfo& serviceInfo, ArcGIS
 				const std::string serviceDataType = serviceInfo.rawJsonMap.at("serviceDataType").ToString();
 				if (GB_Utf8Find(serviceDataType, "ImageService", false) >= 0)
 				{
+					isImageService = true;
 					hasVectorEntry = true;
 					hasRasterEntry = true;
 				}
@@ -1570,6 +1573,17 @@ bool BuildArcGISRestServiceTree(const ArcGISRestServiceInfo& serviceInfo, ArcGIS
 			allLayersNode.uid = CalculateTreeNodeUid(allLayersNode.type, allLayersNode.text, allLayersNode.url);
 			allLayersNode.parentUid = node.uid;
 			node.children.insert(node.children.begin(), allLayersNode);
+		}
+
+		if (isImageService && node.children.empty())
+		{
+			ArcGISRestServiceTreeNode imageServiceNode;
+			imageServiceNode.type = NodeType::RasterLayer;
+			imageServiceNode.text = (serviceInfo.name.empty() ? node.text : serviceInfo.name);
+			imageServiceNode.url = node.url;
+			imageServiceNode.uid = CalculateTreeNodeUid(imageServiceNode.type, imageServiceNode.text, imageServiceNode.url);
+			imageServiceNode.parentUid = node.uid;
+			node.children.push_back(imageServiceNode);
 		}
 	}
 	node.serviceInfo = serviceInfo;
