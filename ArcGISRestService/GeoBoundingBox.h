@@ -1,0 +1,53 @@
+﻿#ifndef GEO_BOUNDINGBOX_H
+#define GEO_BOUNDINGBOX_H
+
+#include "ArcGISRestServicePort.h"
+#include "GeoBase/Geometry/GB_Rectangle.h"
+#include <string>
+
+#ifdef _MSC_VER
+#  pragma warning(push)
+#  pragma warning(disable: 4251)
+#endif
+
+class ARCGIS_RESTSERVICE_PORT GeoBoundingBox
+{
+public:
+	std::string wktUtf8 = "";
+	GB_Rectangle rect;
+
+	static const GeoBoundingBox Invalid;
+
+	GeoBoundingBox();
+	explicit GeoBoundingBox(const std::string& wktUtf8);
+	GeoBoundingBox(const std::string& wktUtf8, const GB_Rectangle& rect);
+	virtual ~GeoBoundingBox();
+
+	bool operator==(const GeoBoundingBox& other) const;
+	bool operator!=(const GeoBoundingBox& other) const;
+
+	bool IsValid() const;
+
+	void Reset();
+
+	void Set(const std::string& wktUtf8, const GB_Rectangle& rect);
+
+	std::string SerializeToString() const;
+	GB_ByteBuffer SerializeToBinary() const;
+
+	bool Deserialize(const GB_ByteBuffer& data);
+
+	// 将当前 rect 限制到当前 wktUtf8 对应坐标系的“自身有效范围”内
+	bool ClampRectToCrsValidArea();
+
+	// 返回 ClampRectToCrsValidArea() 的结果副本（当前对象不变）。
+	GeoBoundingBox ClampedRectToCrsValidArea() const;
+
+	bool Transform(GeoBoundingBox& outBBox) const;
+};
+
+#ifdef _MSC_VER
+#  pragma warning(pop)
+#endif
+
+#endif

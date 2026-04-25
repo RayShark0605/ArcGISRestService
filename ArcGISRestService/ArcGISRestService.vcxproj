@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{bc78d587-5e10-49db-97b8-1025526ececc}</ProjectGuid>
+    <RootNamespace>ArcGISRestService</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <IncludePath>.\3rdParty\include;.\3rdParty\include\libxml2;.\3rdParty\include\opencv4;$(IncludePath)</IncludePath>
+    <LibraryPath>.\3rdParty\lib\Debug;$(LibraryPath)</LibraryPath>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <IncludePath>.\3rdParty\include;.\3rdParty\include\libxml2;.\3rdParty\include\opencv4;$(IncludePath)</IncludePath>
+    <LibraryPath>.\3rdParty\lib\Release;$(LibraryPath)</LibraryPath>
+  </PropertyGroup>
+  <PropertyGroup Label="Vcpkg">
+    <VcpkgEnabled>false</VcpkgEnabled>
+    <VcpkgManifestInstall>false</VcpkgManifestInstall>
+    <VcpkgAutoLink>false</VcpkgAutoLink>
+    <VcpkgApplocalDeps>false</VcpkgApplocalDeps>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions);ARCGIS_RESTSERVICE_EXPORTS</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>libcurl-d.lib;libcrypto.lib;zlibd.lib;gdald.lib;libxml2.lib;yaml-cppd.lib;opencv_core4d.lib;opencv_imgcodecs4d.lib;opencv_imgproc4d.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions);ARCGIS_RESTSERVICE_EXPORTS</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>libcurl.lib;libcrypto.lib;zlib.lib;gdal.lib;libxml2.lib;yaml-cpp.lib;opencv_core4.lib;opencv_imgcodecs4.lib;opencv_imgproc4.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="ArcGISRestCapabilities.h" />
+    <ClInclude Include="ArcGISRestJsonTypes.h" />
+    <ClInclude Include="ArcGISRestServicePort.h" />
+    <ClInclude Include="GeoBase\CV\GB_ColorRGBA.h" />
+    <ClInclude Include="GeoBase\CV\GB_Image.h" />
+    <ClInclude Include="GeoBase\GB_BaseTypes.h" />
+    <ClInclude Include="GeoBase\GB_Config.h" />
+    <ClInclude Include="GeoBase\GB_Crypto.h" />
+    <ClInclude Include="GeoBase\GB_FileSystem.h" />
+    <ClInclude Include="GeoBase\GB_FormatParser.h" />
+    <ClInclude Include="GeoBase\GB_IO.h" />
+    <ClInclude Include="GeoBase\GB_Logger.h" />
+    <ClInclude Include="GeoBase\GB_Math.h" />
+    <ClInclude Include="GeoBase\GB_Network.h" />
+    <ClInclude Include="GeoBase\GB_ReadWriteLock.h" />
+    <ClInclude Include="GeoBase\GB_ThreadPool.h" />
+    <ClInclude Include="GeoBase\GB_Timer.h" />
+    <ClInclude Include="GeoBase\GB_Utf8String.h" />
+    <ClInclude Include="GeoBase\GB_Utility.h" />
+    <ClInclude Include="GeoBase\GB_Variant.h" />
+    <ClInclude Include="GeoBase\Geometry\GB_GeometryInterface.h" />
+    <ClInclude Include="GeoBase\Geometry\GB_Matrix3x3.h" />
+    <ClInclude Include="GeoBase\Geometry\GB_Point2d.h" />
+    <ClInclude Include="GeoBase\Geometry\GB_Rectangle.h" />
+    <ClInclude Include="GeoBase\Geometry\GB_Vector2d.h" />
+    <ClInclude Include="GeoBoundingBox.h" />
+    <ClInclude Include="GeoCrs.h" />
+    <ClInclude Include="GeoCrsManager.h" />
+    <ClInclude Include="GeoCrsTransform.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="ArcGISRestCapabilities.cpp" />
+    <ClCompile Include="ArcGISRestJsonTypes.cpp" />
+    <ClCompile Include="GeoBase\CV\GB_ColorRGBA.cpp" />
+    <ClCompile Include="GeoBase\CV\GB_Image.cpp" />
+    <ClCompile Include="GeoBase\GB_Config.cpp" />
+    <ClCompile Include="GeoBase\GB_Crypto.cpp" />
+    <ClCompile Include="GeoBase\GB_FileSystem.cpp" />
+    <ClCompile Include="GeoBase\GB_FormatParser.cpp" />
+    <ClCompile Include="GeoBase\GB_IO.cpp" />
+    <ClCompile Include="GeoBase\GB_Logger.cpp" />
+    <ClCompile Include="GeoBase\GB_Math.cpp" />
+    <ClCompile Include="GeoBase\GB_Network.cpp" />
+    <ClCompile Include="GeoBase\GB_ReadWriteLock.cpp" />
+    <ClCompile Include="GeoBase\GB_ThreadPool.cpp" />
+    <ClCompile Include="GeoBase\GB_Timer.cpp" />
+    <ClCompile Include="GeoBase\GB_Utf8String.cpp" />
+    <ClCompile Include="GeoBase\GB_Utility.cpp" />
+    <ClCompile Include="GeoBase\GB_Variant.cpp" />
+    <ClCompile Include="GeoBase\Geometry\GB_GeometryInterface.cpp" />
+    <ClCompile Include="GeoBase\Geometry\GB_Matrix3x3.cpp" />
+    <ClCompile Include="GeoBase\Geometry\GB_Point2d.cpp" />
+    <ClCompile Include="GeoBase\Geometry\GB_Rectangle.cpp" />
+    <ClCompile Include="GeoBase\Geometry\GB_Vector2d.cpp" />
+    <ClCompile Include="GeoBoundingBox.cpp" />
+    <ClCompile Include="GeoCrs.cpp" />
+    <ClCompile Include="GeoCrsManager.cpp" />
+    <ClCompile Include="GeoCrsTransform.cpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

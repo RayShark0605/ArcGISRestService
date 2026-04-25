@@ -1,0 +1,207 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="源文件">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="头文件">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
+    </Filter>
+    <Filter Include="资源文件">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+    </Filter>
+    <Filter Include="头文件\GeoBase">
+      <UniqueIdentifier>{4dbd5a07-187d-4ef2-9aa4-d6d3356f6552}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\GeoBase">
+      <UniqueIdentifier>{2a3052c0-29e3-4e4c-ad5c-316756435798}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\GeoBase\Geometry">
+      <UniqueIdentifier>{62943ca1-2d83-4410-89aa-3109a1ab4b1e}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="头文件\GeoBase\CV">
+      <UniqueIdentifier>{56e35931-a40a-4c91-b239-9869daab7da8}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\GeoBase\CV">
+      <UniqueIdentifier>{3297cf12-c21c-450e-98de-ac4e0792508e}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="头文件\GeoBase\Geometry">
+      <UniqueIdentifier>{cba84938-d3f7-43de-bc22-d0c086680347}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="ArcGISRestServicePort.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\GB_BaseTypes.h">
+      <Filter>头文件\GeoBase</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\GB_Config.h">
+      <Filter>头文件\GeoBase</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\GB_FileSystem.h">
+      <Filter>头文件\GeoBase</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\GB_FormatParser.h">
+      <Filter>头文件\GeoBase</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\GB_IO.h">
+      <Filter>头文件\GeoBase</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\GB_Logger.h">
+      <Filter>头文件\GeoBase</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\GB_Math.h">
+      <Filter>头文件\GeoBase</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\GB_Network.h">
+      <Filter>头文件\GeoBase</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\GB_ThreadPool.h">
+      <Filter>头文件\GeoBase</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\GB_Utf8String.h">
+      <Filter>头文件\GeoBase</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\GB_Utility.h">
+      <Filter>头文件\GeoBase</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\GB_Variant.h">
+      <Filter>头文件\GeoBase</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\GB_Timer.h">
+      <Filter>头文件\GeoBase</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\Geometry\GB_GeometryInterface.h">
+      <Filter>头文件\GeoBase\Geometry</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\Geometry\GB_Matrix3x3.h">
+      <Filter>头文件\GeoBase\Geometry</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\Geometry\GB_Point2d.h">
+      <Filter>头文件\GeoBase\Geometry</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\Geometry\GB_Rectangle.h">
+      <Filter>头文件\GeoBase\Geometry</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\Geometry\GB_Vector2d.h">
+      <Filter>头文件\GeoBase\Geometry</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoCrs.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBoundingBox.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoCrsManager.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoCrsTransform.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\GB_ReadWriteLock.h">
+      <Filter>头文件\GeoBase</Filter>
+    </ClInclude>
+    <ClInclude Include="ArcGISRestJsonTypes.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="ArcGISRestCapabilities.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\GB_Crypto.h">
+      <Filter>头文件\GeoBase</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\CV\GB_ColorRGBA.h">
+      <Filter>头文件\GeoBase\CV</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\CV\GB_Image.h">
+      <Filter>头文件\GeoBase\CV</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="GeoBase\GB_Config.cpp">
+      <Filter>源文件\GeoBase</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBase\GB_FileSystem.cpp">
+      <Filter>源文件\GeoBase</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBase\GB_FormatParser.cpp">
+      <Filter>源文件\GeoBase</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBase\GB_IO.cpp">
+      <Filter>源文件\GeoBase</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBase\GB_Logger.cpp">
+      <Filter>源文件\GeoBase</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBase\GB_Math.cpp">
+      <Filter>源文件\GeoBase</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBase\GB_Network.cpp">
+      <Filter>源文件\GeoBase</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBase\GB_ThreadPool.cpp">
+      <Filter>源文件\GeoBase</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBase\GB_Utf8String.cpp">
+      <Filter>源文件\GeoBase</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBase\GB_Utility.cpp">
+      <Filter>源文件\GeoBase</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBase\GB_Variant.cpp">
+      <Filter>源文件\GeoBase</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBase\GB_Timer.cpp">
+      <Filter>源文件\GeoBase</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBase\Geometry\GB_GeometryInterface.cpp">
+      <Filter>源文件\GeoBase\Geometry</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBase\Geometry\GB_Matrix3x3.cpp">
+      <Filter>源文件\GeoBase\Geometry</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBase\Geometry\GB_Point2d.cpp">
+      <Filter>源文件\GeoBase\Geometry</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBase\Geometry\GB_Rectangle.cpp">
+      <Filter>源文件\GeoBase\Geometry</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBase\Geometry\GB_Vector2d.cpp">
+      <Filter>源文件\GeoBase\Geometry</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBoundingBox.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoCrs.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoCrsManager.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBase\GB_ReadWriteLock.cpp">
+      <Filter>源文件\GeoBase</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoCrsTransform.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="ArcGISRestJsonTypes.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="ArcGISRestCapabilities.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBase\GB_Crypto.cpp">
+      <Filter>源文件\GeoBase</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBase\CV\GB_ColorRGBA.cpp">
+      <Filter>源文件\GeoBase\CV</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBase\CV\GB_Image.cpp">
+      <Filter>源文件\GeoBase\CV</Filter>
+    </ClCompile>
+  </ItemGroup>
+</Project>

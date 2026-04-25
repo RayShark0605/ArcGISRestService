@@ -1,0 +1,21 @@
+#build time: 
+2026.4.2
+
+#build commands:
+vcpkg install opencv[calib3d,contrib,cuda,cudnn,dnn,dnn-cuda,eigen,ffmpeg,freetype,fs,highgui,intrinsics,ipp,jpeg,msmf,nonfree,opengl,openjpeg,openmp,png,quality,quirc,text,thread,tiff,webp,win32ui]:x64-windows
+vcpkg install boost:x64-windows
+vcpkg install cgal:x64-windows
+vcpkg install --recurse gdal[archive,curl,expat,geos,gif,hdf5,iconv,jpeg,lerc,libkml,libspatialite,libxml2,lzma,mysql-libmariadb,netcdf,openjpeg,openssl,pcre2,png,poppler,postgresql,qhull,recommended-features,sqlite3,tools,webp,zstd,freexl]:x64-windows
+vcpkg install yaml-cpp:x64-windows
+
+#package version:
+boost:1.90
+CGAL:6.1.1
+curl:8.19.0
+geos:3.14.1
+libxml2:2.15.2
+OpenCV4:4.12.0
+OpenSSL:3.6.1
+proj:9.8.0
+GDAL:3.12.3
+yaml-cpp:0.9.0

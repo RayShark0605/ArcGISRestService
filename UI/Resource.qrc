@@ -1,0 +1,15 @@
+<RCC>
+    <qresource prefix="/resources">
+        <file>Resources/ArcGIS_Rest_Service_64.ico</file>
+        <file>Resources/ArcGIS_Rest_Service_128.ico</file>
+        <file>Resources/ArcGIS_Rest_Service_Root_32.ico</file>
+        <file>Resources/ArcGIS_Rest_Service_MapService_32.ico</file>
+        <file>Resources/ArcGIS_Rest_Service_FeatureService_32.ico</file>
+        <file>Resources/ArcGIS_Rest_Service_ImageService_32.ico</file>
+        <file>Resources/ArcGIS_Rest_Service_AllLayers_64.ico</file>
+        <file>Resources/ArcGIS_Rest_Service_Line_Layer_64.ico</file>
+        <file>Resources/ArcGIS_Rest_Service_Point_Layer_64.ico</file>
+        <file>Resources/ArcGIS_Rest_Service_Polygon_Layer_64.ico</file>
+        <file>Resources/ArcGIS_Rest_Service_Raster_Layer_64.ico</file>
+    </qresource>
+</RCC>

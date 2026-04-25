@@ -1,0 +1,57 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.14.36915.13
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ArcGISRestService", "ArcGISRestService\ArcGISRestService.vcxproj", "{BC78D587-5E10-49DB-97B8-1025526ECECC}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Test", "Test\Test.vcxproj", "{DAF86C62-8CCE-4C34-8885-84F72B59C4C0}"
+	ProjectSection(ProjectDependencies) = postProject
+		{BC78D587-5E10-49DB-97B8-1025526ECECC} = {BC78D587-5E10-49DB-97B8-1025526ECECC}
+	EndProjectSection
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "UI", "UI\UI.vcxproj", "{B4059919-A278-4415-9477-5083BB94D6F1}"
+	ProjectSection(ProjectDependencies) = postProject
+		{BC78D587-5E10-49DB-97B8-1025526ECECC} = {BC78D587-5E10-49DB-97B8-1025526ECECC}
+	EndProjectSection
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Debug|x86 = Debug|x86
+		Release|x64 = Release|x64
+		Release|x86 = Release|x86
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{BC78D587-5E10-49DB-97B8-1025526ECECC}.Debug|x64.ActiveCfg = Debug|x64
+		{BC78D587-5E10-49DB-97B8-1025526ECECC}.Debug|x64.Build.0 = Debug|x64
+		{BC78D587-5E10-49DB-97B8-1025526ECECC}.Debug|x86.ActiveCfg = Debug|Win32
+		{BC78D587-5E10-49DB-97B8-1025526ECECC}.Debug|x86.Build.0 = Debug|Win32
+		{BC78D587-5E10-49DB-97B8-1025526ECECC}.Release|x64.ActiveCfg = Release|x64
+		{BC78D587-5E10-49DB-97B8-1025526ECECC}.Release|x64.Build.0 = Release|x64
+		{BC78D587-5E10-49DB-97B8-1025526ECECC}.Release|x86.ActiveCfg = Release|Win32
+		{BC78D587-5E10-49DB-97B8-1025526ECECC}.Release|x86.Build.0 = Release|Win32
+		{DAF86C62-8CCE-4C34-8885-84F72B59C4C0}.Debug|x64.ActiveCfg = Debug|x64
+		{DAF86C62-8CCE-4C34-8885-84F72B59C4C0}.Debug|x64.Build.0 = Debug|x64
+		{DAF86C62-8CCE-4C34-8885-84F72B59C4C0}.Debug|x86.ActiveCfg = Debug|Win32
+		{DAF86C62-8CCE-4C34-8885-84F72B59C4C0}.Debug|x86.Build.0 = Debug|Win32
+		{DAF86C62-8CCE-4C34-8885-84F72B59C4C0}.Release|x64.ActiveCfg = Release|x64
+		{DAF86C62-8CCE-4C34-8885-84F72B59C4C0}.Release|x64.Build.0 = Release|x64
+		{DAF86C62-8CCE-4C34-8885-84F72B59C4C0}.Release|x86.ActiveCfg = Release|Win32
+		{DAF86C62-8CCE-4C34-8885-84F72B59C4C0}.Release|x86.Build.0 = Release|Win32
+		{B4059919-A278-4415-9477-5083BB94D6F1}.Debug|x64.ActiveCfg = Debug|x64
+		{B4059919-A278-4415-9477-5083BB94D6F1}.Debug|x64.Build.0 = Debug|x64
+		{B4059919-A278-4415-9477-5083BB94D6F1}.Debug|x86.ActiveCfg = Debug|x64
+		{B4059919-A278-4415-9477-5083BB94D6F1}.Debug|x86.Build.0 = Debug|x64
+		{B4059919-A278-4415-9477-5083BB94D6F1}.Release|x64.ActiveCfg = Release|x64
+		{B4059919-A278-4415-9477-5083BB94D6F1}.Release|x64.Build.0 = Release|x64
+		{B4059919-A278-4415-9477-5083BB94D6F1}.Release|x86.ActiveCfg = Release|x64
+		{B4059919-A278-4415-9477-5083BB94D6F1}.Release|x86.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {9427EAF7-DFB6-4646-BA52-5B6156203834}
+	EndGlobalSection
+EndGlobal
