@@ -11,5 +11,6 @@
         <file>Resources/ArcGIS_Rest_Service_Point_Layer_64.ico</file>
         <file>Resources/ArcGIS_Rest_Service_Polygon_Layer_64.ico</file>
         <file>Resources/ArcGIS_Rest_Service_Raster_Layer_64.ico</file>
+        <file>Resources/ArcGIS_Rest_Service_Unknown_Layer_64.ico</file>
     </qresource>
 </RCC>

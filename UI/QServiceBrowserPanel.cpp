@@ -591,8 +591,9 @@ private:
 class QServiceBrowserPanel::ArcGISRestNodeExpandThread : public QThread
 {
 public:
-	ArcGISRestNodeExpandThread(const QPointer<QServiceBrowserPanel>& panelPointer, const ArcGISRestServiceTreeNode& sourceNode)
-		: QThread(nullptr), panelPointer(panelPointer), sourceNode(sourceNode)
+	ArcGISRestNodeExpandThread(const QPointer<QServiceBrowserPanel>& panelPointer, const ArcGISRestServiceTreeNode& sourceNode,
+		const ArcGISRestConnectionSettings& settings)
+		: QThread(nullptr), panelPointer(panelPointer), sourceNode(sourceNode), settings(settings)
 	{
 	}
 
@@ -609,13 +610,13 @@ protected:
 			return;
 		}
 
-		ArcGISRestConnectionSettings settings;
-		settings.serviceUrl = sourceNode.url;
+		ArcGISRestConnectionSettings requestSettings = settings;
+		requestSettings.serviceUrl = NormalizeArcGISRestRequestUrl(sourceNode.url);
 
 		std::string jsonText = "";
 		std::string requestErrorMessage = "";
-		const GB_NetworkRequestOptions networkOptions = CreateNetworkOptionsFromConnectionSettings(settings);
-		if (!RequestArcGISRestJson(settings, jsonText, networkOptions, &requestErrorMessage) || jsonText.empty())
+		const GB_NetworkRequestOptions networkOptions = CreateNetworkOptionsFromConnectionSettings(requestSettings);
+		if (!RequestArcGISRestJson(requestSettings, jsonText, networkOptions, &requestErrorMessage) || jsonText.empty())
 		{
 			result.errorMainText = QStringLiteral("请求 ArcGIS REST 节点 JSON 失败。 ");
 			result.errorDetailText = ToQString(requestErrorMessage);
@@ -709,6 +710,7 @@ private:
 private:
 	QPointer<QServiceBrowserPanel> panelPointer;
 	ArcGISRestServiceTreeNode sourceNode;
+	ArcGISRestConnectionSettings settings;
 };
 
 QServiceBrowserPanel::QServiceBrowserPanel(QWidget* parent) : QDockWidget(QStringLiteral("服务浏览"), parent)
@@ -1056,8 +1058,13 @@ void QServiceBrowserPanel::OnItemExpanded(QTreeWidgetItem* item)
 
 	emit ArcGISRestNodeExpandRequested(nodeInfo.uid, nodeInfo.url, nodeInfo.text, nodeInfo.nodeType);
 
+	ArcGISRestConnectionSettings settings;
+	GetArcGISRestConnectionSettingsForNodeItem(item, settings);
+	settings = NormalizeArcGISRestConnectionSettings(settings);
+	settings.serviceUrl = NormalizeArcGISRestRequestUrl(sourceNode.url);
+
 	SetItemLoadingState(item, true);
-	ArcGISRestNodeExpandThread* expandThread = new ArcGISRestNodeExpandThread(QPointer<QServiceBrowserPanel>(this), sourceNode);
+	ArcGISRestNodeExpandThread* expandThread = new ArcGISRestNodeExpandThread(QPointer<QServiceBrowserPanel>(this), sourceNode, settings);
 	connect(expandThread, &QThread::finished, expandThread, &QObject::deleteLater);
 	expandThread->start();
 }
@@ -1804,6 +1811,27 @@ bool QServiceBrowserPanel::IsArcGISRestConnectionRootItem(const QTreeWidgetItem*
 	return item->parent() == arcGISRestCategoryItem && item->data(0, RoleIsArcGISRestNode).toBool();
 }
 
+const QTreeWidgetItem* QServiceBrowserPanel::FindArcGISRestConnectionRootItem(const QTreeWidgetItem* item) const
+{
+	if (!item || IsPlaceholderItem(item) || !arcGISRestCategoryItem)
+	{
+		return nullptr;
+	}
+
+	const QTreeWidgetItem* currentItem = item;
+	while (currentItem && currentItem->parent() && currentItem->parent() != arcGISRestCategoryItem)
+	{
+		currentItem = currentItem->parent();
+	}
+
+	if (!currentItem || !IsArcGISRestConnectionRootItem(currentItem))
+	{
+		return nullptr;
+	}
+
+	return currentItem;
+}
+
 bool QServiceBrowserPanel::GetArcGISRestConnectionSettingsForItem(const QTreeWidgetItem* item, ArcGISRestConnectionSettings& outSettings) const
 {
 	outSettings = ArcGISRestConnectionSettings();
@@ -1828,6 +1856,18 @@ bool QServiceBrowserPanel::GetArcGISRestConnectionSettingsForItem(const QTreeWid
 	outSettings.displayName = ToStdString(item->data(0, RoleText).toString());
 	outSettings.serviceUrl = NormalizeArcGISRestRequestUrl(ToStdString(item->data(0, RoleUrl).toString()));
 	return !outSettings.serviceUrl.empty();
+}
+
+bool QServiceBrowserPanel::GetArcGISRestConnectionSettingsForNodeItem(const QTreeWidgetItem* item, ArcGISRestConnectionSettings& outSettings) const
+{
+	outSettings = ArcGISRestConnectionSettings();
+	const QTreeWidgetItem* connectionRootItem = FindArcGISRestConnectionRootItem(item);
+	if (!connectionRootItem)
+	{
+		return false;
+	}
+
+	return GetArcGISRestConnectionSettingsForItem(connectionRootItem, outSettings);
 }
 
 void QServiceBrowserPanel::SetArcGISRestConnectionSettings(const QString& uid, const ArcGISRestConnectionSettings& settings)
@@ -2294,7 +2334,7 @@ QIcon QServiceBrowserPanel::IconForArcGISRestNodeType(ArcGISRestServiceTreeNode:
 	case ArcGISRestServiceTreeNode::NodeType::AllLayers:
 		return QIcon(":/resources/Resources/ArcGIS_Rest_Service_AllLayers_64.ico");
 	case ArcGISRestServiceTreeNode::NodeType::UnknownVectorLayer:
-		return style()->standardIcon(QStyle::SP_DirClosedIcon);
+		return QIcon(":/resources/Resources/ArcGIS_Rest_Service_Unknown_Layer_64.ico");
 	case ArcGISRestServiceTreeNode::NodeType::PointVectorLayer:
 		return QIcon(":/resources/Resources/ArcGIS_Rest_Service_Point_Layer_64.ico");
 	case ArcGISRestServiceTreeNode::NodeType::LineVectorLayer:
@@ -2305,6 +2345,6 @@ QIcon QServiceBrowserPanel::IconForArcGISRestNodeType(ArcGISRestServiceTreeNode:
 		return QIcon(":/resources/Resources/ArcGIS_Rest_Service_Raster_Layer_64.ico");
 	case ArcGISRestServiceTreeNode::NodeType::Unknown:
 	default:
-		return style()->standardIcon(QStyle::SP_FileIcon);
+		return QIcon(":/resources/Resources/ArcGIS_Rest_Service_Unknown_Layer_64.ico");
 	}
 }

@@ -131,7 +131,9 @@ private:
 	bool IsArcGISRestConnectionRootItem(const QTreeWidgetItem* item) const;
 	void EnsureArcGISRestCategoryItem();
 
+	const QTreeWidgetItem* FindArcGISRestConnectionRootItem(const QTreeWidgetItem* item) const;
 	bool GetArcGISRestConnectionSettingsForItem(const QTreeWidgetItem* item, ArcGISRestConnectionSettings& outSettings) const;
+	bool GetArcGISRestConnectionSettingsForNodeItem(const QTreeWidgetItem* item, ArcGISRestConnectionSettings& outSettings) const;
 	void SetArcGISRestConnectionSettings(const QString& uid, const ArcGISRestConnectionSettings& settings);
 	void RemoveArcGISRestConnectionSettings(const QString& uid);
 	void RemoveArcGISRestConnectionSettingsRecursively(const QTreeWidgetItem* item);
