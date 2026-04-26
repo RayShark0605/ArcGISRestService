@@ -1,20 +1,28 @@
 ﻿#include "QLayerManagerPanel.h"
 
+#include <QAbstractItemModel>
 #include <QAbstractItemView>
+#include <QAction>
 #include <QColor>
+#include <QEvent>
 #include <QHash>
 #include <QHBoxLayout>
+#include <QKeyEvent>
 #include <QListWidget>
 #include <QListWidgetItem>
+#include <QMenu>
+#include <QMessageBox>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPen>
 #include <QPixmap>
+#include <QPoint>
 #include <QPointF>
 #include <QRectF>
 #include <QSize>
 #include <QSizePolicy>
 #include <QStyle>
+#include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <QWidget>
@@ -158,9 +166,23 @@ QLayerManagerPanel::QLayerManagerPanel(QWidget* parent) : QDockWidget(QStringLit
 	listWidget->setSelectionMode(QAbstractItemView::ExtendedSelection);
 	listWidget->setAlternatingRowColors(true);
 	listWidget->setIconSize(QSize(20, 20));
-	listWidget->setUniformItemSizes(true);
+	listWidget->setUniformItemSizes(false);
+	listWidget->setTextElideMode(Qt::ElideNone);
+	listWidget->setWordWrap(false);
 	listWidget->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+	listWidget->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+	listWidget->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
 	listWidget->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+	listWidget->setDragEnabled(true);
+	listWidget->setAcceptDrops(true);
+	listWidget->viewport()->setAcceptDrops(true);
+	listWidget->setDropIndicatorShown(true);
+	listWidget->setDefaultDropAction(Qt::MoveAction);
+	listWidget->setDragDropMode(QAbstractItemView::InternalMove);
+	listWidget->setDragDropOverwriteMode(false);
+	listWidget->setEditTriggers(QAbstractItemView::NoEditTriggers);
+	listWidget->setContextMenuPolicy(Qt::CustomContextMenu);
+	listWidget->installEventFilter(this);
 	mainLayout->addWidget(listWidget, 1);
 
 	setWidget(contentWidget);
@@ -176,6 +198,8 @@ QLayerManagerPanel::QLayerManagerPanel(QWidget* parent) : QDockWidget(QStringLit
 	connect(removeAllButton, &QToolButton::clicked, this, &QLayerManagerPanel::OnRemoveAllLayersClicked);
 	connect(listWidget, &QListWidget::itemChanged, this, &QLayerManagerPanel::OnItemChanged);
 	connect(listWidget, &QListWidget::itemSelectionChanged, this, &QLayerManagerPanel::OnItemSelectionChanged);
+	connect(listWidget, &QListWidget::customContextMenuRequested, this, &QLayerManagerPanel::OnListContextMenuRequested);
+	connect(listWidget->model(), &QAbstractItemModel::rowsMoved, this, &QLayerManagerPanel::OnLayerRowsMoved);
 
 	UpdateSelectionDependentButtons();
 }
@@ -239,7 +263,7 @@ bool QLayerManagerPanel::AddLayer(const LayerImportRequestInfo& request)
 		return false;
 	}
 
-	layerInfo.row = static_cast<int>(layers.size());
+	layerInfo.row = 0;
 
 	QListWidgetItem* item = CreateItemFromLayerInfo(layerInfo);
 	if (!item)
@@ -248,18 +272,18 @@ bool QLayerManagerPanel::AddLayer(const LayerImportRequestInfo& request)
 	}
 
 	isUpdatingItems = true;
-	listWidget->addItem(item);
+	listWidget->insertItem(0, item);
+	layers.insert(layers.begin(), layerInfo);
 	isUpdatingItems = false;
 
-	layers.push_back(layerInfo);
 	nextLayerSerial++;
 	RefreshItemRows();
 	UpdateSelectionDependentButtons();
 
 	std::vector<LayerManagerLayerInfo> affectedLayers;
-	affectedLayers.push_back(layerInfo);
+	affectedLayers.push_back(layers.front());
 	std::vector<int> affectedRows;
-	affectedRows.push_back(layerInfo.row);
+	affectedRows.push_back(0);
 	EmitChange(LayerManagerActionType::LayerImported, affectedLayers, affectedRows, true);
 	return true;
 }
@@ -279,8 +303,7 @@ bool QLayerManagerPanel::RemoveLayerByUid(const QString& layerUid)
 
 	std::vector<int> rowsToRemove;
 	rowsToRemove.push_back(layerIndex);
-	RemoveRows(rowsToRemove, LayerManagerActionType::RemoveSelectedLayers);
-	return true;
+	return RemoveRows(rowsToRemove, LayerManagerActionType::RemoveSelectedLayers);
 }
 
 bool QLayerManagerPanel::RemoveLayersByUid(const std::vector<QString>& layerUids)
@@ -306,23 +329,21 @@ bool QLayerManagerPanel::RemoveLayersByUid(const std::vector<QString>& layerUids
 		return false;
 	}
 
-	RemoveRows(rowsToRemove, LayerManagerActionType::RemoveSelectedLayers);
-	return true;
+	return RemoveRows(rowsToRemove, LayerManagerActionType::RemoveSelectedLayers);
 }
 
 void QLayerManagerPanel::ClearLayers()
 {
-	if (!listWidget && layers.empty())
+	if ((!listWidget && layers.empty()) || layers.empty())
 	{
 		return;
 	}
 
 	const std::vector<LayerManagerLayerInfo> affectedLayers = BuildLayerSnapshot();
-	std::vector<int> affectedRows;
-	affectedRows.reserve(affectedLayers.size());
-	for (const LayerManagerLayerInfo& layerInfo : affectedLayers)
+	const std::vector<int> affectedRows = BuildAllVisualRowsInDrawingOrder();
+	if (!ConfirmRemoveLayers(static_cast<int>(affectedLayers.size()), LayerManagerActionType::RemoveAllLayers))
 	{
-		affectedRows.push_back(layerInfo.row);
+		return;
 	}
 
 	isUpdatingItems = true;
@@ -360,8 +381,10 @@ bool QLayerManagerPanel::SetLayerVisible(const QString& layerUid, bool visible)
 		isUpdatingItems = false;
 	}
 
+	LayerManagerLayerInfo affectedLayer = layers[layerIndex];
+	affectedLayer.row = layerIndex;
 	std::vector<LayerManagerLayerInfo> affectedLayers;
-	affectedLayers.push_back(layers[layerIndex]);
+	affectedLayers.push_back(affectedLayer);
 	std::vector<int> affectedRows;
 	affectedRows.push_back(layerIndex);
 	EmitChange(LayerManagerActionType::LayerVisibilityChanged, affectedLayers, affectedRows, visible);
@@ -387,20 +410,47 @@ void QLayerManagerPanel::OnItemChanged(QListWidgetItem* item)
 		return;
 	}
 
-	const bool visible = (item->checkState() == Qt::Checked);
-	if (layers[layerIndex].visible == visible)
+	const QString newDisplayName = item->text();
+	const bool newVisible = (item->checkState() == Qt::Checked);
+	const bool displayNameChanged = (layers[layerIndex].displayName != newDisplayName);
+	const bool visibleChanged = (layers[layerIndex].visible != newVisible);
+	if (!displayNameChanged && !visibleChanged)
 	{
 		return;
 	}
 
-	layers[layerIndex].visible = visible;
+	if (displayNameChanged)
+	{
+		layers[layerIndex].displayName = newDisplayName;
 
+		isUpdatingItems = true;
+		item->setToolTip(newDisplayName);
+		isUpdatingItems = false;
+	}
+
+	if (visibleChanged)
+	{
+		layers[layerIndex].visible = newVisible;
+	}
+
+	LayerManagerLayerInfo affectedLayer = layers[layerIndex];
+	affectedLayer.row = layerIndex;
 	std::vector<LayerManagerLayerInfo> affectedLayers;
-	affectedLayers.push_back(layers[layerIndex]);
+	affectedLayers.push_back(affectedLayer);
 	std::vector<int> affectedRows;
 	affectedRows.push_back(layerIndex);
-	EmitChange(LayerManagerActionType::LayerVisibilityChanged, affectedLayers, affectedRows, visible);
+
+	if (displayNameChanged)
+	{
+		EmitChange(LayerManagerActionType::LayerRenamed, affectedLayers, affectedRows, true);
+	}
+
+	if (visibleChanged)
+	{
+		EmitChange(LayerManagerActionType::LayerVisibilityChanged, affectedLayers, affectedRows, newVisible);
+	}
 }
+
 
 void QLayerManagerPanel::OnItemSelectionChanged()
 {
@@ -420,6 +470,11 @@ void QLayerManagerPanel::OnHideAllLayersClicked()
 void QLayerManagerPanel::OnZoomToSelectedLayersClicked()
 {
 	const std::vector<LayerManagerLayerInfo> selectedLayers = BuildSelectedLayerSnapshot();
+	if (selectedLayers.empty())
+	{
+		return;
+	}
+
 	std::vector<int> selectedRows;
 	selectedRows.reserve(selectedLayers.size());
 	for (const LayerManagerLayerInfo& layerInfo : selectedLayers)
@@ -432,12 +487,12 @@ void QLayerManagerPanel::OnZoomToSelectedLayersClicked()
 void QLayerManagerPanel::OnZoomToAllLayersClicked()
 {
 	const std::vector<LayerManagerLayerInfo> allLayers = BuildLayerSnapshot();
-	std::vector<int> affectedRows;
-	affectedRows.reserve(allLayers.size());
-	for (const LayerManagerLayerInfo& layerInfo : allLayers)
+	if (allLayers.empty())
 	{
-		affectedRows.push_back(layerInfo.row);
+		return;
 	}
+
+	const std::vector<int> affectedRows = BuildAllVisualRowsInDrawingOrder();
 	EmitChange(LayerManagerActionType::ZoomToAllLayers, allLayers, affectedRows, true);
 }
 
@@ -468,6 +523,108 @@ void QLayerManagerPanel::OnRemoveAllLayersClicked()
 	ClearLayers();
 }
 
+void QLayerManagerPanel::OnListContextMenuRequested(const QPoint& position)
+{
+	if (!listWidget)
+	{
+		return;
+	}
+
+	QListWidgetItem* item = listWidget->itemAt(position);
+	if (!item)
+	{
+		return;
+	}
+
+	const int row = listWidget->row(item);
+	if (row < 0 || row >= static_cast<int>(layers.size()))
+	{
+		return;
+	}
+
+	SelectOnlyRow(row);
+
+	QMenu menu(this);
+	QAction* zoomToAction = menu.addAction(QStringLiteral("缩放至"));
+	QAction* renameAction = menu.addAction(QStringLiteral("重命名"));
+	QAction* cloneAction = menu.addAction(QStringLiteral("克隆图层"));
+	QAction* removeAction = menu.addAction(QStringLiteral("移除图层"));
+
+	QAction* selectedAction = menu.exec(listWidget->viewport()->mapToGlobal(position));
+	if (selectedAction == zoomToAction)
+	{
+		ZoomToLayerAtRow(row);
+	}
+	else if (selectedAction == renameAction)
+	{
+		RenameLayerAtRow(row);
+	}
+	else if (selectedAction == cloneAction)
+	{
+		CloneLayerAtRow(row);
+	}
+	else if (selectedAction == removeAction)
+	{
+		RemoveLayerAtRow(row);
+	}
+}
+
+void QLayerManagerPanel::OnLayerRowsMoved(const QModelIndex& sourceParent, int sourceStart, int sourceEnd, const QModelIndex& destinationParent, int destinationRow)
+{
+	Q_UNUSED(sourceParent);
+	Q_UNUSED(sourceStart);
+	Q_UNUSED(sourceEnd);
+	Q_UNUSED(destinationParent);
+	Q_UNUSED(destinationRow);
+	OnLayerOrderPossiblyChanged();
+}
+
+void QLayerManagerPanel::OnLayerOrderPossiblyChanged()
+{
+	if (isUpdatingItems)
+	{
+		return;
+	}
+
+	if (!SynchronizeLayersFromListWidget())
+	{
+		return;
+	}
+
+	UpdateSelectionDependentButtons();
+	const std::vector<LayerManagerLayerInfo> affectedLayers = BuildLayerSnapshot();
+	const std::vector<int> affectedRows = BuildAllVisualRowsInDrawingOrder();
+	EmitChange(LayerManagerActionType::LayerOrderChanged, affectedLayers, affectedRows, true);
+}
+
+bool QLayerManagerPanel::eventFilter(QObject* watched, QEvent* event)
+{
+	if (watched == listWidget && event)
+	{
+		if (event->type() == QEvent::KeyPress)
+		{
+			QKeyEvent* keyEvent = static_cast<QKeyEvent*>(event);
+			const Qt::KeyboardModifiers modifiers = keyEvent->modifiers() & ~Qt::KeypadModifier;
+			if (modifiers == Qt::NoModifier && keyEvent->key() == Qt::Key_F2)
+			{
+				RenameLayerAtRow(listWidget->currentRow());
+				return true;
+			}
+			else if (modifiers == Qt::NoModifier && keyEvent->key() == Qt::Key_Delete)
+			{
+				OnRemoveSelectedLayersClicked();
+				return true;
+			}
+		}
+		else if (event->type() == QEvent::Drop)
+		{
+			QTimer::singleShot(0, this, &QLayerManagerPanel::OnLayerOrderPossiblyChanged);
+		}
+	}
+
+	return QDockWidget::eventFilter(watched, event);
+}
+
 QToolButton* QLayerManagerPanel::CreateButton(const QIcon& icon, const QString& accessibleText, const QString& toolTip, QWidget* parent) const
 {
 	QToolButton* button = new QToolButton(parent);
@@ -495,7 +652,7 @@ QListWidgetItem* QLayerManagerPanel::CreateItemFromLayerInfo(const LayerManagerL
 	item->setData(RoleLayerUid, layerInfo.layerUid);
 	item->setToolTip(layerInfo.displayName);
 	item->setCheckState(layerInfo.visible ? Qt::Checked : Qt::Unchecked);
-	item->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable | Qt::ItemIsUserCheckable);
+	item->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable | Qt::ItemIsEditable | Qt::ItemIsUserCheckable | Qt::ItemIsDragEnabled | Qt::ItemIsDropEnabled);
 	return item;
 }
 
@@ -517,12 +674,18 @@ QString QLayerManagerPanel::CreateUniqueLayerUid(const LayerImportRequestInfo& r
 	{
 		baseUid = ToQString(request.serviceUrl).trimmed();
 	}
-	if (baseUid.isEmpty())
+	return CreateUniqueLayerUidFromBase(baseUid);
+}
+
+QString QLayerManagerPanel::CreateUniqueLayerUidFromBase(const QString& baseUid) const
+{
+	QString normalizedBaseUid = baseUid.trimmed();
+	if (normalizedBaseUid.isEmpty())
 	{
-		baseUid = QStringLiteral("layer");
+		normalizedBaseUid = QStringLiteral("layer");
 	}
 
-	QString candidate = baseUid;
+	QString candidate = normalizedBaseUid;
 	if (FindLayerIndexByUid(candidate) < 0)
 	{
 		return candidate;
@@ -531,7 +694,7 @@ QString QLayerManagerPanel::CreateUniqueLayerUid(const LayerImportRequestInfo& r
 	int serial = nextLayerSerial;
 	while (serial < 1000000000)
 	{
-		candidate = QStringLiteral("%1_%2").arg(baseUid).arg(serial);
+		candidate = QStringLiteral("%1_%2").arg(normalizedBaseUid).arg(serial);
 		if (FindLayerIndexByUid(candidate) < 0)
 		{
 			return candidate;
@@ -539,7 +702,7 @@ QString QLayerManagerPanel::CreateUniqueLayerUid(const LayerImportRequestInfo& r
 		serial++;
 	}
 
-	return QStringLiteral("%1_%2").arg(baseUid).arg(layers.size() + 1);
+	return QStringLiteral("%1_%2").arg(normalizedBaseUid).arg(layers.size() + 1);
 }
 
 QString QLayerManagerPanel::CreateDisplayNameFromRequest(const LayerImportRequestInfo& request) const
@@ -666,6 +829,7 @@ void QLayerManagerPanel::RefreshItemRows()
 		return;
 	}
 
+	isUpdatingItems = true;
 	const int count = std::min(listWidget->count(), static_cast<int>(layers.size()));
 	for (int row = 0; row < count; row++)
 	{
@@ -680,15 +844,75 @@ void QLayerManagerPanel::RefreshItemRows()
 		item->setToolTip(layers[row].displayName);
 		item->setIcon(IconForNodeType(layers[row].importRequest.nodeType));
 		item->setCheckState(layers[row].visible ? Qt::Checked : Qt::Unchecked);
+		item->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable | Qt::ItemIsEditable | Qt::ItemIsUserCheckable | Qt::ItemIsDragEnabled | Qt::ItemIsDropEnabled);
 	}
+	isUpdatingItems = false;
+}
+
+bool QLayerManagerPanel::SynchronizeLayersFromListWidget()
+{
+	if (!listWidget || listWidget->count() != static_cast<int>(layers.size()))
+	{
+		return false;
+	}
+
+	QHash<QString, LayerManagerLayerInfo> oldLayersByUid;
+	oldLayersByUid.reserve(static_cast<int>(layers.size()));
+	std::vector<QString> oldOrder;
+	oldOrder.reserve(layers.size());
+	for (const LayerManagerLayerInfo& layerInfo : layers)
+	{
+		oldLayersByUid.insert(layerInfo.layerUid, layerInfo);
+		oldOrder.push_back(layerInfo.layerUid);
+	}
+
+	std::vector<LayerManagerLayerInfo> newLayers;
+	std::vector<QString> newOrder;
+	newLayers.reserve(layers.size());
+	newOrder.reserve(layers.size());
+
+	for (int row = 0; row < listWidget->count(); row++)
+	{
+		QListWidgetItem* item = listWidget->item(row);
+		if (!item)
+		{
+			return false;
+		}
+
+		const QString layerUid = item->data(RoleLayerUid).toString();
+		const auto iter = oldLayersByUid.constFind(layerUid);
+		if (iter == oldLayersByUid.constEnd())
+		{
+			return false;
+		}
+
+		LayerManagerLayerInfo layerInfo = iter.value();
+		layerInfo.row = row;
+		newLayers.push_back(layerInfo);
+		newOrder.push_back(layerUid);
+	}
+
+	if (oldOrder == newOrder)
+	{
+		RefreshItemRows();
+		return false;
+	}
+
+	layers = newLayers;
+	RefreshItemRows();
+	return true;
 }
 
 std::vector<LayerManagerLayerInfo> QLayerManagerPanel::BuildLayerSnapshot() const
 {
-	std::vector<LayerManagerLayerInfo> snapshot = layers;
-	for (size_t layerIndex = 0; layerIndex < snapshot.size(); layerIndex++)
+	std::vector<LayerManagerLayerInfo> snapshot;
+	snapshot.reserve(layers.size());
+
+	for (int row = static_cast<int>(layers.size()) - 1; row >= 0; row--)
 	{
-		snapshot[layerIndex].row = static_cast<int>(layerIndex);
+		LayerManagerLayerInfo layerInfo = layers[static_cast<size_t>(row)];
+		layerInfo.row = row;
+		snapshot.push_back(layerInfo);
 	}
 	return snapshot;
 }
@@ -721,9 +945,20 @@ std::vector<LayerManagerLayerInfo> QLayerManagerPanel::BuildSelectedLayerSnapsho
 	}
 
 	std::sort(selectedLayers.begin(), selectedLayers.end(), [](const LayerManagerLayerInfo& first, const LayerManagerLayerInfo& second) {
-		return first.row < second.row;
+		return first.row > second.row;
 		});
 	return selectedLayers;
+}
+
+std::vector<int> QLayerManagerPanel::BuildAllVisualRowsInDrawingOrder() const
+{
+	std::vector<int> rows;
+	rows.reserve(layers.size());
+	for (int row = static_cast<int>(layers.size()) - 1; row >= 0; row--)
+	{
+		rows.push_back(row);
+	}
+	return rows;
 }
 
 LayerManagerChangeInfo QLayerManagerPanel::CreateChangeInfo(LayerManagerActionType actionType,
@@ -751,18 +986,16 @@ void QLayerManagerPanel::EmitChange(LayerManagerActionType actionType,
 
 void QLayerManagerPanel::SetAllLayersVisible(bool visible)
 {
-	std::vector<LayerManagerLayerInfo> affectedLayers;
-	std::vector<int> affectedRows;
-	affectedLayers.reserve(layers.size());
-	affectedRows.reserve(layers.size());
+	if (layers.empty())
+	{
+		return;
+	}
 
 	isUpdatingItems = true;
 	for (size_t layerIndex = 0; layerIndex < layers.size(); layerIndex++)
 	{
 		layers[layerIndex].visible = visible;
 		layers[layerIndex].row = static_cast<int>(layerIndex);
-		affectedLayers.push_back(layers[layerIndex]);
-		affectedRows.push_back(static_cast<int>(layerIndex));
 
 		QListWidgetItem* item = ItemAtRow(static_cast<int>(layerIndex));
 		if (item)
@@ -772,46 +1005,59 @@ void QLayerManagerPanel::SetAllLayersVisible(bool visible)
 	}
 	isUpdatingItems = false;
 
+	const std::vector<LayerManagerLayerInfo> affectedLayers = BuildLayerSnapshot();
+	const std::vector<int> affectedRows = BuildAllVisualRowsInDrawingOrder();
 	EmitChange(visible ? LayerManagerActionType::ShowAllLayers : LayerManagerActionType::HideAllLayers, affectedLayers, affectedRows, visible);
 }
 
-void QLayerManagerPanel::RemoveRows(const std::vector<int>& rowsToRemove, LayerManagerActionType actionType)
+bool QLayerManagerPanel::RemoveRows(const std::vector<int>& rowsToRemove, LayerManagerActionType actionType)
 {
 	if (!listWidget || rowsToRemove.empty())
 	{
-		return;
+		return false;
 	}
 
 	std::vector<int> uniqueRows = rowsToRemove;
 	std::sort(uniqueRows.begin(), uniqueRows.end());
 	uniqueRows.erase(std::unique(uniqueRows.begin(), uniqueRows.end()), uniqueRows.end());
 
-	std::vector<LayerManagerLayerInfo> affectedLayers;
-	std::vector<int> affectedRows;
-	affectedLayers.reserve(uniqueRows.size());
-	affectedRows.reserve(uniqueRows.size());
+	std::vector<int> validRows;
+	validRows.reserve(uniqueRows.size());
 	for (int row : uniqueRows)
 	{
-		if (row < 0 || row >= static_cast<int>(layers.size()))
+		if (row >= 0 && row < static_cast<int>(layers.size()))
 		{
-			continue;
+			validRows.push_back(row);
 		}
+	}
 
+	if (validRows.empty())
+	{
+		return false;
+	}
+
+	std::sort(validRows.rbegin(), validRows.rend());
+
+	std::vector<LayerManagerLayerInfo> affectedLayers;
+	std::vector<int> affectedRows;
+	affectedLayers.reserve(validRows.size());
+	affectedRows.reserve(validRows.size());
+	for (int row : validRows)
+	{
 		LayerManagerLayerInfo layerInfo = layers[static_cast<size_t>(row)];
 		layerInfo.row = row;
 		affectedLayers.push_back(layerInfo);
 		affectedRows.push_back(row);
 	}
 
-	if (affectedLayers.empty())
+	if (!ConfirmRemoveLayers(static_cast<int>(affectedLayers.size()), actionType))
 	{
-		return;
+		return false;
 	}
 
 	isUpdatingItems = true;
-	for (std::vector<int>::reverse_iterator rowIter = uniqueRows.rbegin(); rowIter != uniqueRows.rend(); ++rowIter)
+	for (int row : validRows)
 	{
-		const int row = *rowIter;
 		if (row < 0 || row >= static_cast<int>(layers.size()))
 		{
 			continue;
@@ -825,6 +1071,134 @@ void QLayerManagerPanel::RemoveRows(const std::vector<int>& rowsToRemove, LayerM
 	RefreshItemRows();
 	UpdateSelectionDependentButtons();
 	EmitChange(actionType, affectedLayers, affectedRows, true);
+	return true;
+}
+
+bool QLayerManagerPanel::ConfirmRemoveLayers(int layerCount, LayerManagerActionType actionType) const
+{
+	if (layerCount <= 0)
+	{
+		return false;
+	}
+
+	QString message;
+	if (actionType == LayerManagerActionType::RemoveAllLayers)
+	{
+		message = QStringLiteral("确定要移除全部 %1 个图层吗？").arg(layerCount);
+	}
+	else if (layerCount == 1)
+	{
+		message = QStringLiteral("确定要移除当前图层吗？");
+	}
+	else
+	{
+		message = QStringLiteral("确定要移除当前选中的 %1 个图层吗？").arg(layerCount);
+	}
+
+	const QMessageBox::StandardButton result = QMessageBox::question(
+		const_cast<QLayerManagerPanel*>(this),
+		QStringLiteral("确认移除图层"),
+		message,
+		QMessageBox::Yes | QMessageBox::No,
+		QMessageBox::No);
+	return result == QMessageBox::Yes;
+}
+
+bool QLayerManagerPanel::RenameLayerAtRow(int row)
+{
+	if (!listWidget || row < 0 || row >= static_cast<int>(layers.size()))
+	{
+		return false;
+	}
+
+	QListWidgetItem* item = ItemAtRow(row);
+	if (!item)
+	{
+		return false;
+	}
+
+	SelectOnlyRow(row);
+	listWidget->scrollToItem(item, QAbstractItemView::EnsureVisible);
+	listWidget->setFocus(Qt::OtherFocusReason);
+	listWidget->editItem(item);
+	return true;
+}
+
+
+bool QLayerManagerPanel::CloneLayerAtRow(int row)
+{
+	if (!listWidget || row < 0 || row >= static_cast<int>(layers.size()))
+	{
+		return false;
+	}
+
+	LayerManagerLayerInfo newLayerInfo = layers[static_cast<size_t>(row)];
+	newLayerInfo.layerUid = CreateUniqueLayerUidFromBase(newLayerInfo.layerUid);
+	newLayerInfo.row = 0;
+
+	QListWidgetItem* item = CreateItemFromLayerInfo(newLayerInfo);
+	if (!item)
+	{
+		return false;
+	}
+
+	isUpdatingItems = true;
+	listWidget->insertItem(0, item);
+	layers.insert(layers.begin(), newLayerInfo);
+	isUpdatingItems = false;
+
+	nextLayerSerial++;
+	RefreshItemRows();
+	UpdateSelectionDependentButtons();
+
+	std::vector<LayerManagerLayerInfo> affectedLayers;
+	affectedLayers.push_back(layers.front());
+	std::vector<int> affectedRows;
+	affectedRows.push_back(0);
+	EmitChange(LayerManagerActionType::LayerCloned, affectedLayers, affectedRows, true);
+	return true;
+}
+
+bool QLayerManagerPanel::ZoomToLayerAtRow(int row)
+{
+	if (row < 0 || row >= static_cast<int>(layers.size()))
+	{
+		return false;
+	}
+
+	SelectOnlyRow(row);
+	OnZoomToSelectedLayersClicked();
+	return true;
+}
+
+bool QLayerManagerPanel::RemoveLayerAtRow(int row)
+{
+	if (row < 0 || row >= static_cast<int>(layers.size()))
+	{
+		return false;
+	}
+
+	std::vector<int> rowsToRemove;
+	rowsToRemove.push_back(row);
+	return RemoveRows(rowsToRemove, LayerManagerActionType::RemoveSelectedLayers);
+}
+
+void QLayerManagerPanel::SelectOnlyRow(int row)
+{
+	if (!listWidget || row < 0 || row >= listWidget->count())
+	{
+		return;
+	}
+
+	QListWidgetItem* item = listWidget->item(row);
+	if (!item)
+	{
+		return;
+	}
+
+	listWidget->clearSelection();
+	listWidget->setCurrentItem(item);
+	item->setSelected(true);
 }
 
 void QLayerManagerPanel::UpdateSelectionDependentButtons()

@@ -4,6 +4,7 @@
 #include <QPoint>
 #include <QRectF>
 #include <QString>
+#include <QTimer>
 #include <QWidget>
 
 #include <string>
@@ -100,6 +101,12 @@ private:
 	bool hasMousePosition = false;
 	QPoint lastMousePosition;
 
+	QTimer viewStateChangedDebounceTimer;
+	bool hasPendingViewStateChanged = false;
+	bool hasEmittedViewState = false;
+	GB_Rectangle lastEmittedViewExtent;
+	double lastEmittedApproximateMetersPerPixel = 0.0;
+
 	QImage CreateQImageFromGBImage(const GB_Image& image) const;
 	void DrawBackground(QPainter& painter) const;
 	void DrawMapTiles(QPainter& painter) const;
@@ -123,7 +130,12 @@ private:
 	GB_Rectangle MakeExtentByCenterAndPixelSize(const GB_Point2d& center, double targetPixelSize) const;
 	GB_Rectangle NormalizeExtentForCurrentWidget(const GB_Rectangle& extent) const;
 	GB_Rectangle EnsureUsableExtent(const GB_Rectangle& extent) const;
+	void ScheduleViewStateChanged();
+	void ScheduleViewStateChangedWithDelay(int debounceIntervalMs);
+	void ScheduleWheelZoomViewStateChanged();
+	void FlushPendingViewStateChanged();
 	void EmitViewStateChanged();
+	bool ShouldEmitViewStateChanged(double approximateMetersPerPixel) const;
 	double CalculateApproximateMetersPerPixel() const;
 	QRectF WorldRectangleToScreenRectangle(const GB_Rectangle& rect) const;
 };

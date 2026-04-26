@@ -18,6 +18,7 @@
 #include <QPen>
 #include <QPolygonF>
 #include <QResizeEvent>
+#include <QTimer>
 #include <QWheelEvent>
 
 #include <algorithm>
@@ -35,6 +36,8 @@ namespace
 	constexpr double MinimumCoordinateRange = 1e-8;
 	constexpr double MaximumCoordinateAbsValue = 1e10;
 	constexpr double FixedAxisPixelLength = 50.0;
+	constexpr int ViewStateChangedDebounceIntervalMs = 180;
+	constexpr int WheelZoomEndDetectionIntervalMs = 300;
 
 	QColor ToQColor(const GB_ColorRGBA& color)
 	{
@@ -49,6 +52,35 @@ namespace
 	bool IsFiniteNonNegative(double value)
 	{
 		return std::isfinite(value) && value >= 0;
+	}
+
+	bool AreNearlyEqual(double firstValue, double secondValue)
+	{
+		if (std::isnan(firstValue) || std::isnan(secondValue))
+		{
+			return std::isnan(firstValue) && std::isnan(secondValue);
+		}
+
+		if (!std::isfinite(firstValue) || !std::isfinite(secondValue))
+		{
+			return firstValue == secondValue;
+		}
+
+		const double scale = std::max(1.0, std::max(std::abs(firstValue), std::abs(secondValue)));
+		return std::abs(firstValue - secondValue) <= scale * 1e-12;
+	}
+
+	bool AreRectanglesNearlyEqual(const GB_Rectangle& firstRect, const GB_Rectangle& secondRect)
+	{
+		if (!firstRect.IsValid() || !secondRect.IsValid())
+		{
+			return !firstRect.IsValid() && !secondRect.IsValid();
+		}
+
+		return AreNearlyEqual(firstRect.minX, secondRect.minX) &&
+			AreNearlyEqual(firstRect.minY, secondRect.minY) &&
+			AreNearlyEqual(firstRect.maxX, secondRect.maxX) &&
+			AreNearlyEqual(firstRect.maxY, secondRect.maxY);
 	}
 
 	QString FormatCoordinate(double value)
@@ -140,6 +172,14 @@ QMainCanvas::QMainCanvas(QWidget* parent) : QWidget(parent)
 	setFocusPolicy(Qt::StrongFocus);
 	setAcceptDrops(true);
 	setAutoFillBackground(false);
+
+	viewStateChangedDebounceTimer.setSingleShot(true);
+	viewStateChangedDebounceTimer.setTimerType(Qt::PreciseTimer);
+	viewStateChangedDebounceTimer.setInterval(ViewStateChangedDebounceIntervalMs);
+	connect(&viewStateChangedDebounceTimer, &QTimer::timeout, this, [this]()
+		{
+			FlushPendingViewStateChanged();
+		});
 
 	UpdateCrsDisplayText();
 
@@ -472,9 +512,13 @@ void QMainCanvas::resizeEvent(QResizeEvent* event)
 
 	if (viewExtent.IsValid())
 	{
+		const GB_Rectangle previousExtent = viewExtent;
 		const GB_Point2d center = viewExtent.Center();
 		UpdateViewExtentFromCenterAndPixelSize(center);
-		EmitViewStateChanged();
+		if (!AreRectanglesNearlyEqual(viewExtent, previousExtent))
+		{
+			ScheduleViewStateChanged();
+		}
 	}
 }
 
@@ -517,6 +561,11 @@ void QMainCanvas::mouseMoveEvent(QMouseEvent* event)
 	{
 		const QPoint delta = event->pos() - lastPanPosition;
 		lastPanPosition = event->pos();
+		if (delta.isNull())
+		{
+			event->accept();
+			return;
+		}
 
 		const double safePixelSize = ClampPixelSizeForCurrentWidget(pixelSize);
 		const double offsetX = -static_cast<double>(delta.x()) * safePixelSize;
@@ -530,10 +579,16 @@ void QMainCanvas::mouseMoveEvent(QMouseEvent* event)
 			return;
 		}
 
+		if (AreRectanglesNearlyEqual(newExtent, viewExtent))
+		{
+			event->accept();
+			return;
+		}
+
 		viewExtent = newExtent;
 		pixelSize = safePixelSize;
 
-		EmitViewStateChanged();
+		ScheduleViewStateChanged();
 		update();
 		event->accept();
 		return;
@@ -562,6 +617,7 @@ void QMainCanvas::mouseReleaseEvent(QMouseEvent* event)
 	{
 		isPanning = false;
 		unsetCursor();
+		FlushPendingViewStateChanged();
 		event->accept();
 		return;
 	}
@@ -583,6 +639,7 @@ void QMainCanvas::mouseDoubleClickEvent(QMouseEvent* event)
 	{
 		isPanning = false;
 		unsetCursor();
+		FlushPendingViewStateChanged();
 		ZoomFull();
 		event->accept();
 		return;
@@ -601,9 +658,25 @@ void QMainCanvas::wheelEvent(QWheelEvent* event)
 	hasMousePosition = true;
 	lastMousePosition = event->pos();
 
+	const bool isWheelBeginEvent = event->phase() == Qt::ScrollBegin;
+	const bool isWheelEndEvent = event->phase() == Qt::ScrollEnd;
+
 	const QPoint angleDelta = event->angleDelta();
 	if (angleDelta.y() == 0)
 	{
+		if (isWheelEndEvent)
+		{
+			FlushPendingViewStateChanged();
+			event->accept();
+			return;
+		}
+
+		if (isWheelBeginEvent)
+		{
+			event->accept();
+			return;
+		}
+
 		QWidget::wheelEvent(event);
 		return;
 	}
@@ -612,6 +685,7 @@ void QMainCanvas::wheelEvent(QWheelEvent* event)
 	const GB_Point2d worldBefore = ScreenToWorld(GB_Point2d(position.x(), position.y()));
 	if (!worldBefore.IsValid())
 	{
+		event->accept();
 		return;
 	}
 
@@ -619,6 +693,7 @@ void QMainCanvas::wheelEvent(QWheelEvent* event)
 	const double zoomFactor = std::pow(1.2, zoomSteps);
 	if (!IsFinitePositive(zoomFactor))
 	{
+		event->accept();
 		return;
 	}
 
@@ -637,10 +712,27 @@ void QMainCanvas::wheelEvent(QWheelEvent* event)
 		return;
 	}
 
+	if (AreRectanglesNearlyEqual(newExtent, viewExtent))
+	{
+		if (isWheelEndEvent)
+		{
+			FlushPendingViewStateChanged();
+		}
+
+		event->accept();
+		return;
+	}
+
 	viewExtent = newExtent;
 	UpdatePixelSizeFromViewExtent();
-	EmitViewStateChanged();
+	ScheduleWheelZoomViewStateChanged();
 	update();
+
+	if (isWheelEndEvent)
+	{
+		FlushPendingViewStateChanged();
+	}
+
 	event->accept();
 }
 
@@ -1325,9 +1417,68 @@ GB_Rectangle QMainCanvas::EnsureUsableExtent(const GB_Rectangle& extent) const
 	return result;
 }
 
+void QMainCanvas::ScheduleViewStateChanged()
+{
+	ScheduleViewStateChangedWithDelay(ViewStateChangedDebounceIntervalMs);
+}
+
+void QMainCanvas::ScheduleViewStateChangedWithDelay(int debounceIntervalMs)
+{
+	if (!viewExtent.IsValid())
+	{
+		return;
+	}
+
+	const int safeDebounceIntervalMs = std::max(1, debounceIntervalMs);
+	hasPendingViewStateChanged = true;
+	viewStateChangedDebounceTimer.start(safeDebounceIntervalMs);
+}
+
+void QMainCanvas::ScheduleWheelZoomViewStateChanged()
+{
+	// Qt::ScrollBegin / Qt::ScrollEnd 并非所有平台都稳定提供。
+	// 对没有明确结束事件的平台，用一个更长的单次防抖定时器判定“一次连续缩放”结束。
+	ScheduleViewStateChangedWithDelay(WheelZoomEndDetectionIntervalMs);
+}
+
+void QMainCanvas::FlushPendingViewStateChanged()
+{
+	if (!hasPendingViewStateChanged)
+	{
+		viewStateChangedDebounceTimer.stop();
+		return;
+	}
+
+	EmitViewStateChanged();
+}
+
 void QMainCanvas::EmitViewStateChanged()
 {
-	emit ViewStateChanged(viewExtent, CalculateApproximateMetersPerPixel());
+	hasPendingViewStateChanged = false;
+	viewStateChangedDebounceTimer.stop();
+
+	const double approximateMetersPerPixel = CalculateApproximateMetersPerPixel();
+	if (!ShouldEmitViewStateChanged(approximateMetersPerPixel))
+	{
+		return;
+	}
+
+	lastEmittedViewExtent = viewExtent;
+	lastEmittedApproximateMetersPerPixel = approximateMetersPerPixel;
+	hasEmittedViewState = true;
+
+	emit ViewStateChanged(viewExtent, approximateMetersPerPixel);
+}
+
+bool QMainCanvas::ShouldEmitViewStateChanged(double approximateMetersPerPixel) const
+{
+	if (!hasEmittedViewState)
+	{
+		return true;
+	}
+
+	return !AreRectanglesNearlyEqual(viewExtent, lastEmittedViewExtent) ||
+		!AreNearlyEqual(approximateMetersPerPixel, lastEmittedApproximateMetersPerPixel);
 }
 
 double QMainCanvas::CalculateApproximateMetersPerPixel() const

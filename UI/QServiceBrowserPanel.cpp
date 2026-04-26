@@ -592,24 +592,32 @@ private:
 
 			if (!result.succeeded)
 			{
+				QString statusText;
 				if (result.loadMode == ArcGISRestConnectionLoadMode::AddNew)
 				{
-					panel->RemoveNode(result.sourceUid);
+					statusText = QStringLiteral("状态：首次加载失败。服务连接已保留，可稍后刷新或编辑后重试。");
 				}
-				else if (result.loadMode == ArcGISRestConnectionLoadMode::RefreshExisting || result.loadMode == ArcGISRestConnectionLoadMode::EditExisting)
+				else if (result.loadMode == ArcGISRestConnectionLoadMode::RefreshExisting)
 				{
-					QString statusText = (result.loadMode == ArcGISRestConnectionLoadMode::RefreshExisting) ?
-						QStringLiteral("状态：刷新失败。") : QStringLiteral("状态：编辑后重新加载失败。");
-					if (!result.errorMainText.isEmpty())
-					{
-						statusText += QStringLiteral("\n\n") + result.errorMainText.trimmed();
-					}
-					if (!result.errorDetailText.isEmpty())
-					{
-						statusText += QStringLiteral("\n\n详细错误：") + result.errorDetailText;
-					}
-					panel->RestoreArcGISRestNodeLazyExpansionState(result.connectionNode, statusText);
+					statusText = QStringLiteral("状态：刷新失败。服务连接已保留。");
 				}
+				else
+				{
+					statusText = QStringLiteral("状态：编辑后重新加载失败。服务连接已保留，可重新编辑或刷新。");
+				}
+
+				if (!result.errorMainText.isEmpty())
+				{
+					statusText += QStringLiteral("\n\n") + result.errorMainText.trimmed();
+				}
+				if (!result.errorDetailText.isEmpty())
+				{
+					statusText += QStringLiteral("\n\n详细错误：") + result.errorDetailText;
+				}
+
+				const QString currentUidBeforeRestore = panel->GetCurrentSelectableNodeUid();
+				panel->RestoreArcGISRestNodeLazyExpansionState(result.connectionNode, statusText);
+				panel->RestoreCurrentSelectableNodeByUid(currentUidBeforeRestore, result.sourceUid);
 
 				ShowArcGISRestConnectionError(panel, result.errorMainText, result.errorDetailText);
 				return;
