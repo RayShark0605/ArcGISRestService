@@ -374,6 +374,18 @@ void QMainCanvas::AddMapTile(const MapTile& tile)
 	}
 }
 
+bool QMainCanvas::HasDrawables() const
+{
+	if (!mapTiles.empty())
+	{
+		return true;
+	}
+
+	// 后续如果恢复 vectorDrawables / extentMarkerDrawables，
+	// 这里也应把它们纳入 Canvas 是否已有内容 的判断。
+	return false;
+}
+
 void QMainCanvas::ClearDrawables()
 {
 	mapTiles.clear();

@@ -58,6 +58,7 @@ public:
 	GB_Point2d ScreenToWorld(const GB_Point2d& point) const;
 
 	void AddMapTile(const MapTile& tile);
+	bool HasDrawables() const;
 
 	void ClearDrawables();
 	void RemoveDrawables(const std::vector<std::string>& drawablesUids);

@@ -478,7 +478,7 @@ namespace
 
 }
 
-bool ArcGISRestLayerImportRequest::IsValid() const
+bool LayerImportRequestInfo::IsValid() const
 {
 	return !nodeUid.empty() && !serviceUrl.empty() && !connectionSettings.serviceUrl.empty() && serviceInfo != nullptr &&
 		nodeType != ArcGISRestServiceTreeNode::NodeType::Unknown &&
@@ -784,7 +784,7 @@ private:
 
 QServiceBrowserPanel::QServiceBrowserPanel(QWidget* parent) : QDockWidget(QStringLiteral("服务浏览"), parent)
 {
-	qRegisterMetaType<ArcGISRestLayerImportRequest>("ArcGISRestLayerImportRequest");
+	qRegisterMetaType<LayerImportRequestInfo>("ArcGISRestLayerImportRequest");
 
 	setObjectName(QStringLiteral("QServiceBrowserPanel"));
 	setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
@@ -2330,7 +2330,7 @@ void QServiceBrowserPanel::ImportArcGISRestNode(QTreeWidgetItem* item)
 
 bool QServiceBrowserPanel::EmitArcGISRestLayerImportRequest(QTreeWidgetItem* item)
 {
-	ArcGISRestLayerImportRequest request;
+	LayerImportRequestInfo request;
 	QString errorMessage;
 	if (!BuildArcGISRestLayerImportRequest(item, request, &errorMessage))
 	{
@@ -2341,13 +2341,13 @@ bool QServiceBrowserPanel::EmitArcGISRestLayerImportRequest(QTreeWidgetItem* ite
 		return false;
 	}
 
-	emit ArcGISRestLayerImportRequested(request);
+	emit LayerImportRequested(request);
 	return true;
 }
 
-bool QServiceBrowserPanel::BuildArcGISRestLayerImportRequest(QTreeWidgetItem* item, ArcGISRestLayerImportRequest& outRequest, QString* errorMessage) const
+bool QServiceBrowserPanel::BuildArcGISRestLayerImportRequest(QTreeWidgetItem* item, LayerImportRequestInfo& outRequest, QString* errorMessage) const
 {
-	outRequest = ArcGISRestLayerImportRequest();
+	outRequest = LayerImportRequestInfo();
 	if (errorMessage)
 	{
 		errorMessage->clear();
@@ -2448,7 +2448,7 @@ bool QServiceBrowserPanel::BuildArcGISRestLayerImportRequest(QTreeWidgetItem* it
 		{
 			*errorMessage = QStringLiteral("导入请求结构体不完整。 ");
 		}
-		outRequest = ArcGISRestLayerImportRequest();
+		outRequest = LayerImportRequestInfo();
 		return false;
 	}
 	return true;

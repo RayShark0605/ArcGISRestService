@@ -8,6 +8,7 @@ class QLabel;
 class QMenu;
 class QMainCanvas;
 class QServiceBrowserPanel;
+class QLayerManagerPanel;
 
 class QArcGISRestMainWindow : public QMainWindow
 {
@@ -21,6 +22,7 @@ public:
 private:
 	QMainCanvas* mainCanvas = nullptr;
 	QServiceBrowserPanel* serviceBrowserPanel = nullptr;
+	QLayerManagerPanel* layerManagerPanel = nullptr;
 
 	void InitializeUi();
 };

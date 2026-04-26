@@ -42,7 +42,7 @@ enum class ArcGISRestConnectionLoadMode
 };
 
 
-struct ArcGISRestLayerImportRequest
+struct LayerImportRequestInfo
 {
 	std::string nodeUid = "";        // 被导入节点的 UID。
 	std::string nodeText = "";       // 被导入节点的显示名称。
@@ -61,7 +61,7 @@ struct ArcGISRestLayerImportRequest
 	bool IsValid() const;
 };
 
-Q_DECLARE_METATYPE(ArcGISRestLayerImportRequest)
+Q_DECLARE_METATYPE(LayerImportRequestInfo)
 
 class QServiceBrowserPanel : public QDockWidget
 {
@@ -119,7 +119,7 @@ signals:
 	void NodeDoubleClicked(const QString& nodeUid, const QString& url, const QString& text, int nodeType);
 	void ArcGISRestNodeExpandRequested(const QString& nodeUid, const QString& url, const QString& text, int nodeType);
 	void NodeRefreshRequested(const QString& nodeUid, const QString& url, const QString& text, int nodeType);
-	void ArcGISRestLayerImportRequested(const ArcGISRestLayerImportRequest& request);
+	void LayerImportRequested(const LayerImportRequestInfo& request);
 
 private slots:
 	void OnCurrentItemChanged(QTreeWidgetItem* currentItem, QTreeWidgetItem* previousItem);
@@ -185,7 +185,7 @@ private:
 	void RefreshArcGISRestChildNode(QTreeWidgetItem* item);
 	void ImportArcGISRestNode(QTreeWidgetItem* item);
 	bool EmitArcGISRestLayerImportRequest(QTreeWidgetItem* item);
-	bool BuildArcGISRestLayerImportRequest(QTreeWidgetItem* item, ArcGISRestLayerImportRequest& outRequest, QString* errorMessage = nullptr) const;
+	bool BuildArcGISRestLayerImportRequest(QTreeWidgetItem* item, LayerImportRequestInfo& outRequest, QString* errorMessage = nullptr) const;
 	const QTreeWidgetItem* FindArcGISRestServiceItemForImport(const QTreeWidgetItem* item) const;
 	std::shared_ptr<const ArcGISRestServiceInfo> GetArcGISRestServiceInfoForItem(const QTreeWidgetItem* item) const;
 	std::string ExtractLayerIdForImport(const QTreeWidgetItem* item, const std::string& serviceUrl, const ArcGISRestServiceInfo* serviceInfo) const;

@@ -1,13 +1,14 @@
 ﻿#include "QArcGISRestMainWindow.h"
 #include "QMainCanvas.h"
 #include "QServiceBrowserPanel.h"
-#include "MapRefresher.h"
+#include "LayerRefresher.h"
+#include "QLayerManagerPanel.h"
 
 QArcGISRestMainWindow::QArcGISRestMainWindow(QWidget* parent) : QMainWindow(parent)
 {
 	InitializeUi();
 
-	MapRefresher* refresher = MapRefresher::GetInstance();
+	LayerRefresher* refresher = LayerRefresher::GetInstance();
 	if (refresher)
 	{
 		refresher->SetCanvasAndPanel(mainCanvas, serviceBrowserPanel);
@@ -31,6 +32,12 @@ void QArcGISRestMainWindow::InitializeUi()
 	serviceBrowserPanel->setMinimumWidth(260);
 	serviceBrowserPanel->BindMainCanvas(mainCanvas);
 	addDockWidget(QServiceBrowserPanel::GetDefaultDockWidgetArea(), serviceBrowserPanel);
+
+	layerManagerPanel = new QLayerManagerPanel(this);
+	layerManagerPanel->setObjectName(QStringLiteral("layerManagerPanel"));
+	layerManagerPanel->setMinimumWidth(260);
+	layerManagerPanel->BindServiceBrowserPanel(serviceBrowserPanel);
+	addDockWidget(QLayerManagerPanel::GetDefaultDockWidgetArea(), layerManagerPanel);
 }
 
 QArcGISRestMainWindow::~QArcGISRestMainWindow()

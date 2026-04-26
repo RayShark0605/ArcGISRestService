@@ -41,7 +41,10 @@
     <ClCompile Include="QArcGISRestConnectionDialog.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="MapRefresher.cpp">
+    <ClCompile Include="LayerRefresher.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="QLayerManagerPanel.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -58,7 +61,10 @@
     <QtMoc Include="QArcGISRestConnectionDialog.h">
       <Filter>Header Files</Filter>
     </QtMoc>
-    <QtMoc Include="MapRefresher.h">
+    <QtMoc Include="LayerRefresher.h">
+      <Filter>Header Files</Filter>
+    </QtMoc>
+    <QtMoc Include="QLayerManagerPanel.h">
       <Filter>Header Files</Filter>
     </QtMoc>
   </ItemGroup>

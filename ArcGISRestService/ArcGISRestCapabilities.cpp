@@ -5,6 +5,9 @@
 #include "GeoCrsManager.h"
 #include <unordered_map>
 #include <unordered_set>
+#include <algorithm>
+#include <cmath>
+#include <map>
 
 #define SET_ERROR_MESSAGE(msg) do { if (errorMessage) { *errorMessage = (msg); } } while(0)
 
@@ -449,7 +452,7 @@ namespace
 	{
 		const auto HasKey = [&jsonMap](const char* key) -> bool {
 			return jsonMap.find(key) != jsonMap.end();
-		};
+			};
 
 		const auto IsDetailedLayerOrTableObject = [](const GB_VariantMap& objectMap) -> bool {
 			if (objectMap.find("id") == objectMap.end())
@@ -473,7 +476,7 @@ namespace
 				objectMap.find("displayField") != objectMap.end() ||
 				objectMap.find("advancedQueryCapabilities") != objectMap.end() ||
 				objectMap.find("supportedQueryFormats") != objectMap.end();
-		};
+			};
 
 		const auto HasDetailedLayerOrTableArray = [&jsonMap, &IsDetailedLayerOrTableObject](const char* key) -> bool {
 			const auto iter = jsonMap.find(key);
@@ -503,7 +506,7 @@ namespace
 			}
 
 			return false;
-		};
+			};
 
 		// 1. 单个 /<layerId> 或 /<tableId>
 		if (HasKey("id") && (HasKey("parentLayer") || HasKey("subLayers") || HasKey("fields") || HasKey("extent") || HasKey("geometryField") ||
@@ -837,7 +840,7 @@ namespace
 		return ArcGISRestServiceTreeNode::NodeType::UnknownVectorLayer;
 	}
 
-	std::vector<ArcGISRestServiceTreeNode> BuildLayerNodeRecursively(const ArcGISMapServiceLayerEntry& layerEntry, std::unordered_set<std::string>& ancestorLayerIds, std::unordered_set<std::string>& builtLayerIds, 
+	std::vector<ArcGISRestServiceTreeNode> BuildLayerNodeRecursively(const ArcGISMapServiceLayerEntry& layerEntry, std::unordered_set<std::string>& ancestorLayerIds, std::unordered_set<std::string>& builtLayerIds,
 		const std::unordered_map<std::string, std::vector<const ArcGISMapServiceLayerEntry*>>& childLayersByParentId, bool hasVectorEntry, bool hasRasterEntry)
 	{
 		const std::string& layerId = layerEntry.id;
@@ -860,7 +863,7 @@ namespace
 
 				std::unordered_set<std::string> childAncestorLayerIds = ancestorLayerIds;
 				std::vector<ArcGISRestServiceTreeNode> childLayerNodes = BuildLayerNodeRecursively(*childLayer, childAncestorLayerIds, builtLayerIds, childLayersByParentId, hasVectorEntry, hasRasterEntry);
-				
+
 				for (ArcGISRestServiceTreeNode& childLayerNode : childLayerNodes)
 				{
 					childLayerNode.parentUid = thisNode.uid;
@@ -873,7 +876,7 @@ namespace
 					return static_cast<int>(a.type) > static_cast<int>(b.type); // 同名时，RasterLayer < VectorLayer
 				}
 				return GB_Utf8CompareLogical(a.text, b.text) < 0;
-			});
+				});
 			return { thisNode };
 		}
 
@@ -1226,7 +1229,7 @@ bool ArcGISRestServiceTreeNode::Expandable() const
 		return true;
 	}
 
-	return (type == NodeType::Root || type == NodeType::Folder || type == NodeType::MapService || 
+	return (type == NodeType::Root || type == NodeType::Folder || type == NodeType::MapService ||
 		type == NodeType::ImageService || type == NodeType::FeatureService || type == NodeType::AllLayers);
 }
 
@@ -1236,7 +1239,7 @@ bool ArcGISRestServiceTreeNode::NeedRequestJson() const
 	{
 		return false;
 	}
-	return (type == NodeType::Root || type == NodeType::Folder || type == NodeType::MapService || 
+	return (type == NodeType::Root || type == NodeType::Folder || type == NodeType::MapService ||
 		type == NodeType::ImageService || type == NodeType::FeatureService || type == NodeType::AllLayers);
 }
 
@@ -1466,7 +1469,7 @@ bool BuildArcGISRestServiceTree(const ArcGISRestServiceInfo& serviceInfo, ArcGIS
 
 		std::sort(node.children.begin(), node.children.end(), [](const ArcGISRestServiceTreeNode& a, const ArcGISRestServiceTreeNode& b) {
 			return GB_Utf8CompareLogical(a.text, b.text) < 0;
-		});
+			});
 	}
 	else if (serviceInfo.resourceType == ArcGISRestResourceType::Service)
 	{
@@ -1497,7 +1500,7 @@ bool BuildArcGISRestServiceTree(const ArcGISRestServiceInfo& serviceInfo, ArcGIS
 				}
 			}
 		}
-		
+
 		// 构建 parentLayerId -> childLayerEntry 列表的映射，以便后续递归构建图层树
 		std::unordered_map<std::string, std::vector<const ArcGISMapServiceLayerEntry*>> childLayersByParentId;
 		std::vector<const ArcGISMapServiceLayerEntry*> rootLayers;
@@ -1528,7 +1531,7 @@ bool BuildArcGISRestServiceTree(const ArcGISRestServiceInfo& serviceInfo, ArcGIS
 				}
 			}
 		}
-		
+
 		// 递归构建图层树
 		std::unordered_set<std::string> builtLayerIds;
 		builtLayerIds.reserve(serviceInfo.layers.size());
@@ -1554,7 +1557,7 @@ bool BuildArcGISRestServiceTree(const ArcGISRestServiceInfo& serviceInfo, ArcGIS
 				return static_cast<int>(a.type) > static_cast<int>(b.type); // 同名时，RasterLayer < VectorLayer
 			}
 			return GB_Utf8CompareLogical(a.text, b.text) < 0;
-		});
+			});
 
 		// 如果有多个图层，并且服务支持导出图片，则在图层列表顶部添加一个“全部图层”的节点
 		if (serviceInfo.layers.size() > 1 && !serviceInfo.supportedImageFormatTypes.empty() && !node.children.empty())
@@ -1593,7 +1596,7 @@ bool BuildArcGISRestServiceTree(const ArcGISRestServiceInfo& serviceInfo, ArcGIS
 std::vector<ImageRequestItem> CalculateImageRequestItems(const CalculateImageRequestItemsInput& input)
 {
 	if (!input.viewExtent.IsValid() || input.viewExtentWidthInPixels <= 0 || input.viewExtentHeightInPixels <= 0 || input.serviceUrl.empty() ||
-		input.layerId.empty() || input.imageFormat.empty())
+		(!input.isImageServer && input.layerId.empty()) || input.imageFormat.empty())
 	{
 		return {};
 	}
@@ -1615,18 +1618,19 @@ std::vector<ImageRequestItem> CalculateImageRequestItems(const CalculateImageReq
 		{
 			return {};
 		}
+
 		const int tileWidthInPixels = serviceInfo->tileInfo.cols;
 		const int tileHeightInPixels = serviceInfo->tileInfo.rows;
 		if (tileWidthInPixels < 1 || tileHeightInPixels < 1)
 		{
 			return {};
 		}
-		const GB_Point2d& originPt = serviceInfo->tileInfo.origin;
 
+		const GB_Point2d& originPt = serviceInfo->tileInfo.origin;
 		std::vector<ArcGISMapServiceTileLod> lods = serviceInfo->tileInfo.lods;
 		std::sort(lods.begin(), lods.end(), [](const ArcGISMapServiceTileLod& a, const ArcGISMapServiceTileLod& b) {
 			return a.resolution > b.resolution;
-		});
+			});
 
 		int level = 0;
 		int foundLevel = -1;
@@ -1644,29 +1648,35 @@ std::vector<ImageRequestItem> CalculateImageRequestItems(const CalculateImageReq
 		level = (foundLevel >= 0 ? foundLevel : lods.back().level);
 
 		const double resolution = levelToResolutionMap[level];
-		const int minX = static_cast<int>(std::floor((viewExtent.minX - originPt.x) / (tileWidthInPixels * resolution)));
-		const int minY = static_cast<int>(std::floor((originPt.y - viewExtent.maxY) / (tileHeightInPixels * resolution)));
-		const int maxX = static_cast<int>(std::ceil((viewExtent.maxX - originPt.x) / (tileWidthInPixels * resolution)));
-		const int maxY = static_cast<int>(std::ceil((originPt.y - viewExtent.minY) / (tileHeightInPixels * resolution)));
-		const double imageX = (viewExtent.minX - originPt.x) / resolution;
-		const double imageY = (originPt.y - viewExtent.maxY) / resolution;
+		if (!std::isfinite(resolution) || resolution <= 0.0)
+		{
+			return {};
+		}
 
-		int i = 0;
-		const double resolutionScale = resolution / targetResolution;
+		const double tileWidthInMapUnits = static_cast<double>(tileWidthInPixels) * resolution;
+		const double tileHeightInMapUnits = static_cast<double>(tileHeightInPixels) * resolution;
+		const int minX = static_cast<int>(std::floor((viewExtent.minX - originPt.x) / tileWidthInMapUnits));
+		const int minY = static_cast<int>(std::floor((originPt.y - viewExtent.maxY) / tileHeightInMapUnits));
+		const int maxX = static_cast<int>(std::ceil((viewExtent.maxX - originPt.x) / tileWidthInMapUnits)) - 1;
+		const int maxY = static_cast<int>(std::ceil((originPt.y - viewExtent.minY) / tileHeightInMapUnits)) - 1;
+
 		for (int iy = minY; iy <= maxY; iy++)
 		{
 			for (int ix = minX; ix <= maxX; ix++)
 			{
 				const std::string requestUrl = baseUrl + GB_Utf8Format("/tile/%d/%d/%d", level, iy, ix);
-				const GB_Rectangle worldRect(originPt.x + ix * tileWidthInPixels * resolution, originPt.y - iy * tileHeightInPixels * resolution,
-					tileWidthInPixels * resolution, tileHeightInPixels * resolution);
+
+				const double tileMinX = originPt.x + static_cast<double>(ix) * tileWidthInMapUnits;
+				const double tileMaxY = originPt.y - static_cast<double>(iy) * tileHeightInMapUnits;
+				const double tileMaxX = tileMinX + tileWidthInMapUnits;
+				const double tileMinY = tileMaxY - tileHeightInMapUnits;
 
 				ImageRequestItem requestItem;
 				requestItem.serviceUrl = input.serviceUrl;
 				requestItem.layerId = input.layerId;
 				requestItem.imageFormat = input.imageFormat;
 				requestItem.requestUrl = requestUrl;
-				requestItem.imageExtent = worldRect;
+				requestItem.imageExtent.Set(tileMinX, tileMinY, tileMaxX, tileMaxY);
 				requestItem.uid = GB_Md5Hash(requestItem.requestUrl);
 				requestItems.push_back(std::move(requestItem));
 			}
@@ -1678,29 +1688,42 @@ std::vector<ImageRequestItem> CalculateImageRequestItems(const CalculateImageReq
 
 		const int maxImageWidth = ((serviceInfo && serviceInfo->maxImageWidth > 0) ? serviceInfo->maxImageWidth : input.viewExtentWidthInPixels);
 		const int maxImageHeight = ((serviceInfo && serviceInfo->maxImageHeight > 0) ? serviceInfo->maxImageHeight : input.viewExtentHeightInPixels);
+		if (maxImageWidth <= 0 || maxImageHeight <= 0)
+		{
+			return {};
+		}
+
 		const int numStepsInWidth = static_cast<int>(std::ceil(static_cast<double>(input.viewExtentWidthInPixels) / maxImageWidth));
 		const int numStepsInHeight = static_cast<int>(std::ceil(static_cast<double>(input.viewExtentHeightInPixels) / maxImageHeight));
 		for (int currentStepWidth = 0; currentStepWidth < numStepsInWidth; currentStepWidth++)
 		{
 			for (int currentStepHeight = 0; currentStepHeight < numStepsInHeight; currentStepHeight++)
 			{
-				const int imageWidth = (currentStepWidth == numStepsInWidth - 1 ? input.viewExtentWidthInPixels % maxImageWidth : maxImageWidth);
-				const int imageHeight = (currentStepHeight == numStepsInHeight - 1 ? input.viewExtentHeightInPixels % maxImageHeight : maxImageHeight);
+				const int usedWidthPixels = currentStepWidth * maxImageWidth;
+				const int usedHeightPixels = currentStepHeight * maxImageHeight;
+				const int imageWidth = std::min(maxImageWidth, input.viewExtentWidthInPixels - usedWidthPixels);
+				const int imageHeight = std::min(maxImageHeight, input.viewExtentHeightInPixels - usedHeightPixels);
+				if (imageWidth <= 0 || imageHeight <= 0)
+				{
+					continue;
+				}
+
 				const std::string imageSizeInfo = GB_Utf8Format("%d,%d", imageWidth, imageHeight);
-
-				const double imageMinX = viewExtent.minX + viewExtent.Width() * currentStepWidth * maxImageWidth / input.viewExtentWidthInPixels;
-				const double imageMinY = viewExtent.minY + viewExtent.Height() * currentStepHeight * maxImageHeight / input.viewExtentHeightInPixels;
-				const double imageMaxX = viewExtent.minX + viewExtent.Width() * (currentStepWidth * maxImageWidth + imageWidth) / input.viewExtentWidthInPixels;
-				const double imageMaxY = viewExtent.minY + viewExtent.Height() * (currentStepHeight * maxImageHeight + imageHeight) / input.viewExtentHeightInPixels;
+				const double imageMinX = viewExtent.minX + viewExtent.Width() * usedWidthPixels / input.viewExtentWidthInPixels;
+				const double imageMinY = viewExtent.minY + viewExtent.Height() * usedHeightPixels / input.viewExtentHeightInPixels;
+				const double imageMaxX = viewExtent.minX + viewExtent.Width() * (usedWidthPixels + imageWidth) / input.viewExtentWidthInPixels;
+				const double imageMaxY = viewExtent.minY + viewExtent.Height() * (usedHeightPixels + imageHeight) / input.viewExtentHeightInPixels;
 				const std::string imageBBoxInfo = GB_Utf8Format("%lf,%lf,%lf,%lf", imageMinX, imageMinY, imageMaxX, imageMaxY);
-
-				const std::string layerInfo = GB_Utf8Format("show:%s", input.layerId.c_str());
 
 				std::string imageUrl = baseUrl;
 				imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "bbox", imageBBoxInfo);
 				imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "size", imageSizeInfo);
 				imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "format", input.imageFormat);
-				imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "layers", layerInfo);
+				if (!input.isImageServer && !input.layerId.empty())
+				{
+					const std::string layerInfo = GB_Utf8Format("show:%s", input.layerId.c_str());
+					imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "layers", layerInfo);
+				}
 				imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "transparent", "true");
 				imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "f", "image");
 				if (input.dpi > 0)
