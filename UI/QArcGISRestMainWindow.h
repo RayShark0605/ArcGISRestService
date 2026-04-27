@@ -18,6 +18,7 @@ public:
 	explicit QArcGISRestMainWindow(QWidget* parent = nullptr);
 	virtual ~QArcGISRestMainWindow() override;
 
+	QMainCanvas* GetCanvas() const;
 
 private:
 	QMainCanvas* mainCanvas = nullptr;

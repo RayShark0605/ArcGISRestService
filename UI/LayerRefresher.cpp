@@ -1,28 +1,46 @@
 ﻿#include "LayerRefresher.h"
-#include "QServiceBrowserPanel.h"
+
 #include "QMainCanvas.h"
-#include "GeoCrsManager.h"
+#include "QServiceBrowserPanel.h"
+#include "QLayerManagerPanel.h"
 #include "GeoBoundingBox.h"
+#include "GeoCrsTransform.h"
+#include "GeoCrsManager.h"
+#include "GeoBase/GB_Crypto.h"
 #include "GeoBase/GB_Network.h"
-#include "GeoBase/GB_ThreadPool.h"
+#include "GeoBase/GB_Utf8String.h"
 #include "GeoBase/CV/GB_Image.h"
 
+#include <QByteArray>
 #include <QMetaObject>
-#include <QThread>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
-#include <future>
+#include <condition_variable>
+#include <cstdint>
 #include <limits>
 #include <mutex>
+#include <queue>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace
 {
+	constexpr size_t FallbackLogicalCpuCoreCount = 4;
+	constexpr size_t MinParallelTileWorkerCount = 4;
+	constexpr unsigned int DefaultTileConnectTimeoutMs = 5000;
+	constexpr unsigned int DefaultTileTotalTimeoutMs = 60000;
+	constexpr double InitialZoomMarginRatio = 0.05;
+	constexpr int ReprojectSampleGridCount = 21;
+	constexpr size_t MaxReprojectOutputSideLength = 4096;
+	constexpr size_t MaxReprojectOutputPixelCount = 16ULL * 1024ULL * 1024ULL;
+
 	std::string TrimmedStdString(const std::string& text)
 	{
 		size_t beginIndex = 0;
@@ -68,11 +86,17 @@ namespace
 		return true;
 	}
 
+	std::string ToStdString(const QString& text)
+	{
+		const QByteArray bytes = text.toUtf8();
+		return std::string(bytes.constData(), static_cast<size_t>(bytes.size()));
+	}
+
 	GB_NetworkRequestOptions CreateNetworkOptionsFromConnectionSettings(const ArcGISRestConnectionSettings& settings)
 	{
 		GB_NetworkRequestOptions networkOptions;
-		networkOptions.connectTimeoutMs = 5000;
-		networkOptions.totalTimeoutMs = 0;
+		networkOptions.connectTimeoutMs = DefaultTileConnectTimeoutMs;
+		networkOptions.totalTimeoutMs = DefaultTileTotalTimeoutMs;
 		networkOptions.refererUtf8 = TrimmedStdString(settings.httpReferer);
 
 		for (const std::pair<std::string, std::string>& header : settings.httpCustomHeaders)
@@ -117,21 +141,6 @@ namespace
 			request.serviceNodeType == ArcGISRestServiceTreeNode::NodeType::ImageService;
 	}
 
-	bool ShouldRequestNodeJsonForImport(const LayerImportRequestInfo& request)
-	{
-		if (request.nodeType == ArcGISRestServiceTreeNode::NodeType::AllLayers)
-		{
-			return false;
-		}
-
-		if (IsArcGISRestServiceNodeType(request.nodeType))
-		{
-			return false;
-		}
-
-		return !request.nodeUrl.empty() && !request.layerId.empty();
-	}
-
 	std::string GetServiceFallbackWkt(const ArcGISRestServiceInfo& serviceInfo)
 	{
 		if (serviceInfo.hasSpatialReference && !serviceInfo.spatialReference.wkt.empty())
@@ -150,6 +159,213 @@ namespace
 		}
 
 		return std::string();
+	}
+
+
+	std::string GetImageRequestWkt(const ArcGISRestServiceInfo& serviceInfo, bool isTiled)
+	{
+		if (isTiled && !serviceInfo.tileInfo.spatialReference.wkt.empty())
+		{
+			return serviceInfo.tileInfo.spatialReference.wkt;
+		}
+
+		return GetServiceFallbackWkt(serviceInfo);
+	}
+
+	bool IsCrsDefinitionValid(const std::string& wktUtf8)
+	{
+		return !GB_Utf8Trim(wktUtf8).empty() && GeoCrsManager::IsDefinitionValidCached(wktUtf8);
+	}
+
+	bool AreCrsEquivalent(const std::string& firstWktUtf8, const std::string& secondWktUtf8)
+	{
+		const std::string firstTrimmed = GB_Utf8Trim(firstWktUtf8);
+		const std::string secondTrimmed = GB_Utf8Trim(secondWktUtf8);
+		if (firstTrimmed.empty() || secondTrimmed.empty())
+		{
+			return false;
+		}
+
+		if (firstTrimmed == secondTrimmed)
+		{
+			return true;
+		}
+
+		const std::shared_ptr<const GeoCrs> firstCrs = GeoCrsManager::GetFromDefinitionCached(firstTrimmed);
+		const std::shared_ptr<const GeoCrs> secondCrs = GeoCrsManager::GetFromDefinitionCached(secondTrimmed);
+		if (!firstCrs || !secondCrs || !firstCrs->IsValid() || !secondCrs->IsValid())
+		{
+			return false;
+		}
+
+		return *firstCrs == *secondCrs;
+	}
+
+	bool TryTransformRectangleBetweenCrs(const std::string& sourceWktUtf8, const std::string& targetWktUtf8, const GB_Rectangle& sourceRect, GB_Rectangle& outRect)
+	{
+		outRect = GB_Rectangle::Invalid;
+		if (!sourceRect.IsValid() || !IsCrsDefinitionValid(sourceWktUtf8) || !IsCrsDefinitionValid(targetWktUtf8))
+		{
+			return false;
+		}
+
+		if (AreCrsEquivalent(sourceWktUtf8, targetWktUtf8))
+		{
+			outRect = sourceRect;
+			return outRect.IsValid();
+		}
+
+		GeoBoundingBox transformedBox;
+		const GeoBoundingBox sourceBox(sourceWktUtf8, sourceRect);
+		if (!GeoCrsTransform::TransformBoundingBox(sourceBox, targetWktUtf8, transformedBox, ReprojectSampleGridCount))
+		{
+			return false;
+		}
+
+		outRect = transformedBox.rect;
+		return outRect.IsValid();
+	}
+
+
+	std::string EscapeJsonString(const std::string& text)
+	{
+		std::string result;
+		result.reserve(text.size() + text.size() / 8 + 8);
+
+		static const char hexChars[] = "0123456789ABCDEF";
+		for (unsigned char ch : text)
+		{
+			switch (ch)
+			{
+			case '"':
+				result += "\\\"";
+				break;
+			case '\\':
+				result += "\\\\";
+				break;
+			case '\b':
+				result += "\\b";
+				break;
+			case '\f':
+				result += "\\f";
+				break;
+			case '\n':
+				result += "\\n";
+				break;
+			case '\r':
+				result += "\\r";
+				break;
+			case '\t':
+				result += "\\t";
+				break;
+			default:
+				if (ch < 0x20)
+				{
+					result += "\\u00";
+					result.push_back(hexChars[(ch >> 4) & 0x0F]);
+					result.push_back(hexChars[ch & 0x0F]);
+				}
+				else
+				{
+					result.push_back(static_cast<char>(ch));
+				}
+				break;
+			}
+		}
+
+		return result;
+	}
+
+	std::string ExtractEpsgCodeFromEpsgString(const std::string& epsgStringUtf8)
+	{
+		const std::string trimmed = GB_Utf8Trim(epsgStringUtf8);
+		if (trimmed.empty())
+		{
+			return std::string();
+		}
+
+		const std::string prefix = "EPSG:";
+		if (!StartsWithAsciiNoCase(trimmed, prefix))
+		{
+			return std::string();
+		}
+
+		const std::string code = GB_Utf8Trim(trimmed.substr(prefix.size()));
+		if (code.empty())
+		{
+			return std::string();
+		}
+
+		for (char ch : code)
+		{
+			if (!std::isdigit(static_cast<unsigned char>(ch)))
+			{
+				return std::string();
+			}
+		}
+		return code;
+	}
+
+	std::string BuildArcGISSpatialReferenceQueryValue(const std::string& wktUtf8)
+	{
+		const std::string trimmedWkt = GB_Utf8Trim(wktUtf8);
+		if (trimmedWkt.empty() || !GeoCrsManager::IsDefinitionValidCached(trimmedWkt))
+		{
+			return std::string();
+		}
+
+		const std::string epsgCode = ExtractEpsgCodeFromEpsgString(GeoCrsManager::WktToEpsgCodeUtf8(trimmedWkt));
+		if (!epsgCode.empty())
+		{
+			return epsgCode;
+		}
+
+		std::string esriWkt = trimmedWkt;
+		const std::shared_ptr<const GeoCrs> crs = GeoCrsManager::GetFromDefinitionCached(trimmedWkt);
+		if (crs && crs->IsValid())
+		{
+			const std::string exportedWkt = crs->ExportToWktUtf8(GeoCrs::WktFormat::Wkt1Esri, false);
+			if (!GB_Utf8Trim(exportedWkt).empty())
+			{
+				esriWkt = exportedWkt;
+			}
+		}
+
+		return std::string("{\"wkt\":\"") + EscapeJsonString(esriWkt) + "\"}";
+	}
+
+	std::string AddExportSpatialReferenceParameters(const std::string& requestUrl, const std::string& spatialReferenceValue, bool isImageServer)
+	{
+		if (requestUrl.empty() || spatialReferenceValue.empty())
+		{
+			return requestUrl;
+		}
+
+		std::string resultUrl = requestUrl;
+		resultUrl = GB_UrlOperator::SetUrlQueryValue(resultUrl, "bboxSR", spatialReferenceValue);
+		resultUrl = GB_UrlOperator::SetUrlQueryValue(resultUrl, "imageSR", spatialReferenceValue);
+
+		if (isImageServer)
+		{
+			resultUrl = GB_UrlOperator::SetUrlQueryValue(resultUrl, "adjustAspectRatio", "false");
+		}
+
+		return resultUrl;
+	}
+
+	bool TryGetTargetPixelSize(const GB_Rectangle& targetExtent, int targetWidthInPixels, int targetHeightInPixels, double& outPixelSizeX, double& outPixelSizeY)
+	{
+		outPixelSizeX = 0.0;
+		outPixelSizeY = 0.0;
+
+		if (!targetExtent.IsValid() || targetWidthInPixels <= 0 || targetHeightInPixels <= 0)
+		{
+			return false;
+		}
+
+		outPixelSizeX = targetExtent.Width() / static_cast<double>(targetWidthInPixels);
+		outPixelSizeY = targetExtent.Height() / static_cast<double>(targetHeightInPixels);
+		return std::isfinite(outPixelSizeX) && outPixelSizeX > 0.0 && std::isfinite(outPixelSizeY) && outPixelSizeY > 0.0;
 	}
 
 	bool TryCreateBoundingBoxFromEnvelope(const ArcGISRestEnvelope& envelope, const std::string& fallbackWkt, GeoBoundingBox& outBBox)
@@ -176,21 +392,11 @@ namespace
 		return true;
 	}
 
-	bool TryGetImportBoundingBox(const LayerImportRequestInfo& request, const ArcGISRestServiceInfo& nodeInfo, const ArcGISRestServiceInfo& serviceInfo, GeoBoundingBox& outBBox)
+	bool TryGetLayerBoundingBox(const LayerImportRequestInfo& request, const ArcGISRestServiceInfo& serviceInfo, GeoBoundingBox& outBBox)
 	{
 		const std::string fallbackWkt = GetServiceFallbackWkt(serviceInfo);
 
-		if (nodeInfo.layerOrTable.hasExtent && TryCreateBoundingBoxFromEnvelope(nodeInfo.layerOrTable.extent, fallbackWkt, outBBox))
-		{
-			return true;
-		}
-
-		if (nodeInfo.hasFullExtent && TryCreateBoundingBoxFromEnvelope(nodeInfo.fullExtent, fallbackWkt, outBBox))
-		{
-			return true;
-		}
-
-		if (nodeInfo.hasInitialExtent && TryCreateBoundingBoxFromEnvelope(nodeInfo.initialExtent, fallbackWkt, outBBox))
+		if (serviceInfo.layerOrTable.hasExtent && TryCreateBoundingBoxFromEnvelope(serviceInfo.layerOrTable.extent, fallbackWkt, outBBox))
 		{
 			return true;
 		}
@@ -205,6 +411,7 @@ namespace
 			return true;
 		}
 
+		(void)request;
 		return false;
 	}
 
@@ -311,38 +518,13 @@ namespace
 		return 96;
 	}
 
-	constexpr size_t MaxParallelImageDownloadThreadCount = 8;
-
-	size_t ChooseParallelImageDownloadThreadCount(size_t requestItemCount)
+	size_t ChooseWorkerThreadCount()
 	{
-		if (requestItemCount <= 1)
-		{
-			return requestItemCount;
-		}
-
 		const unsigned int hardwareThreadCount = std::thread::hardware_concurrency();
-		size_t preferredThreadCount = (hardwareThreadCount > 0) ? static_cast<size_t>(hardwareThreadCount) : static_cast<size_t>(4);
-
-		// 瓦片下载属于网络 I/O + 图像解码混合任务。线程数略高于低核心数机器的 CPU 核数可以隐藏网络等待，
-		// 但不应无上限放大，避免对远端 ArcGIS 服务和本地解码造成过高瞬时压力。
-		preferredThreadCount = std::max<size_t>(preferredThreadCount, 4);
-		preferredThreadCount = std::min<size_t>(preferredThreadCount, MaxParallelImageDownloadThreadCount);
-		return std::max<size_t>(1, std::min<size_t>(requestItemCount, preferredThreadCount));
+		const size_t logicalCpuCoreCount = (hardwareThreadCount > 0) ? static_cast<size_t>(hardwareThreadCount) : FallbackLogicalCpuCoreCount;
+		const size_t preferredThreadCount = logicalCpuCoreCount * 2;
+		return std::max<size_t>(MinParallelTileWorkerCount, preferredThreadCount);
 	}
-
-	struct ArcGISRestImageDownloadContext
-	{
-		LayerImportRequestInfo request;
-		ArcGISRestServiceInfo serviceInfo;
-		GB_Rectangle viewExtent;
-		int viewExtentWidthInPixels = 0;
-		int viewExtentHeightInPixels = 0;
-		std::string imageFormat = "";
-		bool isTiled = false;
-		bool isImageServer = false;
-		int dpi = 96;
-		GB_NetworkRequestOptions networkOptions;
-	};
 
 	std::string PrefixRequestUrlIfNeeded(const std::string& requestUrl, const ArcGISRestConnectionSettings& connectionSettings)
 	{
@@ -354,110 +536,1106 @@ namespace
 
 		return urlPrefix + requestUrl;
 	}
-}
 
-class LayerRefresher::ArcGISRestImageDownloadThread : public QThread
-{
-public:
-	ArcGISRestImageDownloadThread(const QPointer<LayerRefresher>& refresherPointer, const ArcGISRestImageDownloadContext& context)
-		: QThread(nullptr), refresherPointer(refresherPointer), context(context)
+	std::string TrimTrailingSlash(std::string url)
 	{
+		while (!url.empty() && url.back() == '/')
+		{
+			url.pop_back();
+		}
+		return url;
 	}
 
-protected:
-	virtual void run() override
+	std::string JoinArcGISLayerIds(const ArcGISRestServiceInfo& serviceInfo)
 	{
-		if (isInterruptionRequested())
+		std::string result;
+		for (const ArcGISMapServiceLayerEntry& layer : serviceInfo.layers)
 		{
-			return;
-		}
-
-		CalculateImageRequestItemsInput input;
-		input.viewExtent = context.viewExtent;
-		input.viewExtentWidthInPixels = context.viewExtentWidthInPixels;
-		input.viewExtentHeightInPixels = context.viewExtentHeightInPixels;
-		input.serviceUrl = context.request.serviceUrl;
-		input.layerId = context.request.layerId;
-		input.imageFormat = context.imageFormat;
-		input.serviceInfo = &context.serviceInfo;
-		input.isTiled = context.isTiled;
-		input.isImageServer = context.isImageServer;
-		input.dpi = context.dpi;
-
-		const std::vector<ImageRequestItem> requestItems = CalculateImageRequestItems(input);
-		if (requestItems.empty())
-		{
-			return;
-		}
-
-		const size_t threadCount = ChooseParallelImageDownloadThreadCount(requestItems.size());
-		if (threadCount == 0)
-		{
-			return;
-		}
-
-		try
-		{
-			GB_ThreadPool threadPool(threadCount);
-			std::vector<std::future<bool>> futures;
-			futures.reserve(requestItems.size());
-
-			for (size_t itemIndex = 0; itemIndex < requestItems.size(); itemIndex++)
+			if (layer.id.empty())
 			{
-				if (isInterruptionRequested())
-				{
-					break;
-				}
+				continue;
+			}
 
-				const ImageRequestItem requestItem = requestItems[itemIndex];
-				if (requestItem.requestUrl.empty() || !requestItem.imageExtent.IsValid())
+			if (!result.empty())
+			{
+				result += ",";
+			}
+			result += layer.id;
+		}
+		return result;
+	}
+
+	std::string GetEffectiveLayerId(const LayerImportRequestInfo& request, const ArcGISRestServiceInfo& serviceInfo, bool isImageServer)
+	{
+		if (!request.layerId.empty())
+		{
+			return request.layerId;
+		}
+
+		if (!isImageServer)
+		{
+			return JoinArcGISLayerIds(serviceInfo);
+		}
+
+		// ImageServer 的 exportImage 通常不依赖 layers 参数，但内部统一任务结构需要一个非空逻辑 ID。
+		return "0";
+	}
+
+	bool TryGetLodResolution(const ArcGISRestServiceInfo& serviceInfo, int level, double& outResolution)
+	{
+		for (const ArcGISMapServiceTileLod& lod : serviceInfo.tileInfo.lods)
+		{
+			if (lod.level == level && std::isfinite(lod.resolution) && lod.resolution > 0.0)
+			{
+				outResolution = lod.resolution;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	std::string BuildTileRequestUrl(const std::string& serviceUrl, int level, int row, int col)
+	{
+		return TrimTrailingSlash(serviceUrl) + GB_Utf8Format("/tile/%d/%d/%d", level, row, col);
+	}
+
+	GB_Rectangle CalculateTileExtent(const ArcGISRestServiceInfo& serviceInfo, int level, int row, int col)
+	{
+		double resolution = 0.0;
+		if (!TryGetLodResolution(serviceInfo, level, resolution))
+		{
+			return GB_Rectangle::Invalid;
+		}
+
+		const int tileWidthInPixels = serviceInfo.tileInfo.cols;
+		const int tileHeightInPixels = serviceInfo.tileInfo.rows;
+		if (tileWidthInPixels <= 0 || tileHeightInPixels <= 0)
+		{
+			return GB_Rectangle::Invalid;
+		}
+
+		const double tileWidth = static_cast<double>(tileWidthInPixels) * resolution;
+		const double tileHeight = static_cast<double>(tileHeightInPixels) * resolution;
+		const double minX = serviceInfo.tileInfo.origin.x + static_cast<double>(col) * tileWidth;
+		const double maxX = serviceInfo.tileInfo.origin.x + static_cast<double>(col + 1) * tileWidth;
+		const double maxY = serviceInfo.tileInfo.origin.y - static_cast<double>(row) * tileHeight;
+		const double minY = serviceInfo.tileInfo.origin.y - static_cast<double>(row + 1) * tileHeight;
+		return GB_Rectangle(minX, minY, maxX, maxY);
+	}
+
+	std::vector<ImageRequestItem> CalculateTiledImageRequestItems(const CalculateImageRequestItemsInput& input)
+	{
+		const ArcGISRestServiceInfo* serviceInfo = input.serviceInfo;
+		if (!serviceInfo || !serviceInfo->hasTileInfo || serviceInfo->tileInfo.lods.empty())
+		{
+			return std::vector<ImageRequestItem>();
+		}
+
+		const int tileWidthInPixels = serviceInfo->tileInfo.cols;
+		const int tileHeightInPixels = serviceInfo->tileInfo.rows;
+		if (tileWidthInPixels <= 0 || tileHeightInPixels <= 0)
+		{
+			return std::vector<ImageRequestItem>();
+		}
+
+		const double targetResolution = input.viewExtent.Width() / static_cast<double>(input.viewExtentWidthInPixels);
+		if (!std::isfinite(targetResolution) || targetResolution <= 0.0)
+		{
+			return std::vector<ImageRequestItem>();
+		}
+
+		std::vector<ArcGISMapServiceTileLod> lods = serviceInfo->tileInfo.lods;
+		std::sort(lods.begin(), lods.end(), [](const ArcGISMapServiceTileLod& firstLod, const ArcGISMapServiceTileLod& secondLod) {
+			return firstLod.resolution > secondLod.resolution;
+			});
+
+		int level = lods.back().level;
+		for (const ArcGISMapServiceTileLod& lod : lods)
+		{
+			if (std::isfinite(lod.resolution) && lod.resolution > 0.0 && lod.resolution <= 1.5 * targetResolution)
+			{
+				level = lod.level;
+				break;
+			}
+		}
+
+		double resolution = 0.0;
+		if (!TryGetLodResolution(*serviceInfo, level, resolution))
+		{
+			return std::vector<ImageRequestItem>();
+		}
+
+		const double tileWidth = static_cast<double>(tileWidthInPixels) * resolution;
+		const double tileHeight = static_cast<double>(tileHeightInPixels) * resolution;
+		if (!std::isfinite(tileWidth) || !std::isfinite(tileHeight) || tileWidth <= 0.0 || tileHeight <= 0.0)
+		{
+			return std::vector<ImageRequestItem>();
+		}
+
+		const GB_Point2d& origin = serviceInfo->tileInfo.origin;
+		const int minCol = static_cast<int>(std::floor((input.viewExtent.minX - origin.x) / tileWidth));
+		const int maxCol = static_cast<int>(std::ceil((input.viewExtent.maxX - origin.x) / tileWidth)) - 1;
+		const int minRow = static_cast<int>(std::floor((origin.y - input.viewExtent.maxY) / tileHeight));
+		const int maxRow = static_cast<int>(std::ceil((origin.y - input.viewExtent.minY) / tileHeight)) - 1;
+		if (maxCol < minCol || maxRow < minRow)
+		{
+			return std::vector<ImageRequestItem>();
+		}
+
+		std::vector<ImageRequestItem> requestItems;
+		const long long tileCount = static_cast<long long>(maxCol - minCol + 1) * static_cast<long long>(maxRow - minRow + 1);
+		if (tileCount > 0 && tileCount < 200000)
+		{
+			requestItems.reserve(static_cast<size_t>(tileCount));
+		}
+
+		for (int row = minRow; row <= maxRow; row++)
+		{
+			for (int col = minCol; col <= maxCol; col++)
+			{
+				ImageRequestItem requestItem;
+				requestItem.serviceUrl = input.serviceUrl;
+				requestItem.layerId = input.layerId;
+				requestItem.imageFormat = input.imageFormat;
+				requestItem.requestUrl = BuildTileRequestUrl(input.serviceUrl, level, row, col);
+				requestItem.imageExtent = CalculateTileExtent(*serviceInfo, level, row, col);
+				requestItem.uid = GB_Md5Hash(requestItem.requestUrl);
+
+				if (!requestItem.requestUrl.empty() && requestItem.imageExtent.IsValid())
+				{
+					requestItems.push_back(std::move(requestItem));
+				}
+			}
+		}
+		return requestItems;
+	}
+
+	std::vector<ImageRequestItem> CalculateDynamicImageRequestItems(const CalculateImageRequestItemsInput& input)
+	{
+		const ArcGISRestServiceInfo* serviceInfo = input.serviceInfo;
+		std::string baseUrl = TrimTrailingSlash(input.serviceUrl);
+		baseUrl += (input.isImageServer ? "/exportImage" : "/export");
+
+		const int maxImageWidth = (serviceInfo && serviceInfo->maxImageWidth > 0) ? serviceInfo->maxImageWidth : input.viewExtentWidthInPixels;
+		const int maxImageHeight = (serviceInfo && serviceInfo->maxImageHeight > 0) ? serviceInfo->maxImageHeight : input.viewExtentHeightInPixels;
+		if (maxImageWidth <= 0 || maxImageHeight <= 0)
+		{
+			return std::vector<ImageRequestItem>();
+		}
+
+		const int numStepsInWidth = static_cast<int>(std::ceil(static_cast<double>(input.viewExtentWidthInPixels) / static_cast<double>(maxImageWidth)));
+		const int numStepsInHeight = static_cast<int>(std::ceil(static_cast<double>(input.viewExtentHeightInPixels) / static_cast<double>(maxImageHeight)));
+		if (numStepsInWidth <= 0 || numStepsInHeight <= 0)
+		{
+			return std::vector<ImageRequestItem>();
+		}
+
+		std::vector<ImageRequestItem> requestItems;
+		requestItems.reserve(static_cast<size_t>(numStepsInWidth * numStepsInHeight));
+
+		for (int stepX = 0; stepX < numStepsInWidth; stepX++)
+		{
+			const int pixelStartX = stepX * maxImageWidth;
+			const int pixelEndX = std::min(input.viewExtentWidthInPixels, pixelStartX + maxImageWidth);
+			const int imageWidth = pixelEndX - pixelStartX;
+			if (imageWidth <= 0)
+			{
+				continue;
+			}
+
+			for (int stepY = 0; stepY < numStepsInHeight; stepY++)
+			{
+				const int pixelStartY = stepY * maxImageHeight;
+				const int pixelEndY = std::min(input.viewExtentHeightInPixels, pixelStartY + maxImageHeight);
+				const int imageHeight = pixelEndY - pixelStartY;
+				if (imageHeight <= 0)
 				{
 					continue;
 				}
 
-				futures.push_back(threadPool.Enqueue([this, requestItem]() -> bool {
-					return DownloadAndPostTile(requestItem);
-					}));
-			}
+				const double imageMinX = input.viewExtent.minX + input.viewExtent.Width() * static_cast<double>(pixelStartX) / static_cast<double>(input.viewExtentWidthInPixels);
+				const double imageMaxX = input.viewExtent.minX + input.viewExtent.Width() * static_cast<double>(pixelEndX) / static_cast<double>(input.viewExtentWidthInPixels);
+				const double imageMinY = input.viewExtent.minY + input.viewExtent.Height() * static_cast<double>(pixelStartY) / static_cast<double>(input.viewExtentHeightInPixels);
+				const double imageMaxY = input.viewExtent.minY + input.viewExtent.Height() * static_cast<double>(pixelEndY) / static_cast<double>(input.viewExtentHeightInPixels);
 
-			for (std::future<bool>& future : futures)
-			{
-				try
+				const std::string imageSizeInfo = GB_Utf8Format("%d,%d", imageWidth, imageHeight);
+				const std::string imageBBoxInfo = GB_Utf8Format("%.17g,%.17g,%.17g,%.17g", imageMinX, imageMinY, imageMaxX, imageMaxY);
+
+				std::string imageUrl = baseUrl;
+				imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "bbox", imageBBoxInfo);
+				imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "size", imageSizeInfo);
+				imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "format", input.imageFormat);
+				if (!input.isImageServer && !input.layerId.empty())
 				{
-					future.get();
+					const std::string layerInfo = GB_Utf8Format("show:%s", input.layerId.c_str());
+					imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "layers", layerInfo);
 				}
-				catch (...)
+				imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "transparent", "true");
+				imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "f", "image");
+				if (input.dpi > 0)
 				{
-					// 单个瓦片失败不应中断整个刷新流程。
+					imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "dpi", std::to_string(input.dpi));
 				}
+
+				ImageRequestItem requestItem;
+				requestItem.serviceUrl = input.serviceUrl;
+				requestItem.layerId = input.layerId;
+				requestItem.imageFormat = input.imageFormat;
+				requestItem.requestUrl = std::move(imageUrl);
+				requestItem.imageExtent.Set(imageMinX, imageMinY, imageMaxX, imageMaxY);
+				requestItem.uid = GB_Md5Hash(requestItem.requestUrl);
+				requestItems.push_back(std::move(requestItem));
 			}
 		}
-		catch (...)
+		return requestItems;
+	}
+
+	std::vector<ImageRequestItem> CalculateLayerImageRequestItems(const CalculateImageRequestItemsInput& input)
+	{
+		if (!input.viewExtent.IsValid() || input.viewExtentWidthInPixels <= 0 || input.viewExtentHeightInPixels <= 0 ||
+			input.serviceUrl.empty() || input.imageFormat.empty())
+		{
+			return std::vector<ImageRequestItem>();
+		}
+
+		if (input.isTiled)
+		{
+			return CalculateTiledImageRequestItems(input);
+		}
+		return CalculateDynamicImageRequestItems(input);
+	}
+
+	std::string BuildLayerTileUid(const std::string& layerUid, const ImageRequestItem& requestItem, const std::string& displayWktUtf8)
+	{
+		// 同一个服务请求在不同 Canvas CRS 下会生成不同的显示影像与显示范围，
+		// 因此显示目标 CRS 必须纳入 UID，避免切换坐标系后错误复用旧瓦片。
+		return GB_Md5Hash(layerUid + "|" + requestItem.uid + "|" + requestItem.requestUrl + "|" + displayWktUtf8);
+	}
+
+	std::string BuildFallbackLayerUid(const LayerImportRequestInfo& request)
+	{
+		std::string baseUid = request.nodeUid;
+		if (baseUid.empty())
+		{
+			baseUid = request.serviceUrl + "|" + request.layerId;
+		}
+		if (baseUid.empty())
+		{
+			baseUid = "layer";
+		}
+		return baseUid;
+	}
+}
+
+class LayerRefresher::Impl
+{
+public:
+	struct LayerSnapshot
+	{
+		std::string layerUid = "";
+		std::string displayName = "";
+		int orderIndex = 0;
+		bool visible = true;
+		LayerImportRequestInfo importRequest;
+	};
+
+	struct TargetTileRecord
+	{
+		std::string tileUid = "";
+		std::string layerUid = "";
+		std::string requestUrl = "";
+		GB_Rectangle extent;
+		double layerNumber = 0.0;
+		int layerOrderIndex = 0;
+	};
+
+	struct DisplayedTileRecord
+	{
+		MapTile tile;
+		std::string layerUid = "";
+		double layerNumber = 0.0;
+	};
+
+	struct TileTask
+	{
+		std::uint64_t generation = 0;
+		std::uint64_t sequence = 0;
+		int layerOrderIndex = 0;
+		double layerNumber = 0.0;
+		std::string layerUid = "";
+		std::string tileUid = "";
+		ImageRequestItem requestItem;
+		std::string sourceWktUtf8 = "";
+		std::string targetWktUtf8 = "";
+		bool needsReprojection = false;
+		double targetPixelSizeX = 0.0;
+		double targetPixelSizeY = 0.0;
+		ArcGISRestConnectionSettings connectionSettings;
+		GB_NetworkRequestOptions networkOptions;
+	};
+
+	struct TileTaskPriorityGreater
+	{
+		bool operator()(const TileTask& firstTask, const TileTask& secondTask) const
+		{
+			if (firstTask.layerOrderIndex != secondTask.layerOrderIndex)
+			{
+				return firstTask.layerOrderIndex > secondTask.layerOrderIndex;
+			}
+			return firstTask.sequence > secondTask.sequence;
+		}
+	};
+
+	struct TileResult
+	{
+		std::uint64_t generation = 0;
+		std::string tileUid = "";
+		std::string layerUid = "";
+		double layerNumber = 0.0;
+		MapTile tile;
+	};
+
+	explicit Impl(LayerRefresher* owner)
+		: ownerPointer(owner), currentGeneration(0), nextTaskSequence(0), isStopping(false)
+	{
+		StartWorkers();
+	}
+
+	~Impl()
+	{
+		StopWorkers();
+	}
+
+	void SetCanvasAndPanels(QMainCanvas* canvas, QServiceBrowserPanel* servicePanel, QLayerManagerPanel* managerPanel)
+	{
+		DisconnectCurrentObjects();
+
+		mainCanvas = canvas;
+		serviceBrowserPanel = servicePanel;
+		layerManagerPanel = managerPanel;
+		hasViewExtent = false;
+		currentViewExtent.Reset();
+
+		LayerRefresher* owner = ownerPointer.data();
+		if (!owner)
 		{
 			return;
 		}
+
+		if (mainCanvas)
+		{
+			QObject::connect(mainCanvas.data(), &QMainCanvas::ViewStateChanged, owner, &LayerRefresher::OnViewStateChanged, Qt::UniqueConnection);
+
+			GB_Rectangle canvasExtent;
+			if (mainCanvas->TryGetCurrentViewExtent(canvasExtent))
+			{
+				currentViewExtent = canvasExtent;
+				hasViewExtent = true;
+			}
+		}
+
+		if (layerManagerPanel)
+		{
+			QObject::connect(layerManagerPanel.data(), &QLayerManagerPanel::LayersChanged, owner, &LayerRefresher::OnLayersChanged, Qt::UniqueConnection);
+			SetLayersFromLayerInfos(layerManagerPanel->GetLayers());
+			PrepareCanvasForCurrentLayers(false, std::vector<std::string>());
+			StartRefresh();
+			return;
+		}
+
+		// 兼容模式：没有图层管理面板时，直接导入信号会生成一个单图层快照。
+		if (serviceBrowserPanel)
+		{
+			QObject::connect(serviceBrowserPanel.data(), &QServiceBrowserPanel::LayerImportRequested, owner, &LayerRefresher::OnArcGISRestLayerImportRequested, Qt::UniqueConnection);
+		}
+	}
+
+	void DisconnectCurrentObjects()
+	{
+		LayerRefresher* owner = ownerPointer.data();
+		if (!owner)
+		{
+			return;
+		}
+
+		if (mainCanvas)
+		{
+			QObject::disconnect(mainCanvas.data(), &QMainCanvas::ViewStateChanged, owner, &LayerRefresher::OnViewStateChanged);
+		}
+		if (layerManagerPanel)
+		{
+			QObject::disconnect(layerManagerPanel.data(), &QLayerManagerPanel::LayersChanged, owner, &LayerRefresher::OnLayersChanged);
+		}
+		if (serviceBrowserPanel)
+		{
+			QObject::disconnect(serviceBrowserPanel.data(), &QServiceBrowserPanel::LayerImportRequested, owner, &LayerRefresher::OnArcGISRestLayerImportRequested);
+		}
+
+		StopRefresh();
+		RemoveAllDisplayedTiles();
+		RemoveAllTransitionTiles();
+		layers.clear();
+		currentTargetsByUid.clear();
+	}
+
+	void StopRefresh()
+	{
+		currentGeneration.fetch_add(1, std::memory_order_acq_rel);
+		{
+			std::lock_guard<std::mutex> lock(taskQueueMutex);
+			ClearPendingTasksNoLock();
+		}
+		taskQueueCondition.notify_all();
+	}
+
+	void OnViewStateChanged(const GB_Rectangle& extent, double approximateMetersPerPixel)
+	{
+		if (!extent.IsValid())
+		{
+			return;
+		}
+
+		currentViewExtent = extent;
+		currentApproximateMetersPerPixel = approximateMetersPerPixel;
+		hasViewExtent = true;
+		StartRefresh();
+	}
+
+	void OnLayersChanged(const LayerManagerChangeInfo& changeInfo)
+	{
+		const bool allowAutoZoomToImportedLayer = (changeInfo.actionType == LayerManagerActionType::LayerImported);
+		const std::vector<std::string> autoZoomLayerUids = BuildLayerUidList(changeInfo.affectedLayers);
+
+		SetLayersFromLayerInfos(changeInfo.allLayers);
+		PrepareCanvasForCurrentLayers(allowAutoZoomToImportedLayer, autoZoomLayerUids);
+		StartRefresh();
+	}
+
+	void OnDirectLayerImportRequested(const LayerImportRequestInfo& request)
+	{
+		if (!request.IsValid())
+		{
+			return;
+		}
+
+		std::vector<LayerSnapshot> newLayers;
+		LayerSnapshot layer;
+		layer.layerUid = BuildFallbackLayerUid(request);
+		layer.displayName = request.nodeText;
+		layer.orderIndex = 0;
+		layer.visible = true;
+		layer.importRequest = request;
+		std::vector<std::string> autoZoomLayerUids;
+		autoZoomLayerUids.push_back(layer.layerUid);
+
+		newLayers.push_back(std::move(layer));
+		layers = std::move(newLayers);
+
+		PrepareCanvasForCurrentLayers(true, autoZoomLayerUids);
+		StartRefresh();
 	}
 
 private:
-	bool DownloadAndPostTile(const ImageRequestItem& requestItem)
+	std::vector<std::string> BuildLayerUidList(const std::vector<LayerManagerLayerInfo>& layerInfos) const
 	{
-		if (isInterruptionRequested())
+		std::vector<std::string> layerUids;
+		layerUids.reserve(layerInfos.size());
+		for (const LayerManagerLayerInfo& layerInfo : layerInfos)
+		{
+			std::string layerUid = ToStdString(layerInfo.layerUid);
+			if (layerUid.empty())
+			{
+				layerUid = BuildFallbackLayerUid(layerInfo.importRequest);
+			}
+
+			if (!layerUid.empty())
+			{
+				layerUids.push_back(std::move(layerUid));
+			}
+		}
+		return layerUids;
+	}
+
+	bool IsLayerUidInList(const std::vector<std::string>& layerUids, const std::string& layerUid) const
+	{
+		if (layerUid.empty())
 		{
 			return false;
 		}
 
-		try
+		return std::find(layerUids.begin(), layerUids.end(), layerUid) != layerUids.end();
+	}
+
+	void SetLayersFromLayerInfos(const std::vector<LayerManagerLayerInfo>& layerInfos)
+	{
+		std::vector<LayerSnapshot> newLayers;
+		newLayers.reserve(layerInfos.size());
+
+		for (size_t layerIndex = 0; layerIndex < layerInfos.size(); layerIndex++)
 		{
-			const std::string downloadUrl = PrefixRequestUrlIfNeeded(requestItem.requestUrl, context.request.connectionSettings);
-			if (downloadUrl.empty())
+			const LayerManagerLayerInfo& layerInfo = layerInfos[layerIndex];
+			LayerSnapshot layer;
+			layer.layerUid = ToStdString(layerInfo.layerUid);
+			if (layer.layerUid.empty())
 			{
-				return false;
+				layer.layerUid = BuildFallbackLayerUid(layerInfo.importRequest);
+			}
+			layer.displayName = ToStdString(layerInfo.displayName);
+			layer.orderIndex = static_cast<int>(layerIndex);
+			layer.visible = layerInfo.visible;
+			layer.importRequest = layerInfo.importRequest;
+			newLayers.push_back(std::move(layer));
+		}
+
+		layers = std::move(newLayers);
+	}
+
+	void PrepareCanvasForCurrentLayers(bool allowAutoZoomToImportedLayer, const std::vector<std::string>& autoZoomLayerUids)
+	{
+		if (!mainCanvas)
+		{
+			return;
+		}
+
+		GB_Rectangle canvasExtent;
+		const bool hasCanvasViewExtent = mainCanvas->TryGetCurrentViewExtent(canvasExtent);
+
+		// QMainCanvas 默认就有一个可用 viewExtent。不能仅凭 TryGetCurrentViewExtent() 成功就跳过首次导入缩放。
+		// 自动缩放至图层范围只允许发生在“本次变化确实新导入图层”这一前提下；
+		// 显示/隐藏、排序、重命名、移除、初始化绑定等变化只同步当前视口，不改变用户已经浏览到的位置。
+		const bool shouldTryAutoZoom = allowAutoZoomToImportedLayer && !autoZoomLayerUids.empty() && !mainCanvas->HasDrawables();
+		if (!shouldTryAutoZoom)
+		{
+			if (hasCanvasViewExtent)
+			{
+				currentViewExtent = canvasExtent;
+				hasViewExtent = true;
+			}
+			return;
+		}
+
+		for (const LayerSnapshot& layer : layers)
+		{
+			if (!IsLayerUidInList(autoZoomLayerUids, layer.layerUid) || !layer.visible || !layer.importRequest.IsValid() || !CanImportNodeAsImage(layer.importRequest))
+			{
+				continue;
 			}
 
-			const GB_NetworkResponse response = GB_RequestUrlData(downloadUrl, context.networkOptions);
-			if (!response.ok || response.body.empty() || isInterruptionRequested())
+			const ArcGISRestServiceInfo* serviceInfo = GetServiceInfo(layer.importRequest);
+			if (!serviceInfo)
 			{
-				return false;
+				continue;
+			}
+
+			const std::string wkt = GetServiceFallbackWkt(*serviceInfo);
+			SetCanvasCrsIfNeeded(wkt);
+
+			GeoBoundingBox bbox;
+			if (TryGetLayerBoundingBox(layer.importRequest, *serviceInfo, bbox))
+			{
+				SetCanvasCrsIfNeeded(bbox.wktUtf8);
+				GB_Rectangle zoomExtent = bbox.rect;
+				const std::string canvasWkt = mainCanvas->GetCrsWkt();
+				if (IsCrsDefinitionValid(canvasWkt) && IsCrsDefinitionValid(bbox.wktUtf8) && !AreCrsEquivalent(bbox.wktUtf8, canvasWkt))
+				{
+					if (!TryTransformRectangleBetweenCrs(bbox.wktUtf8, canvasWkt, bbox.rect, zoomExtent))
+					{
+						continue;
+					}
+				}
+
+				mainCanvas->ZoomToExtent(zoomExtent, InitialZoomMarginRatio);
+				if (mainCanvas->TryGetCurrentViewExtent(canvasExtent))
+				{
+					currentViewExtent = canvasExtent;
+					hasViewExtent = true;
+				}
+				return;
+			}
+		}
+
+		if (hasCanvasViewExtent)
+		{
+			currentViewExtent = canvasExtent;
+			hasViewExtent = true;
+		}
+	}
+
+	const ArcGISRestServiceInfo* GetServiceInfo(const LayerImportRequestInfo& request) const
+	{
+		if (request.serviceInfo)
+		{
+			return request.serviceInfo;
+		}
+		return request.serviceInfoHolder.get();
+	}
+
+	bool SetCanvasCrsIfNeeded(const std::string& wkt) const
+	{
+		if (!mainCanvas)
+		{
+			return false;
+		}
+
+		const std::string& canvasCrsWkt = mainCanvas->GetCrsWkt();
+		if (GeoCrsManager::IsDefinitionValidCached(canvasCrsWkt))
+		{
+			return true;
+		}
+
+		if (!GeoCrsManager::IsDefinitionValidCached(wkt))
+		{
+			return false;
+		}
+		mainCanvas->SetCrsWkt(wkt);
+		return true;
+	}
+
+	void StartRefresh()
+	{
+		if (isStartingRefresh)
+		{
+			needsRestartAfterCurrentRefresh = true;
+			return;
+		}
+
+		if (!mainCanvas)
+		{
+			return;
+		}
+
+		isStartingRefresh = true;
+		needsRestartAfterCurrentRefresh = false;
+
+		const std::uint64_t generation = currentGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+		{
+			std::lock_guard<std::mutex> lock(taskQueueMutex);
+			ClearPendingTasksNoLock();
+		}
+
+		GB_Rectangle canvasExtent;
+		if (mainCanvas->TryGetCurrentViewExtent(canvasExtent))
+		{
+			currentViewExtent = canvasExtent;
+			hasViewExtent = true;
+		}
+
+		std::unordered_map<std::string, TargetTileRecord> newTargetsByUid;
+		std::vector<TileTask> newTasks;
+
+		if (hasViewExtent && currentViewExtent.IsValid() && !layers.empty())
+		{
+			BuildRefreshTasks(generation, newTargetsByUid, newTasks);
+		}
+
+		ReconcileDisplayedTiles(newTargetsByUid, newTasks);
+		currentTargetsByUid.swap(newTargetsByUid);
+		BeginRefreshCompletionTracking(generation, newTasks.size());
+		EnqueueTasks(newTasks);
+
+		isStartingRefresh = false;
+		if (needsRestartAfterCurrentRefresh)
+		{
+			needsRestartAfterCurrentRefresh = false;
+			StartRefresh();
+		}
+	}
+
+	void BuildRefreshTasks(std::uint64_t generation, std::unordered_map<std::string, TargetTileRecord>& outTargetsByUid, std::vector<TileTask>& outTasks)
+	{
+		if (!mainCanvas || !currentViewExtent.IsValid())
+		{
+			return;
+		}
+
+		const int viewWidth = std::max(1, mainCanvas->width());
+		const int viewHeight = std::max(1, mainCanvas->height());
+		for (const LayerSnapshot& layer : layers)
+		{
+			if (!layer.visible || !layer.importRequest.IsValid() || !CanImportNodeAsImage(layer.importRequest))
+			{
+				continue;
+			}
+
+			const ArcGISRestServiceInfo* serviceInfo = GetServiceInfo(layer.importRequest);
+			if (!serviceInfo)
+			{
+				continue;
+			}
+
+			const bool isTiled = IsTiledServiceForImport(*serviceInfo);
+			const bool isImageServer = IsImageServerForImport(layer.importRequest);
+			const std::string serviceRequestWkt = GetImageRequestWkt(*serviceInfo, isTiled);
+			if (!SetCanvasCrsIfNeeded(serviceRequestWkt))
+			{
+				continue;
+			}
+
+			const std::string canvasWkt = mainCanvas->GetCrsWkt();
+			if (!IsCrsDefinitionValid(serviceRequestWkt) || !IsCrsDefinitionValid(canvasWkt))
+			{
+				continue;
+			}
+
+			// 对动态 MapServer / ImageServer，优先让 ArcGIS Server 直接按 Canvas CRS 导出。
+			// 这样 bbox 与 size 的宽高比天然一致，并且 f=image 无法返回“服务端实际调整后的 extent”也不会再造成显示偏移。
+			const bool preferServerSideDynamicProjection = !isTiled && !AreCrsEquivalent(serviceRequestWkt, canvasWkt);
+			const std::string serverSideSpatialReferenceValue = preferServerSideDynamicProjection ? BuildArcGISSpatialReferenceQueryValue(canvasWkt) : std::string();
+			const bool useServerSideDynamicProjection = !serverSideSpatialReferenceValue.empty();
+			const std::string requestWkt = useServerSideDynamicProjection ? canvasWkt : serviceRequestWkt;
+
+			GB_Rectangle requestViewExtent;
+			if (useServerSideDynamicProjection)
+			{
+				requestViewExtent = currentViewExtent;
+			}
+			else if (!TryTransformRectangleBetweenCrs(canvasWkt, requestWkt, currentViewExtent, requestViewExtent))
+			{
+				continue;
+			}
+
+			double targetPixelSizeX = 0.0;
+			double targetPixelSizeY = 0.0;
+			TryGetTargetPixelSize(currentViewExtent, viewWidth, viewHeight, targetPixelSizeX, targetPixelSizeY);
+
+			const bool needsReprojection = !AreCrsEquivalent(requestWkt, canvasWkt);
+			const std::string imageFormat = ChooseImageFormat(*serviceInfo, isTiled);
+			const std::string effectiveLayerId = GetEffectiveLayerId(layer.importRequest, *serviceInfo, isImageServer);
+			if (effectiveLayerId.empty())
+			{
+				continue;
+			}
+
+			CalculateImageRequestItemsInput input;
+			input.viewExtent = requestViewExtent;
+			input.viewExtentWidthInPixels = viewWidth;
+			input.viewExtentHeightInPixels = viewHeight;
+			input.serviceUrl = layer.importRequest.serviceUrl;
+			input.layerId = effectiveLayerId;
+			input.imageFormat = imageFormat;
+			input.serviceInfo = serviceInfo;
+			input.isTiled = isTiled;
+			input.isImageServer = isImageServer;
+			input.dpi = ChooseDpi(*serviceInfo);
+
+			const std::vector<ImageRequestItem> requestItems = CalculateLayerImageRequestItems(input);
+			if (requestItems.empty())
+			{
+				continue;
+			}
+
+			const double layerNumber = static_cast<double>(layer.orderIndex);
+			const GB_NetworkRequestOptions networkOptions = CreateNetworkOptionsFromConnectionSettings(layer.importRequest.connectionSettings);
+			for (const ImageRequestItem& rawRequestItem : requestItems)
+			{
+				if (rawRequestItem.requestUrl.empty() || !rawRequestItem.imageExtent.IsValid())
+				{
+					continue;
+				}
+
+				ImageRequestItem requestItem = rawRequestItem;
+				if (useServerSideDynamicProjection)
+				{
+					requestItem.requestUrl = AddExportSpatialReferenceParameters(requestItem.requestUrl, serverSideSpatialReferenceValue, isImageServer);
+					requestItem.uid = GB_Md5Hash(requestItem.requestUrl);
+				}
+
+				const std::string tileUid = BuildLayerTileUid(layer.layerUid, requestItem, canvasWkt);
+				TargetTileRecord target;
+				target.tileUid = tileUid;
+				target.layerUid = layer.layerUid;
+				target.requestUrl = requestItem.requestUrl;
+				target.extent = requestItem.imageExtent;
+				target.layerNumber = layerNumber;
+				target.layerOrderIndex = layer.orderIndex;
+				outTargetsByUid[target.tileUid] = target;
+
+				TileTask task;
+				task.generation = generation;
+				task.sequence = nextTaskSequence++;
+				task.layerOrderIndex = layer.orderIndex;
+				task.layerNumber = layerNumber;
+				task.layerUid = layer.layerUid;
+				task.tileUid = tileUid;
+				task.requestItem = requestItem;
+				task.sourceWktUtf8 = requestWkt;
+				task.targetWktUtf8 = canvasWkt;
+				task.needsReprojection = needsReprojection;
+				task.targetPixelSizeX = targetPixelSizeX;
+				task.targetPixelSizeY = targetPixelSizeY;
+				task.connectionSettings = layer.importRequest.connectionSettings;
+				task.networkOptions = networkOptions;
+				outTasks.push_back(std::move(task));
+			}
+		}
+	}
+
+	void ReconcileDisplayedTiles(const std::unordered_map<std::string, TargetTileRecord>& targetsByUid, std::vector<TileTask>& tasks)
+	{
+		if (!mainCanvas)
+		{
+			return;
+		}
+
+		for (auto iter = displayedTilesByUid.begin(); iter != displayedTilesByUid.end(); )
+		{
+			const auto targetIter = targetsByUid.find(iter->first);
+			if (targetIter == targetsByUid.end())
+			{
+				MoveDisplayedTileToTransition(iter->first, std::move(iter->second));
+				iter = displayedTilesByUid.erase(iter);
+				continue;
+			}
+
+			DisplayedTileRecord& displayedTile = iter->second;
+			const TargetTileRecord& target = targetIter->second;
+			if (displayedTile.layerNumber != target.layerNumber)
+			{
+				std::vector<std::string> singleUid;
+				singleUid.push_back(iter->first);
+				mainCanvas->SetDrawablesLayerNumber(singleUid, target.layerNumber);
+
+				displayedTile.layerNumber = target.layerNumber;
+				displayedTile.tile.layerNumber = target.layerNumber;
+				displayedTile.tile.visible = true;
+			}
+			iter++;
+		}
+
+		for (auto iter = transitionTilesByUid.begin(); iter != transitionTilesByUid.end(); )
+		{
+			const auto targetIter = targetsByUid.find(iter->first);
+			if (targetIter == targetsByUid.end())
+			{
+				iter++;
+				continue;
+			}
+
+			DisplayedTileRecord displayedTile = std::move(iter->second);
+			const TargetTileRecord& target = targetIter->second;
+
+			std::vector<std::string> singleUid;
+			singleUid.push_back(iter->first);
+			mainCanvas->SetDrawablesLayerNumber(singleUid, target.layerNumber);
+
+			displayedTile.layerNumber = target.layerNumber;
+			displayedTile.tile.layerNumber = target.layerNumber;
+			displayedTile.tile.visible = true;
+			displayedTilesByUid[iter->first] = std::move(displayedTile);
+			iter = transitionTilesByUid.erase(iter);
+		}
+
+		if (!tasks.empty())
+		{
+			tasks.erase(std::remove_if(tasks.begin(), tasks.end(), [this](const TileTask& task) {
+				return displayedTilesByUid.find(task.tileUid) != displayedTilesByUid.end();
+				}), tasks.end());
+		}
+	}
+
+	void MoveDisplayedTileToTransition(const std::string& tileUid, DisplayedTileRecord&& displayedTile)
+	{
+		if (!mainCanvas || tileUid.empty())
+		{
+			return;
+		}
+
+		std::vector<std::string> singleUid;
+		singleUid.push_back(tileUid);
+		mainCanvas->SetDrawablesLayerNumber(singleUid, QMainCanvas::GetBottomLayerNumber());
+
+		displayedTile.layerNumber = QMainCanvas::GetBottomLayerNumber();
+		displayedTile.tile.layerNumber = QMainCanvas::GetBottomLayerNumber();
+		displayedTile.tile.visible = true;
+		transitionTilesByUid[tileUid] = std::move(displayedTile);
+	}
+
+	void BeginRefreshCompletionTracking(std::uint64_t generation, size_t pendingTaskCount)
+	{
+		trackedGeneration = generation;
+		trackedPendingTaskCount = pendingTaskCount;
+		trackedFinishedTaskCount = 0;
+
+		if (trackedPendingTaskCount == 0)
+		{
+			RemoveAllTransitionTiles();
+		}
+	}
+
+	void MarkTileTaskFinished(std::uint64_t generation)
+	{
+		if (generation != trackedGeneration || !IsTaskGenerationCurrent(generation) || trackedPendingTaskCount == 0)
+		{
+			return;
+		}
+
+		if (trackedFinishedTaskCount < trackedPendingTaskCount)
+		{
+			trackedFinishedTaskCount++;
+		}
+
+		if (trackedFinishedTaskCount >= trackedPendingTaskCount)
+		{
+			RemoveAllTransitionTiles();
+		}
+	}
+
+	void EnqueueTasks(const std::vector<TileTask>& tasks)
+	{
+		if (tasks.empty())
+		{
+			return;
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(taskQueueMutex);
+			if (isStopping)
+			{
+				return;
+			}
+
+			for (const TileTask& task : tasks)
+			{
+				taskQueue.push(task);
+			}
+		}
+		taskQueueCondition.notify_all();
+	}
+
+	void RemoveAllDisplayedTiles()
+	{
+		if (!mainCanvas || displayedTilesByUid.empty())
+		{
+			return;
+		}
+
+		std::vector<std::string> uids;
+		uids.reserve(displayedTilesByUid.size());
+		for (const auto& item : displayedTilesByUid)
+		{
+			uids.push_back(item.first);
+		}
+		mainCanvas->RemoveDrawables(uids);
+		displayedTilesByUid.clear();
+	}
+
+	void RemoveAllTransitionTiles()
+	{
+		if (!mainCanvas || transitionTilesByUid.empty())
+		{
+			transitionTilesByUid.clear();
+			return;
+		}
+
+		std::vector<std::string> uids;
+		uids.reserve(transitionTilesByUid.size());
+		for (const auto& item : transitionTilesByUid)
+		{
+			uids.push_back(item.first);
+		}
+		mainCanvas->RemoveDrawables(uids);
+		transitionTilesByUid.clear();
+	}
+
+	void StartWorkers()
+	{
+		const size_t threadCount = ChooseWorkerThreadCount();
+		workerThreads.reserve(threadCount);
+		for (size_t threadIndex = 0; threadIndex < threadCount; threadIndex++)
+		{
+			workerThreads.emplace_back([this]() {
+				WorkerLoop();
+				});
+		}
+	}
+
+	void StopWorkers()
+	{
+		{
+			std::lock_guard<std::mutex> lock(taskQueueMutex);
+			isStopping = true;
+			ClearPendingTasksNoLock();
+		}
+		taskQueueCondition.notify_all();
+
+		for (std::thread& workerThread : workerThreads)
+		{
+			if (workerThread.joinable())
+			{
+				workerThread.join();
+			}
+		}
+		workerThreads.clear();
+	}
+
+	void ClearPendingTasksNoLock()
+	{
+		while (!taskQueue.empty())
+		{
+			taskQueue.pop();
+		}
+	}
+
+	void WorkerLoop()
+	{
+		while (true)
+		{
+			TileTask task;
+			{
+				std::unique_lock<std::mutex> lock(taskQueueMutex);
+				taskQueueCondition.wait(lock, [this]() {
+					return isStopping || !taskQueue.empty();
+					});
+
+				if (isStopping && taskQueue.empty())
+				{
+					return;
+				}
+
+				task = taskQueue.top();
+				taskQueue.pop();
+			}
+
+			ProcessTileTask(task);
+		}
+	}
+
+	bool IsTaskGenerationCurrent(std::uint64_t generation) const
+	{
+		return currentGeneration.load(std::memory_order_acquire) == generation;
+	}
+
+	void ProcessTileTask(const TileTask& task)
+	{
+		if (!IsTaskGenerationCurrent(task.generation))
+		{
+			return;
+		}
+
+		try
+		{
+			const std::string downloadUrl = PrefixRequestUrlIfNeeded(task.requestItem.requestUrl, task.connectionSettings);
+			if (downloadUrl.empty())
+			{
+				PostTileTaskFinishedIfCurrent(task.generation);
+				return;
+			}
+
+			if (!IsTaskGenerationCurrent(task.generation))
+			{
+				return;
+			}
+
+			const GB_NetworkResponse response = GB_RequestUrlData(downloadUrl, task.networkOptions);
+			if (!IsTaskGenerationCurrent(task.generation))
+			{
+				return;
+			}
+
+			if (!response.ok || response.body.empty())
+			{
+				PostTileTaskFinishedIfCurrent(task.generation);
+				return;
 			}
 
 			GB_ImageLoadOptions loadOptions;
@@ -465,213 +1643,194 @@ private:
 			loadOptions.preserveBitDepth = false;
 
 			GB_Image image;
-			if (!image.LoadFromMemory(response.body.data(), response.body.size(), loadOptions) || image.IsEmpty() || isInterruptionRequested())
+			if (!image.LoadFromMemory(response.body.data(), response.body.size(), loadOptions) || image.IsEmpty())
 			{
-				return false;
+				PostTileTaskFinishedIfCurrent(task.generation);
+				return;
 			}
 
-			MapTile tile;
-			tile.image = std::move(image);
-			tile.extent = requestItem.imageExtent;
-			tile.uid = requestItem.uid;
-			tile.visible = true;
-			PostTile(tile);
-			return true;
+			if (!IsTaskGenerationCurrent(task.generation))
+			{
+				return;
+			}
+
+			GB_Image displayImage;
+			GB_Rectangle displayExtent;
+			if (task.needsReprojection)
+			{
+				GeoImage sourceGeoImage(std::move(image), GeoBoundingBox(task.sourceWktUtf8, task.requestItem.imageExtent));
+				if (!sourceGeoImage.IsValid())
+				{
+					PostTileTaskFinishedIfCurrent(task.generation);
+					return;
+				}
+
+				GeoImageReprojectOptions reprojectOptions;
+				reprojectOptions.interpolation = GB_ImageInterpolation::Linear;
+				reprojectOptions.sampleGridCount = ReprojectSampleGridCount;
+				reprojectOptions.targetPixelSizeX = task.targetPixelSizeX;
+				reprojectOptions.targetPixelSizeY = task.targetPixelSizeY;
+				reprojectOptions.maxOutputWidth = MaxReprojectOutputSideLength;
+				reprojectOptions.maxOutputHeight = MaxReprojectOutputSideLength;
+				reprojectOptions.maxOutputPixelCount = MaxReprojectOutputPixelCount;
+				reprojectOptions.enableOpenMP = false;
+				reprojectOptions.clampToCrsValidArea = true;
+
+				GeoImage reprojectedImage;
+				if (!GeoCrsTransform::ReprojectGeoImage(sourceGeoImage, task.targetWktUtf8, reprojectedImage, reprojectOptions) || !reprojectedImage.IsValid())
+				{
+					PostTileTaskFinishedIfCurrent(task.generation);
+					return;
+				}
+
+				displayImage = std::move(reprojectedImage.image);
+				displayExtent = reprojectedImage.boundingBox.rect;
+			}
+			else
+			{
+				displayImage = std::move(image);
+				displayExtent = task.requestItem.imageExtent;
+			}
+
+			if (displayImage.IsEmpty() || !displayExtent.IsValid())
+			{
+				PostTileTaskFinishedIfCurrent(task.generation);
+				return;
+			}
+
+			TileResult result;
+			result.generation = task.generation;
+			result.tileUid = task.tileUid;
+			result.layerUid = task.layerUid;
+			result.layerNumber = task.layerNumber;
+			result.tile.image = std::move(displayImage);
+			result.tile.extent = displayExtent;
+			result.tile.uid = task.tileUid;
+			result.tile.visible = true;
+			result.tile.layerNumber = task.layerNumber;
+			PostTileResult(std::move(result));
 		}
 		catch (...)
 		{
-			return false;
+			PostTileTaskFinishedIfCurrent(task.generation);
+			return;
 		}
 	}
 
-	void PostTile(const MapTile& tile)
+	void PostTileResult(TileResult result)
 	{
-		std::lock_guard<std::mutex> lock(postTileMutex);
-
-		LayerRefresher* refresher = refresherPointer.data();
-		if (!refresher)
+		LayerRefresher* owner = ownerPointer.data();
+		if (!owner)
 		{
 			return;
 		}
 
-		const QPointer<LayerRefresher> safeRefresherPointer = refresherPointer;
-		QMetaObject::invokeMethod(refresher, [safeRefresherPointer, tile]() mutable {
-			LayerRefresher* refresher = safeRefresherPointer.data();
-			if (!refresher || !refresher->mainCanvas)
+		const QPointer<LayerRefresher> safeOwnerPointer = ownerPointer;
+		QMetaObject::invokeMethod(owner, [safeOwnerPointer, result = std::move(result)]() mutable {
+			LayerRefresher* refresher = safeOwnerPointer.data();
+			if (!refresher || !refresher->impl)
 			{
 				return;
 			}
 
-			refresher->mainCanvas->AddMapTile(tile);
+			refresher->impl->OnTileReady(result);
 			}, Qt::QueuedConnection);
 	}
 
-private:
-	std::mutex postTileMutex;
-	QPointer<LayerRefresher> refresherPointer;
-	ArcGISRestImageDownloadContext context;
-};
-
-class LayerRefresher::ArcGISRestLayerImportThread : public QThread
-{
-private:
-	struct ArcGISRestLayerImportResult
+	void PostTileTaskFinishedIfCurrent(std::uint64_t generation)
 	{
-		bool succeeded = false;
-		LayerImportRequestInfo request;
-		ArcGISRestServiceInfo nodeInfo;
-		GeoBoundingBox layerBBox;
-		std::string errorMessage = "";
-	};
-
-public:
-	ArcGISRestLayerImportThread(const QPointer<LayerRefresher>& refresherPointer, const LayerImportRequestInfo& request)
-		: QThread(nullptr), refresherPointer(refresherPointer), request(request)
-	{
-	}
-
-protected:
-	virtual void run() override
-	{
-		ArcGISRestLayerImportResult result;
-		result.request = request;
-
-		if (isInterruptionRequested())
+		if (!IsTaskGenerationCurrent(generation))
 		{
 			return;
 		}
 
-		if (!request.IsValid())
-		{
-			result.errorMessage = "Invalid ArcGIS REST layer import request.";
-			PostResult(result);
-			return;
-		}
-
-		if (!CanImportNodeAsImage(request))
-		{
-			result.errorMessage = "Only MapServer and ImageServer nodes can be imported as map images currently.";
-			PostResult(result);
-			return;
-		}
-
-		if (!request.serviceInfo)
-		{
-			result.errorMessage = "ArcGIS REST service info is empty.";
-			PostResult(result);
-			return;
-		}
-
-		ArcGISRestServiceInfo nodeInfo = *request.serviceInfo;
-		if (ShouldRequestNodeJsonForImport(request))
-		{
-			ArcGISRestConnectionSettings requestLayerSettings = request.connectionSettings;
-			requestLayerSettings.serviceUrl = request.nodeUrl;
-
-			std::string nodeJson = "";
-			std::string requestJsonError = "";
-			const GB_NetworkRequestOptions networkOptions = CreateNetworkOptionsFromConnectionSettings(requestLayerSettings);
-			if (!RequestArcGISRestJson(requestLayerSettings, nodeJson, networkOptions, &requestJsonError))
-			{
-				result.errorMessage = "Failed to request ArcGIS REST layer JSON: " + requestJsonError;
-				PostResult(result);
-				return;
-			}
-
-			if (isInterruptionRequested())
-			{
-				return;
-			}
-
-			std::string parseError = "";
-			if (!ParseArcGISRestJson(nodeJson, request.nodeUrl, nodeInfo, &parseError))
-			{
-				result.errorMessage = "Failed to parse ArcGIS REST layer JSON: " + parseError;
-				PostResult(result);
-				return;
-			}
-		}
-
-		GeoBoundingBox layerBBox;
-		if (!TryGetImportBoundingBox(request, nodeInfo, *request.serviceInfo, layerBBox))
-		{
-			result.errorMessage = "ArcGIS REST layer extent is invalid or missing.";
-			PostResult(result);
-			return;
-		}
-
-		result.succeeded = true;
-		result.nodeInfo = std::move(nodeInfo);
-		result.layerBBox = layerBBox;
-		PostResult(result);
-	}
-
-private:
-	void PostResult(const ArcGISRestLayerImportResult& result)
-	{
-		LayerRefresher* refresher = refresherPointer.data();
-		if (!refresher)
+		LayerRefresher* owner = ownerPointer.data();
+		if (!owner)
 		{
 			return;
 		}
 
-		const QPointer<LayerRefresher> safeRefresherPointer = refresherPointer;
-		QMetaObject::invokeMethod(refresher, [safeRefresherPointer, result]() mutable {
-			LayerRefresher* refresher = safeRefresherPointer.data();
-			if (!refresher || !refresher->serviceBrowserPanel || !refresher->mainCanvas)
+		const QPointer<LayerRefresher> safeOwnerPointer = ownerPointer;
+		QMetaObject::invokeMethod(owner, [safeOwnerPointer, generation]() mutable {
+			LayerRefresher* refresher = safeOwnerPointer.data();
+			if (!refresher || !refresher->impl)
 			{
 				return;
 			}
 
-			if (!result.succeeded)
-			{
-				return;
-			}
-
-			const std::string& layerWkt = result.layerBBox.wktUtf8;
-			if (!refresher->SetCanvasCrsIfNeeded(layerWkt))
-			{
-				return;
-			}
-
-			if (!refresher->mainCanvas->HasDrawables())
-			{
-				refresher->mainCanvas->ZoomToExtent(result.layerBBox.rect, 0.05);
-			}
-
-			GB_Rectangle viewExtent;
-			if (!refresher->mainCanvas->TryGetCurrentViewExtent(viewExtent))
-			{
-				return;
-			}
-
-			const int viewWidth = std::max(1, refresher->mainCanvas->width());
-			const int viewHeight = std::max(1, refresher->mainCanvas->height());
-			const ArcGISRestServiceInfo& serviceInfo = *result.request.serviceInfo;
-			const bool isTiled = IsTiledServiceForImport(serviceInfo);
-			const bool isImageServer = IsImageServerForImport(result.request);
-
-			ArcGISRestImageDownloadContext context;
-			context.request = result.request;
-			context.serviceInfo = serviceInfo;
-			context.viewExtent = viewExtent;
-			context.viewExtentWidthInPixels = viewWidth;
-			context.viewExtentHeightInPixels = viewHeight;
-			context.isTiled = isTiled;
-			context.isImageServer = isImageServer;
-			context.imageFormat = ChooseImageFormat(serviceInfo, isTiled);
-			context.dpi = ChooseDpi(serviceInfo);
-			context.networkOptions = CreateNetworkOptionsFromConnectionSettings(result.request.connectionSettings);
-
-			ArcGISRestImageDownloadThread* const downloadThread = new ArcGISRestImageDownloadThread(QPointer<LayerRefresher>(refresher), context);
-			connect(downloadThread, &QThread::finished, downloadThread, &QObject::deleteLater);
-			downloadThread->start();
+			refresher->impl->OnTileTaskFinished(generation);
 			}, Qt::QueuedConnection);
 	}
 
+	void OnTileTaskFinished(std::uint64_t generation)
+	{
+		if (!IsTaskGenerationCurrent(generation))
+		{
+			return;
+		}
+
+		MarkTileTaskFinished(generation);
+	}
+
+	void OnTileReady(const TileResult& result)
+	{
+		if (!mainCanvas || !IsTaskGenerationCurrent(result.generation))
+		{
+			return;
+		}
+
+		const auto targetIter = currentTargetsByUid.find(result.tileUid);
+		if (targetIter != currentTargetsByUid.end())
+		{
+			const TargetTileRecord& target = targetIter->second;
+			if (target.layerUid == result.layerUid && target.layerNumber == result.layerNumber && displayedTilesByUid.find(result.tileUid) == displayedTilesByUid.end())
+			{
+				std::vector<std::string> singleUid;
+				singleUid.push_back(result.tileUid);
+				mainCanvas->RemoveDrawables(singleUid);
+				transitionTilesByUid.erase(result.tileUid);
+				mainCanvas->AddMapTile(result.tile, target.layerNumber);
+
+				DisplayedTileRecord displayedTile;
+				displayedTile.tile = result.tile;
+				displayedTile.tile.layerNumber = target.layerNumber;
+				displayedTile.layerUid = result.layerUid;
+				displayedTile.layerNumber = target.layerNumber;
+				displayedTilesByUid[result.tileUid] = std::move(displayedTile);
+			}
+		}
+
+		MarkTileTaskFinished(result.generation);
+	}
+
 private:
-	QPointer<LayerRefresher> refresherPointer;
-	LayerImportRequestInfo request;
+	QPointer<LayerRefresher> ownerPointer;
+	QPointer<QMainCanvas> mainCanvas;
+	QPointer<QServiceBrowserPanel> serviceBrowserPanel;
+	QPointer<QLayerManagerPanel> layerManagerPanel;
+
+	std::vector<LayerSnapshot> layers;
+	GB_Rectangle currentViewExtent;
+	double currentApproximateMetersPerPixel = 0.0;
+	bool hasViewExtent = false;
+	bool isStartingRefresh = false;
+	bool needsRestartAfterCurrentRefresh = false;
+
+	std::unordered_map<std::string, TargetTileRecord> currentTargetsByUid;
+	std::unordered_map<std::string, DisplayedTileRecord> displayedTilesByUid;
+	std::unordered_map<std::string, DisplayedTileRecord> transitionTilesByUid;
+
+	std::atomic<std::uint64_t> currentGeneration;
+	std::uint64_t nextTaskSequence;
+	std::uint64_t trackedGeneration = 0;
+	size_t trackedPendingTaskCount = 0;
+	size_t trackedFinishedTaskCount = 0;
+
+	std::vector<std::thread> workerThreads;
+	std::priority_queue<TileTask, std::vector<TileTask>, TileTaskPriorityGreater> taskQueue;
+	std::mutex taskQueueMutex;
+	std::condition_variable taskQueueCondition;
+	bool isStopping;
 };
 
 LayerRefresher* LayerRefresher::GetInstance()
@@ -682,22 +1841,26 @@ LayerRefresher* LayerRefresher::GetInstance()
 
 void LayerRefresher::SetCanvasAndPanel(QMainCanvas* canvas, QServiceBrowserPanel* panel)
 {
-	QServiceBrowserPanel* const oldPanel = serviceBrowserPanel.data();
-	if (oldPanel)
-	{
-		disconnect(oldPanel, &QServiceBrowserPanel::LayerImportRequested, this, &LayerRefresher::OnArcGISRestLayerImportRequested);
-	}
+	impl->SetCanvasAndPanels(canvas, panel, nullptr);
+}
 
-	mainCanvas = canvas;
-	serviceBrowserPanel = panel;
+void LayerRefresher::SetCanvasAndPanel(QMainCanvas* canvas, QLayerManagerPanel* layerManagerPanel)
+{
+	impl->SetCanvasAndPanels(canvas, nullptr, layerManagerPanel);
+}
 
-	if (mainCanvas && serviceBrowserPanel)
-	{
-		connect(serviceBrowserPanel.data(), &QServiceBrowserPanel::LayerImportRequested, this, &LayerRefresher::OnArcGISRestLayerImportRequested, Qt::UniqueConnection);
-	}
+void LayerRefresher::SetCanvasAndPanels(QMainCanvas* canvas, QServiceBrowserPanel* serviceBrowserPanel, QLayerManagerPanel* layerManagerPanel)
+{
+	impl->SetCanvasAndPanels(canvas, serviceBrowserPanel, layerManagerPanel);
+}
+
+void LayerRefresher::StopRefresh()
+{
+	impl->StopRefresh();
 }
 
 LayerRefresher::LayerRefresher()
+	: impl(new Impl(this))
 {
 }
 
@@ -705,35 +1868,17 @@ LayerRefresher::~LayerRefresher()
 {
 }
 
-bool LayerRefresher::SetCanvasCrsIfNeeded(const std::string& wkt) const
+void LayerRefresher::OnViewStateChanged(const GB_Rectangle& extent, double approximateMetersPerPixel)
 {
-	if (!mainCanvas)
-	{
-		return false;
-	}
+	impl->OnViewStateChanged(extent, approximateMetersPerPixel);
+}
 
-	const std::string& canvasCrsWkt = mainCanvas->GetCrsWkt();
-	if (GeoCrsManager::IsDefinitionValidCached(canvasCrsWkt))
-	{
-		return true;
-	}
-
-	if (!GeoCrsManager::IsDefinitionValidCached(wkt))
-	{
-		return false;
-	}
-	mainCanvas->SetCrsWkt(wkt);
-	return true;
+void LayerRefresher::OnLayersChanged(const LayerManagerChangeInfo& changeInfo)
+{
+	impl->OnLayersChanged(changeInfo);
 }
 
 void LayerRefresher::OnArcGISRestLayerImportRequested(const LayerImportRequestInfo& request)
 {
-	if (!serviceBrowserPanel || !mainCanvas || !request.IsValid())
-	{
-		return;
-	}
-
-	ArcGISRestLayerImportThread* const importThread = new ArcGISRestLayerImportThread(QPointer<LayerRefresher>(this), request);
-	connect(importThread, &QThread::finished, importThread, &QObject::deleteLater);
-	importThread->start();
+	impl->OnDirectLayerImportRequested(request);
 }

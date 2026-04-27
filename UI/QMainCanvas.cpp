@@ -2,6 +2,7 @@
 #include "GeoBoundingBox.h"
 #include "GeoCrs.h"
 #include "GeoCrsManager.h"
+#include "GeoBase/GB_Math.h"
 
 #include <QApplication>
 #include <QDragEnterEvent>
@@ -36,6 +37,9 @@ namespace
 	constexpr double MinimumCoordinateRange = 1e-8;
 	constexpr double MaximumCoordinateAbsValue = 1e10;
 	constexpr double FixedAxisPixelLength = 50.0;
+	constexpr double DefaultLayerNumberValue = 0.0;
+	constexpr double TopLayerNumberValue = -1.0;
+	constexpr double BottomLayerNumberValue = static_cast<double>(GB_IntMax / 2);
 	constexpr int ViewStateChangedDebounceIntervalMs = 180;
 	constexpr int WheelZoomEndDetectionIntervalMs = 300;
 
@@ -194,6 +198,21 @@ QMainCanvas::~QMainCanvas()
 QString QMainCanvas::GetServiceNodeMimeType()
 {
 	return QStringLiteral("application/x-arcgis-rest-service-node");
+}
+
+double QMainCanvas::GetDefaultLayerNumber()
+{
+	return DefaultLayerNumberValue;
+}
+
+double QMainCanvas::GetTopLayerNumber()
+{
+	return TopLayerNumberValue;
+}
+
+double QMainCanvas::GetBottomLayerNumber()
+{
+	return BottomLayerNumberValue;
 }
 
 void QMainCanvas::SetCrsWkt(const std::string& wktUtf8)
@@ -386,6 +405,11 @@ GB_Point2d QMainCanvas::ScreenToWorld(const GB_Point2d& point) const
 
 void QMainCanvas::AddMapTile(const MapTile& tile)
 {
+	AddMapTile(tile, tile.layerNumber);
+}
+
+void QMainCanvas::AddMapTile(const MapTile& tile, double layerNumber)
+{
 	if (!tile.extent.IsValid() || tile.image.IsEmpty())
 	{
 		return;
@@ -393,6 +417,7 @@ void QMainCanvas::AddMapTile(const MapTile& tile)
 
 	CachedMapTile cachedTile;
 	cachedTile.tile = tile;
+	cachedTile.tile.layerNumber = NormalizeLayerNumber(layerNumber);
 	if (cachedTile.tile.uid.empty())
 	{
 		cachedTile.tile.uid = cachedTile.tile.CalculateUid();
@@ -403,7 +428,9 @@ void QMainCanvas::AddMapTile(const MapTile& tile)
 		return;
 	}
 
-	mapTiles.push_back(std::move(cachedTile));
+	cachedTile.insertionSequence = nextDrawableInsertionSequence;
+	nextDrawableInsertionSequence++;
+	InsertCachedMapTile(std::move(cachedTile));
 	if (!viewExtent.IsValid())
 	{
 		ZoomToExtent(tile.extent, 0.05);
@@ -428,10 +455,14 @@ bool QMainCanvas::HasDrawables() const
 
 void QMainCanvas::ClearDrawables()
 {
+	const bool hadDrawables = HasDrawables();
 	mapTiles.clear();
 	//vectorDrawables.clear();
 	//extentMarkerDrawables.clear();
-	update();
+	if (hadDrawables)
+	{
+		update();
+	}
 }
 
 void QMainCanvas::RemoveDrawables(const std::vector<std::string>& drawablesUids)
@@ -441,9 +472,12 @@ void QMainCanvas::RemoveDrawables(const std::vector<std::string>& drawablesUids)
 		return;
 	}
 
+	bool hasChanged = false;
+	const size_t oldMapTileCount = mapTiles.size();
 	mapTiles.erase(std::remove_if(mapTiles.begin(), mapTiles.end(), [this, &drawablesUids](const CachedMapTile& item) {
 		return IsDrawableUidInSet(drawablesUids, item.tile.uid);
 		}), mapTiles.end());
+	hasChanged = hasChanged || oldMapTileCount != mapTiles.size();
 
 	//vectorDrawables.erase(std::remove_if(vectorDrawables.begin(), vectorDrawables.end(), [this, &drawablesUids](const VectorDrawable& item) {
 	//	return IsDrawableUidInSet(drawablesUids, item.uid);
@@ -453,7 +487,10 @@ void QMainCanvas::RemoveDrawables(const std::vector<std::string>& drawablesUids)
 	//	return IsDrawableUidInSet(drawablesUids, item.uid);
 	//	}), extentMarkerDrawables.end());
 
-	update();
+	if (hasChanged)
+	{
+		update();
+	}
 }
 
 void QMainCanvas::SetDrawablesVisible(const std::vector<std::string>& drawablesUids, bool visible)
@@ -463,11 +500,13 @@ void QMainCanvas::SetDrawablesVisible(const std::vector<std::string>& drawablesU
 		return;
 	}
 
+	bool hasChanged = false;
 	for (CachedMapTile& item : mapTiles)
 	{
-		if (IsDrawableUidInSet(drawablesUids, item.tile.uid))
+		if (IsDrawableUidInSet(drawablesUids, item.tile.uid) && item.tile.visible != visible)
 		{
 			item.tile.visible = visible;
+			hasChanged = true;
 		}
 	}
 
@@ -487,7 +526,38 @@ void QMainCanvas::SetDrawablesVisible(const std::vector<std::string>& drawablesU
 	//	}
 	//}
 
-	update();
+	if (hasChanged)
+	{
+		update();
+	}
+}
+
+void QMainCanvas::SetDrawablesLayerNumber(const std::vector<std::string>& drawablesUids, double layerNumber)
+{
+	if (drawablesUids.empty())
+	{
+		return;
+	}
+
+	const double normalizedLayerNumber = NormalizeLayerNumber(layerNumber);
+	bool hasChanged = false;
+	for (CachedMapTile& item : mapTiles)
+	{
+		if (IsDrawableUidInSet(drawablesUids, item.tile.uid) && item.tile.layerNumber != normalizedLayerNumber)
+		{
+			item.tile.layerNumber = normalizedLayerNumber;
+			hasChanged = true;
+		}
+	}
+
+	// 后续如果恢复 vectorDrawables / extentMarkerDrawables，
+	// 这里也应同步调整它们的 layerNumber 并参与重排。
+
+	if (hasChanged)
+	{
+		std::sort(mapTiles.begin(), mapTiles.end(), IsCachedMapTilePaintOrderLess);
+		update();
+	}
 }
 
 void QMainCanvas::paintEvent(QPaintEvent* event)
@@ -820,6 +890,66 @@ QImage QMainCanvas::CreateQImageFromGBImage(const GB_Image& image) const
 	}
 
 	return result;
+}
+
+double QMainCanvas::NormalizeLayerNumber(double layerNumber)
+{
+	if (!std::isfinite(layerNumber))
+	{
+		return GetDefaultLayerNumber();
+	}
+
+	return layerNumber;
+}
+
+bool QMainCanvas::IsTopLayerNumber(double layerNumber)
+{
+	return layerNumber == GetTopLayerNumber();
+}
+
+bool QMainCanvas::IsBottomLayerNumber(double layerNumber)
+{
+	return layerNumber == GetBottomLayerNumber();
+}
+
+int QMainCanvas::GetLayerPaintOrderGroup(double layerNumber)
+{
+	if (IsBottomLayerNumber(layerNumber))
+	{
+		return 0;
+	}
+
+	if (IsTopLayerNumber(layerNumber))
+	{
+		return 2;
+	}
+
+	return 1;
+}
+
+bool QMainCanvas::IsCachedMapTilePaintOrderLess(const CachedMapTile& firstTile, const CachedMapTile& secondTile)
+{
+	const int firstGroup = GetLayerPaintOrderGroup(firstTile.tile.layerNumber);
+	const int secondGroup = GetLayerPaintOrderGroup(secondTile.tile.layerNumber);
+	if (firstGroup != secondGroup)
+	{
+		return firstGroup < secondGroup;
+	}
+
+	if (firstGroup == 1 && firstTile.tile.layerNumber != secondTile.tile.layerNumber)
+	{
+		// QPainter 后绘制的内容会覆盖先绘制的内容。
+		// 普通层号越大越靠底层，因此需要先绘制较大的层号。
+		return firstTile.tile.layerNumber > secondTile.tile.layerNumber;
+	}
+
+	return firstTile.insertionSequence < secondTile.insertionSequence;
+}
+
+void QMainCanvas::InsertCachedMapTile(CachedMapTile&& cachedTile)
+{
+	const auto insertIter = std::lower_bound(mapTiles.begin(), mapTiles.end(), cachedTile, IsCachedMapTilePaintOrderLess);
+	mapTiles.insert(insertIter, std::move(cachedTile));
 }
 
 void QMainCanvas::DrawBackground(QPainter& painter) const

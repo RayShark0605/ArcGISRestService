@@ -7,6 +7,7 @@
 #include <QTimer>
 #include <QWidget>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,10 @@ public:
 
 	static QString GetServiceNodeMimeType();
 
+	static double GetDefaultLayerNumber();
+	static double GetTopLayerNumber();
+	static double GetBottomLayerNumber();
+
 	void SetCrsWkt(const std::string& wktUtf8);
 	const std::string& GetCrsWkt() const;
 
@@ -59,11 +64,13 @@ public:
 	GB_Point2d ScreenToWorld(const GB_Point2d& point) const;
 
 	void AddMapTile(const MapTile& tile);
+	void AddMapTile(const MapTile& tile, double layerNumber);
 	bool HasDrawables() const;
 
 	void ClearDrawables();
 	void RemoveDrawables(const std::vector<std::string>& drawablesUids);
 	void SetDrawablesVisible(const std::vector<std::string>& drawablesUids, bool visible);
+	void SetDrawablesLayerNumber(const std::vector<std::string>& drawablesUids, double layerNumber);
 
 signals:
 	void ViewStateChanged(const GB_Rectangle& extent, double approximateMetersPerPixel);
@@ -87,6 +94,7 @@ private:
 	{
 		MapTile tile;
 		QImage image;
+		std::uint64_t insertionSequence = 0;
 	};
 
 	std::string crsWkt = "";
@@ -96,6 +104,7 @@ private:
 	bool clipMapTilesToCrsValidArea = false;
 
 	std::vector<CachedMapTile> mapTiles;
+	std::uint64_t nextDrawableInsertionSequence = 0;
 	bool isPanning = false;
 	QPoint lastPanPosition;
 	bool hasMousePosition = false;
@@ -108,6 +117,12 @@ private:
 	double lastEmittedApproximateMetersPerPixel = 0.0;
 
 	QImage CreateQImageFromGBImage(const GB_Image& image) const;
+	static double NormalizeLayerNumber(double layerNumber);
+	static bool IsTopLayerNumber(double layerNumber);
+	static bool IsBottomLayerNumber(double layerNumber);
+	static int GetLayerPaintOrderGroup(double layerNumber);
+	static bool IsCachedMapTilePaintOrderLess(const CachedMapTile& firstTile, const CachedMapTile& secondTile);
+	void InsertCachedMapTile(CachedMapTile&& cachedTile);
 	void DrawBackground(QPainter& painter) const;
 	void DrawMapTiles(QPainter& painter) const;
 	void DrawCoordinateAxes(QPainter& painter) const;

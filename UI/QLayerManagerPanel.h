@@ -55,13 +55,13 @@ struct LayerManagerLayerInfo
  *
  * 顺序约定：
  * - 面板列表从上到下表示从顶层到底层，row=0 为最顶层；
- * - allLayers / affectedLayers 等图层数组按绘制顺序组织：开头是最底层，最后是最顶层。
+ * - allLayers / affectedLayers 等图层数组统一按列表语义组织：开头是最顶层，最后是最底层。
  */
 struct LayerManagerChangeInfo
 {
 	LayerManagerActionType actionType = LayerManagerActionType::None;
-	std::vector<LayerManagerLayerInfo> allLayers;      // 变化后的全部图层状态，顺序为底层 -> 顶层。
-	std::vector<LayerManagerLayerInfo> affectedLayers; // 本次动作直接影响的图层，顺序为底层 -> 顶层。
+	std::vector<LayerManagerLayerInfo> allLayers;      // 变化后的全部图层状态，顺序为顶层 -> 底层。
+	std::vector<LayerManagerLayerInfo> affectedLayers; // 本次动作直接影响的图层，顺序为顶层 -> 底层。
 	std::vector<int> affectedRows;                     // 本次动作直接影响的行号；移除动作中为移除前行号，顺序与 affectedLayers 对齐。
 	bool targetVisible = true;                         // Show/Hide/勾选变化的目标可见状态。
 };
@@ -78,7 +78,7 @@ Q_DECLARE_METATYPE(LayerManagerChangeInfo)
  * 面板本身不直接操作主画布；当用户改变显示状态、调整图层顺序、请求缩放或请求移除图层时，
  * 通过 LayersChanged() 把完整状态快照发送给外部业务层处理。
  */
-class QLayerManagerPanel : public QDockWidget
+	class QLayerManagerPanel : public QDockWidget
 {
 	Q_OBJECT
 
@@ -149,7 +149,7 @@ private:
 
 	std::vector<LayerManagerLayerInfo> BuildLayerSnapshot() const;
 	std::vector<LayerManagerLayerInfo> BuildSelectedLayerSnapshot() const;
-	std::vector<int> BuildAllVisualRowsInDrawingOrder() const;
+	std::vector<int> BuildAllVisualRowsTopToBottom() const;
 	LayerManagerChangeInfo CreateChangeInfo(LayerManagerActionType actionType,
 		const std::vector<LayerManagerLayerInfo>& affectedLayers,
 		const std::vector<int>& affectedRows,

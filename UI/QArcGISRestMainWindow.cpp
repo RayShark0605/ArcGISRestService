@@ -11,7 +11,7 @@ QArcGISRestMainWindow::QArcGISRestMainWindow(QWidget* parent) : QMainWindow(pare
 	LayerRefresher* refresher = LayerRefresher::GetInstance();
 	if (refresher)
 	{
-		refresher->SetCanvasAndPanel(mainCanvas, serviceBrowserPanel);
+		refresher->SetCanvasAndPanels(mainCanvas, serviceBrowserPanel, layerManagerPanel);
 	}
 }
 
@@ -42,4 +42,9 @@ void QArcGISRestMainWindow::InitializeUi()
 
 QArcGISRestMainWindow::~QArcGISRestMainWindow()
 {
+}
+
+QMainCanvas* QArcGISRestMainWindow::GetCanvas() const
+{
+	return mainCanvas;
 }

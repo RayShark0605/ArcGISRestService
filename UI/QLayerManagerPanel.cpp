@@ -340,7 +340,7 @@ void QLayerManagerPanel::ClearLayers()
 	}
 
 	const std::vector<LayerManagerLayerInfo> affectedLayers = BuildLayerSnapshot();
-	const std::vector<int> affectedRows = BuildAllVisualRowsInDrawingOrder();
+	const std::vector<int> affectedRows = BuildAllVisualRowsTopToBottom();
 	if (!ConfirmRemoveLayers(static_cast<int>(affectedLayers.size()), LayerManagerActionType::RemoveAllLayers))
 	{
 		return;
@@ -492,7 +492,7 @@ void QLayerManagerPanel::OnZoomToAllLayersClicked()
 		return;
 	}
 
-	const std::vector<int> affectedRows = BuildAllVisualRowsInDrawingOrder();
+	const std::vector<int> affectedRows = BuildAllVisualRowsTopToBottom();
 	EmitChange(LayerManagerActionType::ZoomToAllLayers, allLayers, affectedRows, true);
 }
 
@@ -593,7 +593,7 @@ void QLayerManagerPanel::OnLayerOrderPossiblyChanged()
 
 	UpdateSelectionDependentButtons();
 	const std::vector<LayerManagerLayerInfo> affectedLayers = BuildLayerSnapshot();
-	const std::vector<int> affectedRows = BuildAllVisualRowsInDrawingOrder();
+	const std::vector<int> affectedRows = BuildAllVisualRowsTopToBottom();
 	EmitChange(LayerManagerActionType::LayerOrderChanged, affectedLayers, affectedRows, true);
 }
 
@@ -908,10 +908,10 @@ std::vector<LayerManagerLayerInfo> QLayerManagerPanel::BuildLayerSnapshot() cons
 	std::vector<LayerManagerLayerInfo> snapshot;
 	snapshot.reserve(layers.size());
 
-	for (int row = static_cast<int>(layers.size()) - 1; row >= 0; row--)
+	for (size_t layerIndex = 0; layerIndex < layers.size(); layerIndex++)
 	{
-		LayerManagerLayerInfo layerInfo = layers[static_cast<size_t>(row)];
-		layerInfo.row = row;
+		LayerManagerLayerInfo layerInfo = layers[layerIndex];
+		layerInfo.row = static_cast<int>(layerIndex);
 		snapshot.push_back(layerInfo);
 	}
 	return snapshot;
@@ -945,16 +945,16 @@ std::vector<LayerManagerLayerInfo> QLayerManagerPanel::BuildSelectedLayerSnapsho
 	}
 
 	std::sort(selectedLayers.begin(), selectedLayers.end(), [](const LayerManagerLayerInfo& first, const LayerManagerLayerInfo& second) {
-		return first.row > second.row;
+		return first.row < second.row;
 		});
 	return selectedLayers;
 }
 
-std::vector<int> QLayerManagerPanel::BuildAllVisualRowsInDrawingOrder() const
+std::vector<int> QLayerManagerPanel::BuildAllVisualRowsTopToBottom() const
 {
 	std::vector<int> rows;
 	rows.reserve(layers.size());
-	for (int row = static_cast<int>(layers.size()) - 1; row >= 0; row--)
+	for (int row = 0; row < static_cast<int>(layers.size()); row++)
 	{
 		rows.push_back(row);
 	}
@@ -1006,7 +1006,7 @@ void QLayerManagerPanel::SetAllLayersVisible(bool visible)
 	isUpdatingItems = false;
 
 	const std::vector<LayerManagerLayerInfo> affectedLayers = BuildLayerSnapshot();
-	const std::vector<int> affectedRows = BuildAllVisualRowsInDrawingOrder();
+	const std::vector<int> affectedRows = BuildAllVisualRowsTopToBottom();
 	EmitChange(visible ? LayerManagerActionType::ShowAllLayers : LayerManagerActionType::HideAllLayers, affectedLayers, affectedRows, visible);
 }
 
@@ -1036,8 +1036,6 @@ bool QLayerManagerPanel::RemoveRows(const std::vector<int>& rowsToRemove, LayerM
 		return false;
 	}
 
-	std::sort(validRows.rbegin(), validRows.rend());
-
 	std::vector<LayerManagerLayerInfo> affectedLayers;
 	std::vector<int> affectedRows;
 	affectedLayers.reserve(validRows.size());
@@ -1055,8 +1053,11 @@ bool QLayerManagerPanel::RemoveRows(const std::vector<int>& rowsToRemove, LayerM
 		return false;
 	}
 
+	std::vector<int> rowsForDeletion = validRows;
+	std::sort(rowsForDeletion.rbegin(), rowsForDeletion.rend());
+
 	isUpdatingItems = true;
-	for (int row : validRows)
+	for (int row : rowsForDeletion)
 	{
 		if (row < 0 || row >= static_cast<int>(layers.size()))
 		{

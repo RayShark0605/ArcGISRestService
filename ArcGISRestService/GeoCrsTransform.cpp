@@ -1,6 +1,5 @@
 ﻿#include "GeoCrsTransform.h"
 
-#include "GeoBoundingBox.h"
 #include "GeoCrs.h"
 #include "GeoCrsManager.h"
 
@@ -10,17 +9,20 @@
 #include "GeoBase/Geometry/GB_Point2d.h"
 #include "GeoBase/Geometry/GB_Rectangle.h"
 
+#include "gdal_version.h"
 #include "ogr_spatialref.h"
 #include "ogr_srs_api.h"
 
-#include "gdal_version.h"
+#include "opencv2/core.hpp"
+#include "opencv2/imgproc.hpp"
 
 #include <algorithm>
-#include <memory>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
-#include <atomic>
+#include <cstring>
 #include <limits>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -56,6 +58,48 @@ namespace
         return IsFinite(point.x) && IsFinite(point.y);
     }
 
+    static bool IsPositiveFinite(double value)
+    {
+        return IsFinite(value) && value > 0.0;
+    }
+
+    static bool IsNearlyEqual(double left, double right, double tolerance)
+    {
+        return std::fabs(left - right) <= tolerance;
+    }
+
+    static bool IsDegreeAngularUnit(const OGRSpatialReference& srs)
+    {
+        if (srs.IsGeographic() == 0)
+        {
+            return false;
+        }
+
+        const double radiansPerUnit = srs.GetAngularUnits(nullptr);
+        constexpr double degreeToRadians = 0.017453292519943295769236907684886;
+        return IsPositiveFinite(radiansPerUnit) && IsNearlyEqual(radiansPerUnit, degreeToRadians, 1e-14);
+    }
+
+    static double GetRectangleWidth(const GB_Rectangle& rect)
+    {
+        return rect.maxX - rect.minX;
+    }
+
+    static double GetRectangleHeight(const GB_Rectangle& rect)
+    {
+        return rect.maxY - rect.minY;
+    }
+
+    static bool IsNonEmptyRectangle(const GB_Rectangle& rect)
+    {
+        return rect.IsValid() && GetRectangleWidth(rect) > 0.0 && GetRectangleHeight(rect) > 0.0;
+    }
+
+    static bool IsInsideRectangle(const GB_Rectangle& rect, double x, double y)
+    {
+        return x >= rect.minX && x <= rect.maxX && y >= rect.minY && y <= rect.maxY;
+    }
+
     static void EnsureTraditionalGisAxisOrder(OGRSpatialReference& srs)
     {
         srs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
@@ -80,6 +124,29 @@ namespace
         }
 
         return normalized;
+    }
+
+    static bool TryClampRectangleToValidArea(GB_Rectangle& rect, const GB_Rectangle& validRect)
+    {
+        if (!IsNonEmptyRectangle(rect))
+        {
+            return false;
+        }
+
+        if (!IsNonEmptyRectangle(validRect))
+        {
+            return true;
+        }
+
+        const GB_Rectangle clippedRect = rect.Intersected(validRect);
+        if (!IsNonEmptyRectangle(clippedRect))
+        {
+            rect = GB_Rectangle::Invalid;
+            return false;
+        }
+
+        rect = clippedRect;
+        return true;
     }
 
     struct TransformKey
@@ -112,10 +179,16 @@ namespace
 
         bool sourceIsGeographic = false;
         bool targetIsGeographic = false;
+        bool sourceLongitudeIsDegree = false;
+        bool targetLongitudeIsDegree = false;
 
-        // 源 CRS 的自身有效范围（便于 bbox 求交/点的可选归一化判断）
+        // 源 CRS 的自身有效范围（便于 bbox / GeoImage 先求交）
         GB_Rectangle sourceValidRect;
         bool hasSourceValidRect = false;
+
+        // 目标 CRS 的自身有效范围（确保输出范围不会越过目标 CRS 的合法范围）
+        GB_Rectangle targetValidRect;
+        bool hasTargetValidRect = false;
 
         std::string canonicalTargetWkt;
     };
@@ -140,16 +213,19 @@ namespace
             return false;
         }
 
-        const std::string sourceUid = sourceCrs->GetUidUtf8();
-        const std::string targetUid = targetCrs->GetUidUtf8();
-        if (sourceUid.empty() || targetUid.empty())
+        const std::string canonicalSourceWkt = sourceCrs->ExportToWktUtf8(GeoCrs::WktFormat::Wkt2_2018, false);
+        const std::string canonicalTargetWkt = targetCrs->ExportToWktUtf8(GeoCrs::WktFormat::Wkt2_2018, false);
+
+        std::string sourceCacheKey = canonicalSourceWkt.empty() ? sourceCrs->GetUidUtf8() : canonicalSourceWkt;
+        std::string targetCacheKey = canonicalTargetWkt.empty() ? targetCrs->GetUidUtf8() : canonicalTargetWkt;
+        if (sourceCacheKey.empty() || targetCacheKey.empty())
         {
             return false;
         }
 
         TransformKey key;
-        key.sourceUid = sourceUid;
-        key.targetUid = targetUid;
+        key.sourceUid = std::move(sourceCacheKey);
+        key.targetUid = std::move(targetCacheKey);
 
         auto it = g_threadTransformCache.find(key);
         if (it != g_threadTransformCache.end())
@@ -162,28 +238,45 @@ namespace
         item.sourceIsGeographic = sourceCrs->IsGeographic();
         item.targetIsGeographic = targetCrs->IsGeographic();
 
-        // 取源 CRS 的自身有效范围（如果可用）
-        {
-            GeoBoundingBox lonLatArea;
-            GeoBoundingBox selfArea;
-            GeoCrsManager::TryGetValidAreasCached(trimmedSourceWkt, lonLatArea, selfArea);
-            if (selfArea.IsValid())
-            {
-                item.sourceValidRect = selfArea.rect;
-                item.hasSourceValidRect = selfArea.rect.IsValid();
-            }
-        }
+        const OGRSpatialReference& sourceRef = sourceCrs->GetConstRef();
+        const OGRSpatialReference& targetRef = targetCrs->GetConstRef();
+        item.sourceLongitudeIsDegree = IsDegreeAngularUnit(sourceRef);
+        item.targetLongitudeIsDegree = IsDegreeAngularUnit(targetRef);
+
+        const std::string validAreaSourceWkt = canonicalSourceWkt.empty() ? trimmedSourceWkt : canonicalSourceWkt;
 
         // 使用目标 CRS 的规范化 WKT（WKT2_2018），确保输出 GeoBoundingBox 的 wktUtf8 稳定。
-        item.canonicalTargetWkt = targetCrs->ExportToWktUtf8(GeoCrs::WktFormat::Wkt2_2018, false);
+        item.canonicalTargetWkt = canonicalTargetWkt;
         if (item.canonicalTargetWkt.empty())
         {
             // 兜底：至少保留用户输入。
             item.canonicalTargetWkt = trimmedTargetWkt;
         }
 
-        const OGRSpatialReference& sourceRef = sourceCrs->GetConstRef();
-        const OGRSpatialReference& targetRef = targetCrs->GetConstRef();
+        // 取源 CRS 的自身有效范围（如果可用）。
+        // 注意：TryGetValidAreasCached 以 WKT 为输入，因此这里优先使用规范化 WKT，避免传入 "EPSG:xxxx" 时无法取到有效范围。
+        {
+            GeoBoundingBox lonLatArea;
+            GeoBoundingBox selfArea;
+            GeoCrsManager::TryGetValidAreasCached(validAreaSourceWkt, lonLatArea, selfArea);
+            if (selfArea.rect.IsValid())
+            {
+                item.sourceValidRect = selfArea.rect;
+                item.hasSourceValidRect = IsNonEmptyRectangle(selfArea.rect);
+            }
+        }
+
+        // 取目标 CRS 的自身有效范围（如果可用）。
+        {
+            GeoBoundingBox lonLatArea;
+            GeoBoundingBox selfArea;
+            GeoCrsManager::TryGetValidAreasCached(item.canonicalTargetWkt, lonLatArea, selfArea);
+            if (selfArea.rect.IsValid())
+            {
+                item.targetValidRect = selfArea.rect;
+                item.hasTargetValidRect = IsNonEmptyRectangle(selfArea.rect);
+            }
+        }
 
         item.sourceSrs.reset(sourceRef.Clone());
         item.targetSrs.reset(targetRef.Clone());
@@ -219,7 +312,7 @@ namespace
         // 对 Geographic CRS 的经度做适度归一化，减少“超范围但等价”的失败。
         double inputX = x;
         double inputY = y;
-        if (item.sourceIsGeographic)
+        if (item.sourceLongitudeIsDegree)
         {
             inputX = NormalizeLongitudeDegrees(inputX);
         }
@@ -235,7 +328,7 @@ namespace
         }
 
         // 若目标是 Geographic CRS，也进行经度归一化。跨日期线时，单点归一化是安全的。
-        if (item.targetIsGeographic)
+        if (item.targetLongitudeIsDegree)
         {
             transformedX = NormalizeLongitudeDegrees(transformedX);
         }
@@ -259,7 +352,7 @@ namespace
         double inputX = x;
         double inputY = y;
         double inputZ = z;
-        if (item.sourceIsGeographic)
+        if (item.sourceLongitudeIsDegree)
         {
             inputX = NormalizeLongitudeDegrees(inputX);
         }
@@ -272,7 +365,7 @@ namespace
             return false;
         }
 
-        if (item.targetIsGeographic)
+        if (item.targetLongitudeIsDegree)
         {
             inputX = NormalizeLongitudeDegrees(inputX);
         }
@@ -283,6 +376,49 @@ namespace
         return true;
     }
 
+    static bool TryTransformXYArrayInternal(TransformItem& item, std::vector<double>& xValues, std::vector<double>& yValues, std::vector<int>& successFlags)
+    {
+        const size_t count = xValues.size();
+        if (count == 0)
+        {
+            successFlags.clear();
+            return true;
+        }
+
+        if (count != yValues.size() || count > static_cast<size_t>(std::numeric_limits<int>::max()) || item.transform == nullptr)
+        {
+            successFlags.assign(count, FALSE);
+            return false;
+        }
+
+        if (item.sourceLongitudeIsDegree)
+        {
+            for (size_t i = 0; i < count; i++)
+            {
+                xValues[i] = NormalizeLongitudeDegrees(xValues[i]);
+            }
+        }
+
+        successFlags.assign(count, FALSE);
+        const int overallOk = item.transform->Transform(static_cast<int>(count), xValues.data(), yValues.data(), nullptr, successFlags.data());
+
+        for (size_t i = 0; i < count; i++)
+        {
+            if (successFlags[i] == FALSE || !IsFinite(xValues[i]) || !IsFinite(yValues[i]))
+            {
+                successFlags[i] = FALSE;
+                continue;
+            }
+
+            if (item.targetLongitudeIsDegree)
+            {
+                xValues[i] = NormalizeLongitudeDegrees(xValues[i]);
+            }
+        }
+
+        return overallOk != FALSE;
+    }
+
     static void AppendRectangleGridSamples(const GB_Rectangle& rect, int sampleGridCount, std::vector<double>& xs, std::vector<double>& ys)
     {
         const int count = std::max(2, sampleGridCount);
@@ -291,12 +427,12 @@ namespace
 
         for (int yIndex = 0; yIndex < count; yIndex++)
         {
-            const double yT = (count <= 1) ? 0 : static_cast<double>(yIndex) / static_cast<double>(count - 1);
+            const double yT = (count <= 1) ? 0.0 : static_cast<double>(yIndex) / static_cast<double>(count - 1);
             const double y = rect.minY + (rect.maxY - rect.minY) * yT;
 
             for (int xIndex = 0; xIndex < count; xIndex++)
             {
-                const double xT = (count <= 1) ? 0 : static_cast<double>(xIndex) / static_cast<double>(count - 1);
+                const double xT = (count <= 1) ? 0.0 : static_cast<double>(xIndex) / static_cast<double>(count - 1);
                 const double x = rect.minX + (rect.maxX - rect.minX) * xT;
                 xs.push_back(x);
                 ys.push_back(y);
@@ -304,11 +440,27 @@ namespace
         }
     }
 
-    static bool TryTransformRectangleToAabbInternal(TransformItem& item, const GB_Rectangle& sourceRect, int sampleGridCount, GB_Rectangle& outTargetRect)
+    static bool TryFinalizeTargetRectangleInternal(TransformItem& item, bool clampToCrsValidArea, GB_Rectangle& targetRect)
+    {
+        if (!IsNonEmptyRectangle(targetRect))
+        {
+            targetRect = GB_Rectangle::Invalid;
+            return false;
+        }
+
+        if (clampToCrsValidArea && item.hasTargetValidRect && !TryClampRectangleToValidArea(targetRect, item.targetValidRect))
+        {
+            return false;
+        }
+
+        return IsNonEmptyRectangle(targetRect);
+    }
+
+    static bool TryTransformRectangleToAabbInternal(TransformItem& item, const GB_Rectangle& sourceRect, int sampleGridCount, bool clampToCrsValidArea, GB_Rectangle& outTargetRect)
     {
         outTargetRect = GB_Rectangle::Invalid;
 
-        if (!sourceRect.IsValid() || item.transform == nullptr)
+        if (!IsNonEmptyRectangle(sourceRect) || item.transform == nullptr)
         {
             return false;
         }
@@ -316,13 +468,13 @@ namespace
         GB_Rectangle workingRect = sourceRect;
 
         // 与源 CRS 的有效范围求交（更接近“部分交集”的真实语义）。
-        if (item.hasSourceValidRect && item.sourceValidRect.IsValid())
+        if (clampToCrsValidArea && item.hasSourceValidRect && item.sourceValidRect.IsValid())
         {
             workingRect = workingRect.Intersected(item.sourceValidRect);
         }
 
         // 若求交后退化/无效，则认为无法给出合理转换结果。
-        if (!workingRect.IsValid() || workingRect.Area() <= 0.0)
+        if (!IsNonEmptyRectangle(workingRect))
         {
             return false;
         }
@@ -335,29 +487,20 @@ namespace
         double boundsMinY = 0.0;
         double boundsMaxX = 0.0;
         double boundsMaxY = 0.0;
-        const int boundsOk = item.transform->TransformBounds(
-            workingRect.minX,
-            workingRect.minY,
-            workingRect.maxX,
-            workingRect.maxY,
-            &boundsMinX,
-            &boundsMinY,
-            &boundsMaxX,
-            &boundsMaxY,
-            densifyPoints);
+        const int boundsOk = item.transform->TransformBounds(workingRect.minX, workingRect.minY, workingRect.maxX, workingRect.maxY, &boundsMinX, &boundsMinY, &boundsMaxX, &boundsMaxY, densifyPoints);
 
         if (boundsOk != FALSE && IsFinite(boundsMinX) && IsFinite(boundsMinY) && IsFinite(boundsMaxX) && IsFinite(boundsMaxY))
         {
             // 目标为 Geographic CRS 时：TransformBounds 用“xmax < xmin”表示跨越反经线（日期变更线）。
             // 由于 GB_Rectangle 只能表示单段经度，这里保守返回全球经度范围。
-            if (item.targetIsGeographic&& boundsMaxX < boundsMinX)
+            if (item.targetIsGeographic && boundsMaxX < boundsMinX)
             {
                 boundsMinX = -180.0;
                 boundsMaxX = 180.0;
             }
 
             outTargetRect.Set(boundsMinX, boundsMinY, boundsMaxX, boundsMaxY);
-            return outTargetRect.IsValid() && outTargetRect.Area() > 0.0;
+            return TryFinalizeTargetRectangleInternal(item, clampToCrsValidArea, outTargetRect);
         }
 #endif
 
@@ -373,7 +516,7 @@ namespace
         }
 
         std::vector<int> successFlags(numPoints, FALSE);
-        item.transform->Transform(static_cast<int>(numPoints), xValues.data(), yValues.data(), nullptr, successFlags.data());
+        TryTransformXYArrayInternal(item, xValues, yValues, successFlags);
 
         double minX = std::numeric_limits<double>::infinity();
         double minY = std::numeric_limits<double>::infinity();
@@ -388,16 +531,11 @@ namespace
                 continue;
             }
 
-            double x = xValues[i];
-            double y = yValues[i];
+            const double x = xValues[i];
+            const double y = yValues[i];
             if (!IsFinite(x) || !IsFinite(y))
             {
                 continue;
-            }
-
-            if (item.targetIsGeographic)
-            {
-                x = NormalizeLongitudeDegrees(x);
             }
 
             hasAnyPoint = true;
@@ -423,20 +561,10 @@ namespace
         }
 
         outTargetRect.Set(minX, minY, maxX, maxY);
-        return outTargetRect.IsValid() && outTargetRect.Area() > 0.0;
+        return TryFinalizeTargetRectangleInternal(item, clampToCrsValidArea, outTargetRect);
     }
 
-    
-    static void TransformPointsChunkInternal(
-        TransformItem& item,
-        std::vector<GB_Point2d>& points,
-        size_t baseIndex,
-        size_t count,
-        std::atomic_bool& allOk,
-        std::vector<double>& xValues,
-        std::vector<double>& yValues,
-        std::vector<int>& successFlags,
-        std::vector<size_t>& indexMap)
+    static void TransformPointsChunkInternal(TransformItem& item, std::vector<GB_Point2d>& points, size_t baseIndex, size_t count, std::atomic_bool& allOk, std::vector<double>& xValues, std::vector<double>& yValues, std::vector<int>& successFlags, std::vector<size_t>& indexMap)
     {
         xValues.clear();
         yValues.clear();
@@ -459,7 +587,7 @@ namespace
 
             double x = point.x;
             const double y = point.y;
-            if (item.sourceIsGeographic)
+            if (item.sourceLongitudeIsDegree)
             {
                 x = NormalizeLongitudeDegrees(x);
             }
@@ -482,13 +610,7 @@ namespace
         }
 
         successFlags.assign(validCount, FALSE);
-
-        const int overallOk = item.transform->Transform(
-            static_cast<int>(validCount),
-            xValues.data(),
-            yValues.data(),
-            nullptr,
-            successFlags.data());
+        const int overallOk = item.transform->Transform(static_cast<int>(validCount), xValues.data(), yValues.data(), nullptr, successFlags.data());
 
         if (overallOk == FALSE)
         {
@@ -505,7 +627,7 @@ namespace
 
             double x = xValues[i];
             const double y = yValues[i];
-            if (item.targetIsGeographic)
+            if (item.targetLongitudeIsDegree)
             {
                 x = NormalizeLongitudeDegrees(x);
             }
@@ -518,6 +640,365 @@ namespace
             }
         }
     }
+
+    static int ToCvInterpolation(GB_ImageInterpolation interpolation)
+    {
+        switch (interpolation)
+        {
+        case GB_ImageInterpolation::Nearest:
+            return cv::INTER_NEAREST;
+        case GB_ImageInterpolation::Cubic:
+            return cv::INTER_CUBIC;
+        case GB_ImageInterpolation::Lanczos4:
+            return cv::INTER_LANCZOS4;
+        case GB_ImageInterpolation::Area:
+            // cv::remap 不适合使用 INTER_AREA，这里回退到线性插值。
+            return cv::INTER_LINEAR;
+        case GB_ImageInterpolation::Linear:
+        default:
+            return cv::INTER_LINEAR;
+        }
+    }
+
+    static bool TryCreateBgraSourceImage(const GB_Image& sourceImage, GB_Image& outImage)
+    {
+        outImage.Clear();
+
+        if (sourceImage.IsEmpty())
+        {
+            return false;
+        }
+
+        const int channels = sourceImage.GetChannels();
+        if (channels == 1)
+        {
+            outImage = sourceImage.ConvertColor(GB_ImageColorConversion::GrayToBgra);
+        }
+        else if (channels == 3)
+        {
+            outImage = sourceImage.ConvertColor(GB_ImageColorConversion::BgrToBgra);
+        }
+        else if (channels == 4)
+        {
+            outImage = sourceImage.Clone();
+        }
+        else
+        {
+            GBLOG_ERROR(GB_STR("【GeoCrsTransform::ReprojectGeoImage】暂不支持 1/3/4 通道之外的 GeoImage 重投影。"));
+            return false;
+        }
+
+        return !outImage.IsEmpty() && outImage.GetChannels() == 4;
+    }
+    static bool ApplySourceWorkingRectMask(cv::Mat& sourceMat, const GB_Rectangle& sourceRect, const GB_Rectangle& sourceWorkingRect)
+    {
+        if (sourceMat.empty() || !IsNonEmptyRectangle(sourceRect) || !IsNonEmptyRectangle(sourceWorkingRect))
+        {
+            return false;
+        }
+
+        const int rows = sourceMat.rows;
+        const int cols = sourceMat.cols;
+        if (rows <= 0 || cols <= 0)
+        {
+            return false;
+        }
+
+        const size_t bytesPerPixel = sourceMat.elemSize();
+        if (bytesPerPixel == 0)
+        {
+            return false;
+        }
+
+        const double pixelSizeX = GetRectangleWidth(sourceRect) / static_cast<double>(cols);
+        const double pixelSizeY = GetRectangleHeight(sourceRect) / static_cast<double>(rows);
+        if (!IsPositiveFinite(pixelSizeX) || !IsPositiveFinite(pixelSizeY))
+        {
+            return false;
+        }
+
+        for (int row = 0; row < rows; row++)
+        {
+            const double y = sourceRect.maxY - (static_cast<double>(row) + 0.5) * pixelSizeY;
+            unsigned char* rowData = sourceMat.ptr<unsigned char>(row);
+
+            for (int col = 0; col < cols; col++)
+            {
+                const double x = sourceRect.minX + (static_cast<double>(col) + 0.5) * pixelSizeX;
+                if (!IsInsideRectangle(sourceWorkingRect, x, y))
+                {
+                    std::memset(rowData + static_cast<size_t>(col) * bytesPerPixel, 0, bytesPerPixel);
+                }
+            }
+        }
+
+        return true;
+    }
+
+
+    static bool TryGetSourceWorkingRect(const GeoBoundingBox& sourceBox, TransformItem& forwardItem, bool clampToCrsValidArea, GB_Rectangle& outWorkingRect)
+    {
+        outWorkingRect = sourceBox.rect;
+
+        if (!IsNonEmptyRectangle(outWorkingRect))
+        {
+            outWorkingRect = GB_Rectangle::Invalid;
+            return false;
+        }
+
+        if (clampToCrsValidArea && forwardItem.hasSourceValidRect)
+        {
+            outWorkingRect = outWorkingRect.Intersected(forwardItem.sourceValidRect);
+        }
+
+        if (!IsNonEmptyRectangle(outWorkingRect))
+        {
+            outWorkingRect = GB_Rectangle::Invalid;
+            return false;
+        }
+
+        return true;
+    }
+
+    static double MedianPositiveValue(std::vector<double>& values)
+    {
+        values.erase(std::remove_if(values.begin(), values.end(), [](double value) { return !IsPositiveFinite(value); }), values.end());
+        if (values.empty())
+        {
+            return 0.0;
+        }
+
+        const size_t middleIndex = values.size() / 2;
+        std::nth_element(values.begin(), values.begin() + middleIndex, values.end());
+        return values[middleIndex];
+    }
+
+    static bool TryEstimateTargetPixelSize(TransformItem& forwardItem, const GB_Rectangle& sourceSampleRect, const GB_Rectangle& sourcePixelRect, size_t sourceCols, size_t sourceRows, int sampleGridCount, double& outPixelSizeX, double& outPixelSizeY)
+    {
+        outPixelSizeX = 0.0;
+        outPixelSizeY = 0.0;
+
+        if (!IsNonEmptyRectangle(sourceSampleRect) || !IsNonEmptyRectangle(sourcePixelRect) || sourceCols == 0 || sourceRows == 0)
+        {
+            return false;
+        }
+
+        // 像元大小必须来自整幅源影像的真实地理范围，而不是裁剪后的有效参与范围。
+        // 否则当 sourceSampleRect 只是 sourcePixelRect 的一部分时，输出分辨率会被错误放大，导致重投影后图像尺寸偏大。
+        const double sourcePixelSizeX = GetRectangleWidth(sourcePixelRect) / static_cast<double>(sourceCols);
+        const double sourcePixelSizeY = GetRectangleHeight(sourcePixelRect) / static_cast<double>(sourceRows);
+        if (!IsPositiveFinite(sourcePixelSizeX) || !IsPositiveFinite(sourcePixelSizeY))
+        {
+            return false;
+        }
+
+        const int count = std::max(2, std::min(sampleGridCount, 9));
+        std::vector<double> xPixelSizes;
+        std::vector<double> yPixelSizes;
+        xPixelSizes.reserve(static_cast<size_t>(count) * static_cast<size_t>(count));
+        yPixelSizes.reserve(static_cast<size_t>(count) * static_cast<size_t>(count));
+
+        for (int yIndex = 0; yIndex < count; yIndex++)
+        {
+            const double yT = static_cast<double>(yIndex) / static_cast<double>(count - 1);
+            const double sourceY = sourceSampleRect.minY + GetRectangleHeight(sourceSampleRect) * yT;
+
+            for (int xIndex = 0; xIndex < count; xIndex++)
+            {
+                const double xT = static_cast<double>(xIndex) / static_cast<double>(count - 1);
+                const double sourceX = sourceSampleRect.minX + GetRectangleWidth(sourceSampleRect) * xT;
+
+                double centerX = 0.0;
+                double centerY = 0.0;
+                if (!TryTransformSingleXYInternal(forwardItem, sourceX, sourceY, centerX, centerY))
+                {
+                    continue;
+                }
+
+                const double xNeighborSourceX = (sourceX + sourcePixelSizeX <= sourceSampleRect.maxX) ? sourceX + sourcePixelSizeX : sourceX - sourcePixelSizeX;
+                double xNeighborX = 0.0;
+                double xNeighborY = 0.0;
+                if (xNeighborSourceX >= sourceSampleRect.minX && xNeighborSourceX <= sourceSampleRect.maxX && TryTransformSingleXYInternal(forwardItem, xNeighborSourceX, sourceY, xNeighborX, xNeighborY))
+                {
+                    const double distance = std::sqrt((xNeighborX - centerX) * (xNeighborX - centerX) + (xNeighborY - centerY) * (xNeighborY - centerY));
+                    if (IsPositiveFinite(distance))
+                    {
+                        xPixelSizes.push_back(distance);
+                    }
+                }
+
+                const double yNeighborSourceY = (sourceY + sourcePixelSizeY <= sourceSampleRect.maxY) ? sourceY + sourcePixelSizeY : sourceY - sourcePixelSizeY;
+                double yNeighborX = 0.0;
+                double yNeighborY = 0.0;
+                if (yNeighborSourceY >= sourceSampleRect.minY && yNeighborSourceY <= sourceSampleRect.maxY && TryTransformSingleXYInternal(forwardItem, sourceX, yNeighborSourceY, yNeighborX, yNeighborY))
+                {
+                    const double distance = std::sqrt((yNeighborX - centerX) * (yNeighborX - centerX) + (yNeighborY - centerY) * (yNeighborY - centerY));
+                    if (IsPositiveFinite(distance))
+                    {
+                        yPixelSizes.push_back(distance);
+                    }
+                }
+            }
+        }
+
+        outPixelSizeX = MedianPositiveValue(xPixelSizes);
+        outPixelSizeY = MedianPositiveValue(yPixelSizes);
+        return IsPositiveFinite(outPixelSizeX) && IsPositiveFinite(outPixelSizeY);
+    }
+
+    static bool TryScaleOutputSizeToLimits(size_t& width, size_t& height, const GeoImageReprojectOptions& options)
+    {
+        if (width == 0 || height == 0)
+        {
+            return false;
+        }
+
+        double scale = 1.0;
+        if (options.maxOutputWidth > 0 && width > options.maxOutputWidth)
+        {
+            scale = std::min(scale, static_cast<double>(options.maxOutputWidth) / static_cast<double>(width));
+        }
+        if (options.maxOutputHeight > 0 && height > options.maxOutputHeight)
+        {
+            scale = std::min(scale, static_cast<double>(options.maxOutputHeight) / static_cast<double>(height));
+        }
+        if (options.maxOutputPixelCount > 0)
+        {
+            const long double pixelCount = static_cast<long double>(width) * static_cast<long double>(height);
+            if (pixelCount > static_cast<long double>(options.maxOutputPixelCount))
+            {
+                const long double pixelScale = std::sqrt(static_cast<long double>(options.maxOutputPixelCount) / pixelCount);
+                scale = std::min(scale, static_cast<double>(pixelScale));
+            }
+        }
+
+        if (scale < 1.0)
+        {
+            width = std::max<size_t>(1, static_cast<size_t>(std::floor(static_cast<double>(width) * scale)));
+            height = std::max<size_t>(1, static_cast<size_t>(std::floor(static_cast<double>(height) * scale)));
+        }
+
+        return width > 0 && height > 0 && width <= static_cast<size_t>(std::numeric_limits<int>::max()) && height <= static_cast<size_t>(std::numeric_limits<int>::max());
+    }
+
+    static bool TryCeilPositiveToSizeT(double value, size_t& outValue)
+    {
+        outValue = 0;
+        if (!IsPositiveFinite(value) || value > static_cast<double>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        outValue = static_cast<size_t>(std::ceil(value));
+        if (outValue == 0)
+        {
+            outValue = 1;
+        }
+
+        return true;
+    }
+
+    static bool TryResolveOutputSize(TransformItem& forwardItem, const GB_Rectangle& sourceWorkingRect, const GB_Rectangle& sourcePixelRect, const GB_Rectangle& targetRect, size_t sourceCols, size_t sourceRows, const GeoImageReprojectOptions& options, size_t& outWidth, size_t& outHeight)
+    {
+        outWidth = options.outputWidth;
+        outHeight = options.outputHeight;
+
+        if (!IsNonEmptyRectangle(sourceWorkingRect) || !IsNonEmptyRectangle(sourcePixelRect) || !IsNonEmptyRectangle(targetRect) || sourceCols == 0 || sourceRows == 0)
+        {
+            return false;
+        }
+
+        if (outWidth > 0 && outHeight > 0)
+        {
+            return TryScaleOutputSizeToLimits(outWidth, outHeight, options);
+        }
+
+        double targetPixelSizeX = options.targetPixelSizeX;
+        double targetPixelSizeY = options.targetPixelSizeY;
+        if (!IsPositiveFinite(targetPixelSizeX) || !IsPositiveFinite(targetPixelSizeY))
+        {
+            double estimatedPixelSizeX = 0.0;
+            double estimatedPixelSizeY = 0.0;
+            if (TryEstimateTargetPixelSize(forwardItem, sourceWorkingRect, sourcePixelRect, sourceCols, sourceRows, options.sampleGridCount, estimatedPixelSizeX, estimatedPixelSizeY))
+            {
+                if (!IsPositiveFinite(targetPixelSizeX))
+                {
+                    targetPixelSizeX = estimatedPixelSizeX;
+                }
+                if (!IsPositiveFinite(targetPixelSizeY))
+                {
+                    targetPixelSizeY = estimatedPixelSizeY;
+                }
+            }
+        }
+
+        if (!IsPositiveFinite(targetPixelSizeX))
+        {
+            targetPixelSizeX = GetRectangleWidth(targetRect) / static_cast<double>(sourceCols);
+        }
+        if (!IsPositiveFinite(targetPixelSizeY))
+        {
+            targetPixelSizeY = GetRectangleHeight(targetRect) / static_cast<double>(sourceRows);
+        }
+
+        if (!IsPositiveFinite(targetPixelSizeX) || !IsPositiveFinite(targetPixelSizeY))
+        {
+            return false;
+        }
+
+        if (outWidth == 0)
+        {
+            if (!TryCeilPositiveToSizeT(GetRectangleWidth(targetRect) / targetPixelSizeX, outWidth))
+            {
+                return false;
+            }
+        }
+        if (outHeight == 0)
+        {
+            if (!TryCeilPositiveToSizeT(GetRectangleHeight(targetRect) / targetPixelSizeY, outHeight))
+            {
+                return false;
+            }
+        }
+
+        return TryScaleOutputSizeToLimits(outWidth, outHeight, options);
+    }
+
+}
+
+GeoImage::GeoImage() = default;
+
+GeoImage::GeoImage(const GB_Image& sourceImage, const GeoBoundingBox& sourceBoundingBox)
+    : image(sourceImage), boundingBox(sourceBoundingBox)
+{
+}
+
+GeoImage::GeoImage(GB_Image&& sourceImage, GeoBoundingBox&& sourceBoundingBox) noexcept
+    : image(std::move(sourceImage)), boundingBox(std::move(sourceBoundingBox))
+{
+}
+
+bool GeoImage::IsValid() const
+{
+    return !image.IsEmpty() && image.GetWidth() > 0 && image.GetHeight() > 0 && boundingBox.IsValid() && IsNonEmptyRectangle(boundingBox.rect);
+}
+
+void GeoImage::Reset()
+{
+    image.Clear();
+    boundingBox.Reset();
+}
+
+void GeoImage::Set(const GB_Image& sourceImage, const GeoBoundingBox& sourceBoundingBox)
+{
+    image = sourceImage;
+    boundingBox = sourceBoundingBox;
+}
+
+void GeoImage::Set(GB_Image&& sourceImage, GeoBoundingBox&& sourceBoundingBox) noexcept
+{
+    image = std::move(sourceImage);
+    boundingBox = std::move(sourceBoundingBox);
 }
 
 bool GeoCrsTransform::TransformPoint(const std::string& sourceWktUtf8, const std::string& targetWktUtf8, const GB_Point2d& sourcePoint, GB_Point2d& outPoint)
@@ -685,14 +1166,13 @@ bool GeoCrsTransform::TransformBoundingBox(const GeoBoundingBox& sourceBox, cons
     }
 
     GB_Rectangle targetRect;
-    if (!TryTransformRectangleToAabbInternal(*item, sourceBox.rect, sampleGridCount, targetRect))
+    if (!TryTransformRectangleToAabbInternal(*item, sourceBox.rect, sampleGridCount, true, targetRect))
     {
         return false;
     }
 
     GeoBoundingBox result;
-    result.wktUtf8 = item->canonicalTargetWkt;
-    result.rect = targetRect;
+    result.Set(item->canonicalTargetWkt, targetRect);
     outBox = result;
     return outBox.IsValid();
 }
@@ -720,6 +1200,10 @@ bool GeoCrsTransform::TryTransformBoundingBoxes(std::vector<GeoBoundingBox>& inO
     const std::string trimmedTargetWkt = GB_Utf8Trim(targetWktUtf8);
     if (trimmedTargetWkt.empty())
     {
+        for (GeoBoundingBox& bbox : inOutBoxes)
+        {
+            bbox = GeoBoundingBox::Invalid;
+        }
         return false;
     }
 
@@ -757,15 +1241,14 @@ bool GeoCrsTransform::TryTransformBoundingBoxes(std::vector<GeoBoundingBox>& inO
         }
 
         GB_Rectangle targetRect;
-        if (!TryTransformRectangleToAabbInternal(*item, bbox.rect, sampleGridCount, targetRect))
+        if (!TryTransformRectangleToAabbInternal(*item, bbox.rect, sampleGridCount, true, targetRect))
         {
             bbox = GeoBoundingBox::Invalid;
             allOk.store(false, std::memory_order_relaxed);
             return;
         }
 
-        bbox.wktUtf8 = item->canonicalTargetWkt;
-        bbox.rect = targetRect;
+        bbox.Set(item->canonicalTargetWkt, targetRect);
         };
 
     if (enableOpenMP)
@@ -785,4 +1268,283 @@ bool GeoCrsTransform::TryTransformBoundingBoxes(std::vector<GeoBoundingBox>& inO
     }
 
     return allOk.load(std::memory_order_relaxed);
+}
+
+bool GeoCrsTransform::ReprojectGeoImage(const GeoImage& sourceImage, const std::string& targetWktUtf8, GeoImage& outImage, const GeoImageReprojectOptions& options)
+{
+    outImage.Reset();
+
+    if (!sourceImage.IsValid())
+    {
+        return false;
+    }
+
+    const std::string trimmedSourceWkt = GB_Utf8Trim(sourceImage.boundingBox.wktUtf8);
+    const std::string trimmedTargetWkt = GB_Utf8Trim(targetWktUtf8);
+    if (trimmedSourceWkt.empty() || trimmedTargetWkt.empty())
+    {
+        return false;
+    }
+
+    TransformItem* forwardItem = nullptr;
+    if (!TryGetTransformItem(trimmedSourceWkt, trimmedTargetWkt, forwardItem) || forwardItem == nullptr)
+    {
+        return false;
+    }
+
+    GB_Rectangle sourceWorkingRect;
+    if (!TryGetSourceWorkingRect(sourceImage.boundingBox, *forwardItem, options.clampToCrsValidArea, sourceWorkingRect))
+    {
+        return false;
+    }
+
+    GB_Rectangle targetRect;
+    if (!TryTransformRectangleToAabbInternal(*forwardItem, sourceWorkingRect, options.sampleGridCount, options.clampToCrsValidArea, targetRect))
+    {
+        return false;
+    }
+
+    GeoBoundingBox targetBoundingBox;
+    targetBoundingBox.Set(forwardItem->canonicalTargetWkt, targetRect);
+    if (!targetBoundingBox.IsValid())
+    {
+        return false;
+    }
+
+    const size_t sourceCols = sourceImage.image.GetWidth();
+    const size_t sourceRows = sourceImage.image.GetHeight();
+    size_t outputWidth = 0;
+    size_t outputHeight = 0;
+    if (!TryResolveOutputSize(*forwardItem, sourceWorkingRect, sourceImage.boundingBox.rect, targetBoundingBox.rect, sourceCols, sourceRows, options, outputWidth, outputHeight))
+    {
+        return false;
+    }
+
+    GB_Image bgraSourceImage;
+    if (!TryCreateBgraSourceImage(sourceImage.image, bgraSourceImage))
+    {
+        return false;
+    }
+
+    GeoImage workingSourceImage(bgraSourceImage, sourceImage.boundingBox);
+    cv::Mat sourceMat = bgraSourceImage.ToCvMat(GB_ImageCopyMode::ShallowCopy);
+    if (sourceMat.empty() || sourceMat.channels() != 4)
+    {
+        return false;
+    }
+    if (!ApplySourceWorkingRectMask(sourceMat, workingSourceImage.boundingBox.rect, sourceWorkingRect))
+    {
+        return false;
+    }
+
+
+    cv::Mat mapX;
+    cv::Mat mapY;
+
+    auto buildMaps = [&](const std::string& inverseSourceWkt, const std::string& inverseTargetWkt) -> bool {
+        mapX.release();
+        mapY.release();
+
+        if (outputWidth > static_cast<size_t>(std::numeric_limits<int>::max()) || outputHeight > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        try
+        {
+            mapX = cv::Mat(static_cast<int>(outputHeight), static_cast<int>(outputWidth), CV_32FC1, cv::Scalar(-1.0));
+            mapY = cv::Mat(static_cast<int>(outputHeight), static_cast<int>(outputWidth), CV_32FC1, cv::Scalar(-1.0));
+        }
+        catch (const cv::Exception&)
+        {
+            mapX.release();
+            mapY.release();
+            return false;
+        }
+
+        const double sourcePixelSizeX = GetRectangleWidth(workingSourceImage.boundingBox.rect) / static_cast<double>(sourceCols);
+        const double sourcePixelSizeY = GetRectangleHeight(workingSourceImage.boundingBox.rect) / static_cast<double>(sourceRows);
+        const double targetPixelSizeX = GetRectangleWidth(targetBoundingBox.rect) / static_cast<double>(outputWidth);
+        const double targetPixelSizeY = GetRectangleHeight(targetBoundingBox.rect) / static_cast<double>(outputHeight);
+        if (!IsPositiveFinite(sourcePixelSizeX) || !IsPositiveFinite(sourcePixelSizeY) || !IsPositiveFinite(targetPixelSizeX) || !IsPositiveFinite(targetPixelSizeY))
+        {
+            return false;
+        }
+
+        std::atomic_bool allOk(true);
+        std::atomic_bool hasAnyMappedPixel(false);
+        const bool useParallel = options.enableOpenMP && outputHeight <= static_cast<size_t>(std::numeric_limits<int>::max());
+
+        auto buildRow = [&](size_t row, TransformItem& inverseItem, std::vector<double>& xValues, std::vector<double>& yValues, std::vector<int>& successFlags) {
+            xValues.resize(outputWidth);
+            yValues.resize(outputWidth);
+
+            const double targetY = targetBoundingBox.rect.maxY - (static_cast<double>(row) + 0.5) * targetPixelSizeY;
+            for (size_t col = 0; col < outputWidth; col++)
+            {
+                xValues[col] = targetBoundingBox.rect.minX + (static_cast<double>(col) + 0.5) * targetPixelSizeX;
+                yValues[col] = targetY;
+            }
+
+            TryTransformXYArrayInternal(inverseItem, xValues, yValues, successFlags);
+
+            float* mapXRow = mapX.ptr<float>(static_cast<int>(row));
+            float* mapYRow = mapY.ptr<float>(static_cast<int>(row));
+            for (size_t col = 0; col < outputWidth; col++)
+            {
+                if (successFlags[col] == FALSE)
+                {
+                    continue;
+                }
+
+                const double sourceX = xValues[col];
+                const double sourceY = yValues[col];
+                if (!IsInsideRectangle(sourceWorkingRect, sourceX, sourceY))
+                {
+                    continue;
+                }
+
+                const double sourcePixelX = (sourceX - workingSourceImage.boundingBox.rect.minX) / sourcePixelSizeX - 0.5;
+                const double sourcePixelY = (workingSourceImage.boundingBox.rect.maxY - sourceY) / sourcePixelSizeY - 0.5;
+                if (!IsFinite(sourcePixelX) || !IsFinite(sourcePixelY))
+                {
+                    continue;
+                }
+
+                mapXRow[col] = static_cast<float>(sourcePixelX);
+                hasAnyMappedPixel.store(true, std::memory_order_relaxed);
+                mapYRow[col] = static_cast<float>(sourcePixelY);
+            }
+            };
+
+        if (useParallel)
+        {
+#pragma omp parallel
+            {
+                TransformItem* inverseItem = nullptr;
+                if (!TryGetTransformItem(inverseSourceWkt, inverseTargetWkt, inverseItem) || inverseItem == nullptr || inverseItem->transform == nullptr)
+                {
+                    allOk.store(false, std::memory_order_relaxed);
+                }
+
+                std::vector<double> xValues;
+                std::vector<double> yValues;
+                std::vector<int> successFlags;
+
+#pragma omp for schedule(static)
+                for (int row = 0; row < static_cast<int>(outputHeight); row++)
+                {
+                    if (inverseItem == nullptr || inverseItem->transform == nullptr)
+                    {
+                        allOk.store(false, std::memory_order_relaxed);
+                        continue;
+                    }
+
+                    buildRow(static_cast<size_t>(row), *inverseItem, xValues, yValues, successFlags);
+                }
+            }
+        }
+        else
+        {
+            TransformItem* inverseItem = nullptr;
+            if (!TryGetTransformItem(inverseSourceWkt, inverseTargetWkt, inverseItem) || inverseItem == nullptr || inverseItem->transform == nullptr)
+            {
+                return false;
+            }
+
+            std::vector<double> xValues;
+            std::vector<double> yValues;
+            std::vector<int> successFlags;
+
+            for (size_t row = 0; row < outputHeight; row++)
+            {
+                buildRow(row, *inverseItem, xValues, yValues, successFlags);
+            }
+        }
+
+        return allOk.load(std::memory_order_relaxed) && hasAnyMappedPixel.load(std::memory_order_relaxed);
+        };
+
+    if (!buildMaps(targetBoundingBox.wktUtf8, trimmedSourceWkt))
+    {
+        return false;
+    }
+
+    cv::Mat targetMat;
+    try
+    {
+        targetMat = cv::Mat(static_cast<int>(outputHeight), static_cast<int>(outputWidth), sourceMat.type(), cv::Scalar(0.0, 0.0, 0.0, 0.0));
+        cv::remap(sourceMat, targetMat, mapX, mapY, ToCvInterpolation(options.interpolation), cv::BORDER_CONSTANT, cv::Scalar(0.0, 0.0, 0.0, 0.0));
+    }
+    catch (const cv::Exception&)
+    {
+        return false;
+    }
+
+    GB_Image targetImage;
+    if (!targetImage.SetFromCvMat(targetMat, GB_ImageCopyMode::DeepCopy))
+    {
+        return false;
+    }
+
+    outImage.Set(std::move(targetImage), std::move(targetBoundingBox));
+    return outImage.IsValid();
+}
+
+bool GeoCrsTransform::ReprojectGeoImages(const std::vector<GeoImage>& sourceImages, const std::string& targetWktUtf8, std::vector<GeoImage>& outImages, const GeoImageReprojectOptions& options)
+{
+    outImages.clear();
+    outImages.resize(sourceImages.size());
+
+    const size_t count = sourceImages.size();
+    if (count == 0)
+    {
+        return true;
+    }
+
+    std::atomic_bool allOk(true);
+    if (options.enableOpenMP && count <= static_cast<size_t>(std::numeric_limits<int>::max()))
+    {
+#pragma omp parallel for schedule(dynamic)
+        for (int i = 0; i < static_cast<int>(count); i++)
+        {
+            GeoImageReprojectOptions itemOptions = options;
+            itemOptions.enableOpenMP = false;
+
+            GeoImage projectedImage;
+            if (!ReprojectGeoImage(sourceImages[static_cast<size_t>(i)], targetWktUtf8, projectedImage, itemOptions))
+            {
+                outImages[static_cast<size_t>(i)].Reset();
+                allOk.store(false, std::memory_order_relaxed);
+                continue;
+            }
+
+            outImages[static_cast<size_t>(i)] = std::move(projectedImage);
+        }
+    }
+    else
+    {
+        for (size_t i = 0; i < count; i++)
+        {
+            GeoImage projectedImage;
+            if (!ReprojectGeoImage(sourceImages[i], targetWktUtf8, projectedImage, options))
+            {
+                outImages[i].Reset();
+                allOk.store(false, std::memory_order_relaxed);
+                continue;
+            }
+
+            outImages[i] = std::move(projectedImage);
+        }
+    }
+
+    return allOk.load(std::memory_order_relaxed);
+}
+
+bool GeoCrsTransform::TryReprojectGeoImages(std::vector<GeoImage>& inOutImages, const std::string& targetWktUtf8, const GeoImageReprojectOptions& options)
+{
+    std::vector<GeoImage> transformedImages;
+    const bool ok = ReprojectGeoImages(inOutImages, targetWktUtf8, transformedImages, options);
+    inOutImages.swap(transformedImages);
+    return ok;
 }

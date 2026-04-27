@@ -131,11 +131,16 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions);ARCGIS_RESTSERVICE_EXPORTS</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
+      <SupportJustMyCode />
+      <UseDynamicDebugging />
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies>libcurl.lib;libcrypto.lib;zlib.lib;gdal.lib;libxml2.lib;yaml-cpp.lib;opencv_core4.lib;opencv_imgcodecs4.lib;opencv_imgproc4.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <UseDynamicDebugging />
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
