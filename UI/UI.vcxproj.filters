@@ -47,6 +47,9 @@
     <ClCompile Include="QLayerManagerPanel.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="TileImageCache.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <QtMoc Include="QMainCanvas.h">
@@ -70,6 +73,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="DataDef.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="TileImageCache.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

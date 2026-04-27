@@ -119,8 +119,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <GenerateDebugInformation>
-      </GenerateDebugInformation>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
     </Link>
@@ -137,9 +136,11 @@
     <ClCompile Include="QLayerManagerPanel.cpp" />
     <ClCompile Include="QMainCanvas.cpp" />
     <ClCompile Include="QServiceBrowserPanel.cpp" />
+    <ClCompile Include="TileImageCache.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="DataDef.h" />
+    <ClInclude Include="TileImageCache.h" />
     <QtMoc Include="QLayerManagerPanel.h" />
     <QtMoc Include="LayerRefresher.h" />
     <QtMoc Include="QArcGISRestConnectionDialog.h" />

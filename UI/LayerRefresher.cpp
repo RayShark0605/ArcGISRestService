@@ -6,6 +6,7 @@
 #include "GeoBoundingBox.h"
 #include "GeoCrsTransform.h"
 #include "GeoCrsManager.h"
+#include "TileImageCache.h"
 #include "GeoBase/GB_Crypto.h"
 #include "GeoBase/GB_Network.h"
 #include "GeoBase/GB_Utf8String.h"
@@ -535,6 +536,130 @@ namespace
 		}
 
 		return urlPrefix + requestUrl;
+	}
+
+	std::string NormalizeFileExtForLayerRefresher(const std::string& fileExtUtf8)
+	{
+		std::string ext = ToLowerAscii(TrimmedStdString(fileExtUtf8));
+		if (ext.empty())
+		{
+			return std::string();
+		}
+
+		if (ext[0] != '.')
+		{
+			ext.insert(ext.begin(), '.');
+		}
+
+		if (ext == ".jpeg")
+		{
+			return ".jpg";
+		}
+		if (ext == ".tif")
+		{
+			return ".tiff";
+		}
+		if (ext == ".png8" || ext == ".png24" || ext == ".png32")
+		{
+			return ".png";
+		}
+
+		bool allSafe = ext.size() >= 2 && ext.size() <= 16;
+		for (size_t charIndex = 1; charIndex < ext.size(); charIndex++)
+		{
+			const unsigned char ch = static_cast<unsigned char>(ext[charIndex]);
+			if (!std::isalnum(ch))
+			{
+				allSafe = false;
+				break;
+			}
+		}
+
+		return allSafe ? ext : std::string();
+	}
+
+	std::string GuessFileExtFromContentType(const std::string& contentTypeUtf8)
+	{
+		const std::string contentType = ToLowerAscii(TrimmedStdString(contentTypeUtf8));
+		if (contentType.empty())
+		{
+			return std::string();
+		}
+
+		if (contentType.find("image/png") != std::string::npos)
+		{
+			return ".png";
+		}
+		if (contentType.find("image/jpeg") != std::string::npos || contentType.find("image/jpg") != std::string::npos)
+		{
+			return ".jpg";
+		}
+		if (contentType.find("image/tiff") != std::string::npos || contentType.find("image/tif") != std::string::npos)
+		{
+			return ".tiff";
+		}
+		if (contentType.find("image/gif") != std::string::npos)
+		{
+			return ".gif";
+		}
+		if (contentType.find("image/bmp") != std::string::npos || contentType.find("image/x-ms-bmp") != std::string::npos)
+		{
+			return ".bmp";
+		}
+		if (contentType.find("image/webp") != std::string::npos)
+		{
+			return ".webp";
+		}
+
+		return std::string();
+	}
+
+	std::string GuessFileExtFromFileName(const std::string& fileNameUtf8)
+	{
+		const std::string fileName = TrimmedStdString(fileNameUtf8);
+		const size_t dotPos = fileName.find_last_of('.');
+		if (dotPos == std::string::npos || dotPos + 1 >= fileName.size())
+		{
+			return std::string();
+		}
+
+		return NormalizeFileExtForLayerRefresher(fileName.substr(dotPos));
+	}
+
+	std::string GuessFileExtFromImageFormatForLayerRefresher(const std::string& imageFormatUtf8)
+	{
+		const std::string imageFormat = ToLowerAscii(TrimmedStdString(imageFormatUtf8));
+		if (imageFormat.empty())
+		{
+			return std::string();
+		}
+
+		if (StartsWithAsciiNoCase(imageFormat, "png"))
+		{
+			return ".png";
+		}
+		if (StartsWithAsciiNoCase(imageFormat, "jpg") || StartsWithAsciiNoCase(imageFormat, "jpeg"))
+		{
+			return ".jpg";
+		}
+		if (StartsWithAsciiNoCase(imageFormat, "tif") || StartsWithAsciiNoCase(imageFormat, "tiff"))
+		{
+			return ".tiff";
+		}
+		if (StartsWithAsciiNoCase(imageFormat, "gif"))
+		{
+			return ".gif";
+		}
+		if (StartsWithAsciiNoCase(imageFormat, "bmp"))
+		{
+			return ".bmp";
+		}
+		if (StartsWithAsciiNoCase(imageFormat, "webp"))
+		{
+			return ".webp";
+		}
+
+		return NormalizeFileExtForLayerRefresher(imageFormat);
 	}
 
 	std::string TrimTrailingSlash(std::string url)
@@ -1605,6 +1730,92 @@ private:
 		return currentGeneration.load(std::memory_order_acquire) == generation;
 	}
 
+	std::string BuildRawImageCacheExtraKey(const TileTask& task) const
+	{
+		std::string keyText;
+		keyText.reserve(512);
+		keyText += "version=1\n";
+		keyText += "referer=";
+		keyText += task.networkOptions.refererUtf8;
+		keyText += "\n";
+
+		for (const std::string& header : task.networkOptions.headersUtf8)
+		{
+			keyText += "header=";
+			keyText += header;
+			keyText += "\n";
+		}
+
+		if (!task.connectionSettings.username.empty() || !task.connectionSettings.password.empty())
+		{
+			keyText += "credentialsHash=";
+			keyText += GB_Md5Hash(task.connectionSettings.username + "\n" + task.connectionSettings.password);
+			keyText += "\n";
+		}
+
+		return "LayerRefresherRawImageCacheV1:" + GB_Md5Hash(keyText);
+	}
+
+	TileImageCacheKey BuildRawImageCacheKey(const TileTask& task, const std::string& downloadUrl) const
+	{
+		ImageRequestItem cacheRequestItem = task.requestItem;
+		cacheRequestItem.requestUrl = downloadUrl;
+		cacheRequestItem.uid = GB_Md5Hash(downloadUrl);
+
+		// 这里缓存的是服务端原始返回影像，而不是重投影后的显示影像。
+		// 因此 targetWktUtf8 留空，使同一原始瓦片可被不同目标 CRS 复用。
+		return TileImageCacheKey(cacheRequestItem, task.sourceWktUtf8, std::string(), BuildRawImageCacheExtraKey(task));
+	}
+
+	std::string GuessPreferredCacheFileExt(const TileTask& task, const GB_NetworkDownloadedFile& downloadedFile) const
+	{
+		std::string fileExt = GuessFileExtFromContentType(downloadedFile.contentTypeUtf8);
+		if (!fileExt.empty())
+		{
+			return fileExt;
+		}
+
+		fileExt = GuessFileExtFromFileName(downloadedFile.fileNameUtf8);
+		if (!fileExt.empty())
+		{
+			return fileExt;
+		}
+
+		return GuessFileExtFromImageFormatForLayerRefresher(task.requestItem.imageFormat);
+	}
+
+	bool TryLoadRawImageFromCacheOrNetwork(const TileTask& task, const std::string& downloadUrl, const GB_ImageLoadOptions& loadOptions, GB_Image& outImage) const
+	{
+		outImage.Clear();
+
+		const TileImageCacheKey cacheKey = BuildRawImageCacheKey(task, downloadUrl);
+		if (TileImageCache::TryReadImage(cacheKey, outImage, loadOptions) && !outImage.IsEmpty())
+		{
+			return true;
+		}
+
+		if (!IsTaskGenerationCurrent(task.generation))
+		{
+			return false;
+		}
+
+		const GB_NetworkDownloadedFile downloadedFile = GB_DownloadFile(downloadUrl, task.networkOptions);
+		if (!downloadedFile.ok || downloadedFile.data.empty())
+		{
+			return false;
+		}
+
+		if (!outImage.LoadFromMemory(downloadedFile.data, loadOptions) || outImage.IsEmpty())
+		{
+			outImage.Clear();
+			return false;
+		}
+
+		const std::string preferredFileExt = GuessPreferredCacheFileExt(task, downloadedFile);
+		TileImageCache::PutEncodedImage(cacheKey, downloadedFile.data, preferredFileExt);
+		return true;
+	}
+
 	void ProcessTileTask(const TileTask& task)
 	{
 		if (!IsTaskGenerationCurrent(task.generation))
@@ -1626,24 +1837,12 @@ private:
 				return;
 			}
 
-			const GB_NetworkResponse response = GB_RequestUrlData(downloadUrl, task.networkOptions);
-			if (!IsTaskGenerationCurrent(task.generation))
-			{
-				return;
-			}
-
-			if (!response.ok || response.body.empty())
-			{
-				PostTileTaskFinishedIfCurrent(task.generation);
-				return;
-			}
-
 			GB_ImageLoadOptions loadOptions;
 			loadOptions.colorMode = GB_ImageColorMode::BGRA;
 			loadOptions.preserveBitDepth = false;
 
 			GB_Image image;
-			if (!image.LoadFromMemory(response.body.data(), response.body.size(), loadOptions) || image.IsEmpty())
+			if (!TryLoadRawImageFromCacheOrNetwork(task, downloadUrl, loadOptions, image))
 			{
 				PostTileTaskFinishedIfCurrent(task.generation);
 				return;
