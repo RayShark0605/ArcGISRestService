@@ -1,6 +1,7 @@
 ﻿#pragma once
 
 #include <QImage>
+#include <QPixmap>
 #include <QPoint>
 #include <QRectF>
 #include <QString>
@@ -65,6 +66,7 @@ public:
 
 	void AddMapTile(const MapTile& tile);
 	void AddMapTile(const MapTile& tile, double layerNumber);
+	void AddMapTiles(const std::vector<MapTile>& tiles);
 	bool HasDrawables() const;
 
 	void ClearDrawables();
@@ -93,7 +95,7 @@ private:
 	struct CachedMapTile
 	{
 		MapTile tile;
-		QImage image;
+		QPixmap pixmap;
 		std::uint64_t insertionSequence = 0;
 	};
 
@@ -111,12 +113,25 @@ private:
 	QPoint lastMousePosition;
 
 	QTimer viewStateChangedDebounceTimer;
+
+	mutable QPixmap mapContentCache;
+	mutable bool isMapContentCacheDirty = true;
+	mutable GB_Rectangle mapContentCacheViewExtent;
+	mutable double mapContentCachePixelSize = 0.0;
+	mutable bool mapContentCacheClipMapTilesToCrsValidArea = false;
+	mutable std::string mapContentCacheCrsWkt;
+
+	QPixmap panPreviewPixmap;
+	bool hasPanPreview = false;
+	GB_Rectangle panPreviewViewExtent;
+	double panPreviewPixelSize = 0.0;
 	bool hasPendingViewStateChanged = false;
 	bool hasEmittedViewState = false;
 	GB_Rectangle lastEmittedViewExtent;
 	double lastEmittedApproximateMetersPerPixel = 0.0;
 
 	QImage CreateQImageFromGBImage(const GB_Image& image) const;
+	QPixmap CreateQPixmapFromGBImage(const GB_Image& image) const;
 	static double NormalizeLayerNumber(double layerNumber);
 	static bool IsTopLayerNumber(double layerNumber);
 	static bool IsBottomLayerNumber(double layerNumber);
@@ -124,8 +139,12 @@ private:
 	static bool IsCachedMapTilePaintOrderLess(const CachedMapTile& firstTile, const CachedMapTile& secondTile);
 	void InsertCachedMapTile(CachedMapTile&& cachedTile);
 	void DrawBackground(QPainter& painter) const;
-	void DrawMapTiles(QPainter& painter) const;
+	void DrawMapTiles(QPainter& painter, const QRectF& exposedRect) const;
 	void DrawCoordinateAxes(QPainter& painter) const;
+	void DrawMapContent(QPainter& painter, const QRectF& exposedRect) const;
+	void EnsureMapContentCache() const;
+	void InvalidateMapContentCache() const;
+	bool IsMapContentCacheValid() const;
 	//void DrawVectorDrawables(QPainter& painter) const;
 	//void DrawExtentMarkers(QPainter& painter) const;
 	void DrawOverlay(QPainter& painter) const;

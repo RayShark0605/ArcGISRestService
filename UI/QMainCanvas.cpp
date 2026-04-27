@@ -16,6 +16,7 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPaintEvent>
+#include <QPixmap>
 #include <QPen>
 #include <QPolygonF>
 #include <QResizeEvent>
@@ -26,6 +27,7 @@
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <unordered_set>
 #include <utility>
 
 namespace
@@ -224,6 +226,7 @@ void QMainCanvas::SetCrsWkt(const std::string& wktUtf8)
 
 	crsWkt = wktUtf8;
 	UpdateCrsDisplayText();
+	InvalidateMapContentCache();
 	EmitViewStateChanged();
 	update();
 }
@@ -241,6 +244,7 @@ void QMainCanvas::SetClipMapTilesToCrsValidArea(bool enabled)
 	}
 
 	clipMapTilesToCrsValidArea = enabled;
+	InvalidateMapContentCache();
 	update();
 }
 
@@ -280,6 +284,7 @@ void QMainCanvas::SetViewCenter(const GB_Point2d& center)
 	}
 
 	UpdateViewExtentFromCenterAndPixelSize(center);
+	InvalidateMapContentCache();
 	EmitViewStateChanged();
 	update();
 }
@@ -410,30 +415,75 @@ void QMainCanvas::AddMapTile(const MapTile& tile)
 
 void QMainCanvas::AddMapTile(const MapTile& tile, double layerNumber)
 {
-	if (!tile.extent.IsValid() || tile.image.IsEmpty())
+	MapTile normalizedTile = tile;
+	normalizedTile.layerNumber = NormalizeLayerNumber(layerNumber);
+
+	std::vector<MapTile> tiles;
+	tiles.push_back(std::move(normalizedTile));
+	AddMapTiles(tiles);
+}
+
+void QMainCanvas::AddMapTiles(const std::vector<MapTile>& tiles)
+{
+	if (tiles.empty())
 	{
 		return;
 	}
 
-	CachedMapTile cachedTile;
-	cachedTile.tile = tile;
-	cachedTile.tile.layerNumber = NormalizeLayerNumber(layerNumber);
-	if (cachedTile.tile.uid.empty())
+	std::vector<CachedMapTile> cachedTiles;
+	cachedTiles.reserve(tiles.size());
+
+	for (const MapTile& tile : tiles)
 	{
-		cachedTile.tile.uid = cachedTile.tile.CalculateUid();
+		if (!tile.extent.IsValid() || tile.image.IsEmpty())
+		{
+			continue;
+		}
+
+		CachedMapTile cachedTile;
+		cachedTile.tile = tile;
+		cachedTile.tile.layerNumber = NormalizeLayerNumber(tile.layerNumber);
+		if (cachedTile.tile.uid.empty())
+		{
+			cachedTile.tile.uid = cachedTile.tile.CalculateUid();
+		}
+
+		cachedTile.pixmap = CreateQPixmapFromGBImage(cachedTile.tile.image);
+		if (cachedTile.pixmap.isNull())
+		{
+			continue;
+		}
+
+		cachedTile.insertionSequence = nextDrawableInsertionSequence;
+		nextDrawableInsertionSequence++;
+		cachedTiles.push_back(std::move(cachedTile));
 	}
-	cachedTile.image = CreateQImageFromGBImage(cachedTile.tile.image);
-	if (cachedTile.image.isNull())
+
+	if (cachedTiles.empty())
 	{
 		return;
 	}
 
-	cachedTile.insertionSequence = nextDrawableInsertionSequence;
-	nextDrawableInsertionSequence++;
-	InsertCachedMapTile(std::move(cachedTile));
-	if (!viewExtent.IsValid())
+	const bool shouldZoomToAddedTiles = !viewExtent.IsValid();
+	GB_Rectangle addedExtent;
+	addedExtent.Reset();
+	for (const CachedMapTile& cachedTile : cachedTiles)
 	{
-		ZoomToExtent(tile.extent, 0.05);
+		addedExtent.Expand(cachedTile.tile.extent);
+	}
+
+	mapTiles.reserve(mapTiles.size() + cachedTiles.size());
+	for (CachedMapTile& cachedTile : cachedTiles)
+	{
+		mapTiles.push_back(std::move(cachedTile));
+	}
+
+	std::sort(mapTiles.begin(), mapTiles.end(), IsCachedMapTilePaintOrderLess);
+	InvalidateMapContentCache();
+
+	if (shouldZoomToAddedTiles && addedExtent.IsValid())
+	{
+		ZoomToExtent(addedExtent, 0.05);
 	}
 	else
 	{
@@ -457,6 +507,7 @@ void QMainCanvas::ClearDrawables()
 {
 	const bool hadDrawables = HasDrawables();
 	mapTiles.clear();
+	InvalidateMapContentCache();
 	//vectorDrawables.clear();
 	//extentMarkerDrawables.clear();
 	if (hadDrawables)
@@ -472,12 +523,18 @@ void QMainCanvas::RemoveDrawables(const std::vector<std::string>& drawablesUids)
 		return;
 	}
 
+	const std::unordered_set<std::string> uidSet(drawablesUids.begin(), drawablesUids.end());
+
 	bool hasChanged = false;
 	const size_t oldMapTileCount = mapTiles.size();
-	mapTiles.erase(std::remove_if(mapTiles.begin(), mapTiles.end(), [this, &drawablesUids](const CachedMapTile& item) {
-		return IsDrawableUidInSet(drawablesUids, item.tile.uid);
+	mapTiles.erase(std::remove_if(mapTiles.begin(), mapTiles.end(), [&uidSet](const CachedMapTile& item) {
+		return !item.tile.uid.empty() && uidSet.find(item.tile.uid) != uidSet.end();
 		}), mapTiles.end());
 	hasChanged = hasChanged || oldMapTileCount != mapTiles.size();
+	if (hasChanged)
+	{
+		InvalidateMapContentCache();
+	}
 
 	//vectorDrawables.erase(std::remove_if(vectorDrawables.begin(), vectorDrawables.end(), [this, &drawablesUids](const VectorDrawable& item) {
 	//	return IsDrawableUidInSet(drawablesUids, item.uid);
@@ -500,10 +557,12 @@ void QMainCanvas::SetDrawablesVisible(const std::vector<std::string>& drawablesU
 		return;
 	}
 
+	const std::unordered_set<std::string> uidSet(drawablesUids.begin(), drawablesUids.end());
+
 	bool hasChanged = false;
 	for (CachedMapTile& item : mapTiles)
 	{
-		if (IsDrawableUidInSet(drawablesUids, item.tile.uid) && item.tile.visible != visible)
+		if (!item.tile.uid.empty() && uidSet.find(item.tile.uid) != uidSet.end() && item.tile.visible != visible)
 		{
 			item.tile.visible = visible;
 			hasChanged = true;
@@ -528,6 +587,7 @@ void QMainCanvas::SetDrawablesVisible(const std::vector<std::string>& drawablesU
 
 	if (hasChanged)
 	{
+		InvalidateMapContentCache();
 		update();
 	}
 }
@@ -539,11 +599,13 @@ void QMainCanvas::SetDrawablesLayerNumber(const std::vector<std::string>& drawab
 		return;
 	}
 
+	const std::unordered_set<std::string> uidSet(drawablesUids.begin(), drawablesUids.end());
+
 	const double normalizedLayerNumber = NormalizeLayerNumber(layerNumber);
 	bool hasChanged = false;
 	for (CachedMapTile& item : mapTiles)
 	{
-		if (IsDrawableUidInSet(drawablesUids, item.tile.uid) && item.tile.layerNumber != normalizedLayerNumber)
+		if (!item.tile.uid.empty() && uidSet.find(item.tile.uid) != uidSet.end() && item.tile.layerNumber != normalizedLayerNumber)
 		{
 			item.tile.layerNumber = normalizedLayerNumber;
 			hasChanged = true;
@@ -556,29 +618,51 @@ void QMainCanvas::SetDrawablesLayerNumber(const std::vector<std::string>& drawab
 	if (hasChanged)
 	{
 		std::sort(mapTiles.begin(), mapTiles.end(), IsCachedMapTilePaintOrderLess);
+		InvalidateMapContentCache();
 		update();
 	}
 }
 
 void QMainCanvas::paintEvent(QPaintEvent* event)
 {
-	Q_UNUSED(event);
+	const QRectF exposedRect = event ? QRectF(event->rect()) : QRectF(rect());
 
 	QPainter painter(this);
-	painter.setRenderHint(QPainter::Antialiasing, true);
-	painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+	painter.setClipRect(exposedRect);
 
-	DrawBackground(painter);
-	DrawMapTiles(painter);
-	DrawCoordinateAxes(painter);
-	//DrawVectorDrawables(painter);
-	//DrawExtentMarkers(painter);
+	if (isPanning && hasPanPreview && !panPreviewPixmap.isNull() && viewExtent.IsValid() && panPreviewViewExtent.IsValid() && AreNearlyEqual(pixelSize, panPreviewPixelSize))
+	{
+		DrawBackground(painter);
+
+		const double offsetX = (panPreviewViewExtent.minX - viewExtent.minX) / pixelSize;
+		const double offsetY = (viewExtent.maxY - panPreviewViewExtent.maxY) / pixelSize;
+		if (std::isfinite(offsetX) && std::isfinite(offsetY))
+		{
+			painter.drawPixmap(QPointF(offsetX, offsetY), panPreviewPixmap);
+		}
+	}
+	else
+	{
+		EnsureMapContentCache();
+		if (!mapContentCache.isNull())
+		{
+			painter.drawPixmap(QPoint(0, 0), mapContentCache);
+		}
+		else
+		{
+			DrawMapContent(painter, exposedRect);
+		}
+	}
+
 	DrawOverlay(painter);
 }
 
 void QMainCanvas::resizeEvent(QResizeEvent* event)
 {
 	QWidget::resizeEvent(event);
+	InvalidateMapContentCache();
+	hasPanPreview = false;
+	panPreviewPixmap = QPixmap();
 
 	if (viewExtent.IsValid())
 	{
@@ -605,6 +689,12 @@ void QMainCanvas::mousePressEvent(QMouseEvent* event)
 
 	if (event->button() == Qt::LeftButton || event->button() == Qt::MiddleButton)
 	{
+		EnsureMapContentCache();
+		panPreviewPixmap = mapContentCache;
+		hasPanPreview = !panPreviewPixmap.isNull() && viewExtent.IsValid() && IsFinitePositive(pixelSize);
+		panPreviewViewExtent = viewExtent;
+		panPreviewPixelSize = pixelSize;
+
 		isPanning = true;
 		lastPanPosition = event->pos();
 		setCursor(Qt::ClosedHandCursor);
@@ -657,6 +747,7 @@ void QMainCanvas::mouseMoveEvent(QMouseEvent* event)
 
 		viewExtent = newExtent;
 		pixelSize = safePixelSize;
+		InvalidateMapContentCache();
 
 		ScheduleViewStateChanged();
 		update();
@@ -686,8 +777,12 @@ void QMainCanvas::mouseReleaseEvent(QMouseEvent* event)
 	if ((event->button() == Qt::LeftButton || event->button() == Qt::MiddleButton) && isPanning)
 	{
 		isPanning = false;
+		hasPanPreview = false;
+		panPreviewPixmap = QPixmap();
+		InvalidateMapContentCache();
 		unsetCursor();
 		FlushPendingViewStateChanged();
+		update();
 		event->accept();
 		return;
 	}
@@ -708,6 +803,8 @@ void QMainCanvas::mouseDoubleClickEvent(QMouseEvent* event)
 	if (event->button() == Qt::MiddleButton)
 	{
 		isPanning = false;
+		hasPanPreview = false;
+		panPreviewPixmap = QPixmap();
 		unsetCursor();
 		FlushPendingViewStateChanged();
 		ZoomFull();
@@ -795,6 +892,7 @@ void QMainCanvas::wheelEvent(QWheelEvent* event)
 
 	viewExtent = newExtent;
 	UpdatePixelSizeFromViewExtent();
+	InvalidateMapContentCache();
 	ScheduleWheelZoomViewStateChanged();
 	update();
 
@@ -892,6 +990,18 @@ QImage QMainCanvas::CreateQImageFromGBImage(const GB_Image& image) const
 	return result;
 }
 
+
+QPixmap QMainCanvas::CreateQPixmapFromGBImage(const GB_Image& image) const
+{
+	const QImage qImage = CreateQImageFromGBImage(image);
+	if (qImage.isNull())
+	{
+		return QPixmap();
+	}
+
+	return QPixmap::fromImage(qImage);
+}
+
 double QMainCanvas::NormalizeLayerNumber(double layerNumber)
 {
 	if (!std::isfinite(layerNumber))
@@ -982,7 +1092,7 @@ bool QMainCanvas::TryGetCrsValidArea(GB_Rectangle& outValidArea) const
 	return outValidArea.IsValid();
 }
 
-void QMainCanvas::DrawMapTiles(QPainter& painter) const
+void QMainCanvas::DrawMapTiles(QPainter& painter, const QRectF& exposedRect) const
 {
 	if (!viewExtent.IsValid())
 	{
@@ -991,50 +1101,35 @@ void QMainCanvas::DrawMapTiles(QPainter& painter) const
 
 	GB_Rectangle crsValidArea;
 	const bool shouldClipToCrsValidArea = clipMapTilesToCrsValidArea && TryGetCrsValidArea(crsValidArea);
+	const QRectF safeExposedRect = exposedRect.isValid() ? exposedRect : QRectF(rect());
+
+	bool lastSmoothPixmapTransform = false;
+	painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
 
 	for (const CachedMapTile& cachedTile : mapTiles)
 	{
-		if (!cachedTile.tile.visible || !cachedTile.tile.extent.IsValid() || cachedTile.image.isNull())
+		if (!cachedTile.tile.visible || !cachedTile.tile.extent.IsValid() || cachedTile.pixmap.isNull())
 		{
-			continue;
-		}
-
-		if (!cachedTile.tile.extent.IsIntersects(viewExtent))
-		{
-			continue;
-		}
-
-		if (shouldClipToCrsValidArea && !cachedTile.tile.extent.IsIntersects(crsValidArea))
-		{
-			continue;
-		}
-
-		if (!shouldClipToCrsValidArea)
-		{
-			const QRectF targetRect = WorldRectangleToScreenRectangle(cachedTile.tile.extent);
-			if (!targetRect.isValid())
-			{
-				continue;
-			}
-
-			painter.drawImage(targetRect, cachedTile.image);
 			continue;
 		}
 
 		GB_Rectangle clippedWorldRect = cachedTile.tile.extent.Intersected(viewExtent);
-		if (!clippedWorldRect.IsValid())
+		if (!clippedWorldRect.IsValid() || clippedWorldRect.Width() <= 0.0 || clippedWorldRect.Height() <= 0.0)
 		{
 			continue;
 		}
 
-		clippedWorldRect = clippedWorldRect.Intersected(crsValidArea);
-		if (!clippedWorldRect.IsValid())
+		if (shouldClipToCrsValidArea)
 		{
-			continue;
+			clippedWorldRect = clippedWorldRect.Intersected(crsValidArea);
+			if (!clippedWorldRect.IsValid() || clippedWorldRect.Width() <= 0.0 || clippedWorldRect.Height() <= 0.0)
+			{
+				continue;
+			}
 		}
 
-		const QRectF clippedTargetRect = WorldRectangleToScreenRectangle(clippedWorldRect);
-		if (!clippedTargetRect.isValid())
+		const QRectF targetRect = WorldRectangleToScreenRectangle(clippedWorldRect);
+		if (!targetRect.isValid() || !targetRect.intersects(safeExposedRect))
 		{
 			continue;
 		}
@@ -1046,8 +1141,13 @@ void QMainCanvas::DrawMapTiles(QPainter& painter) const
 			continue;
 		}
 
-		const double imageWidth = static_cast<double>(cachedTile.image.width());
-		const double imageHeight = static_cast<double>(cachedTile.image.height());
+		const double imageWidth = static_cast<double>(cachedTile.pixmap.width());
+		const double imageHeight = static_cast<double>(cachedTile.pixmap.height());
+		if (!IsFinitePositive(imageWidth) || !IsFinitePositive(imageHeight))
+		{
+			continue;
+		}
+
 		const QRectF sourceRect(
 			(clippedWorldRect.minX - cachedTile.tile.extent.minX) / tileWidth * imageWidth,
 			(cachedTile.tile.extent.maxY - clippedWorldRect.maxY) / tileHeight * imageHeight,
@@ -1058,8 +1158,93 @@ void QMainCanvas::DrawMapTiles(QPainter& painter) const
 			continue;
 		}
 
-		painter.drawImage(clippedTargetRect, cachedTile.image, sourceRect);
+		const bool needsSmoothTransform = std::abs(targetRect.width() - sourceRect.width()) > 0.25 ||
+			std::abs(targetRect.height() - sourceRect.height()) > 0.25;
+		if (needsSmoothTransform != lastSmoothPixmapTransform)
+		{
+			painter.setRenderHint(QPainter::SmoothPixmapTransform, needsSmoothTransform);
+			lastSmoothPixmapTransform = needsSmoothTransform;
+		}
+
+		painter.drawPixmap(targetRect, cachedTile.pixmap, sourceRect);
 	}
+
+	if (lastSmoothPixmapTransform)
+	{
+		painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
+	}
+}
+
+void QMainCanvas::DrawMapContent(QPainter& painter, const QRectF& exposedRect) const
+{
+	DrawBackground(painter);
+	DrawMapTiles(painter, exposedRect);
+	DrawCoordinateAxes(painter);
+}
+
+bool QMainCanvas::IsMapContentCacheValid() const
+{
+	if (isMapContentCacheDirty || mapContentCache.isNull())
+	{
+		return false;
+	}
+
+	if (mapContentCache.size() != size())
+	{
+		return false;
+	}
+
+	if (!AreRectanglesNearlyEqual(mapContentCacheViewExtent, viewExtent))
+	{
+		return false;
+	}
+
+	if (!AreNearlyEqual(mapContentCachePixelSize, pixelSize))
+	{
+		return false;
+	}
+
+	if (mapContentCacheClipMapTilesToCrsValidArea != clipMapTilesToCrsValidArea)
+	{
+		return false;
+	}
+
+	return mapContentCacheCrsWkt == crsWkt;
+}
+
+void QMainCanvas::EnsureMapContentCache() const
+{
+	if (IsMapContentCacheValid())
+	{
+		return;
+	}
+
+	if (width() <= 0 || height() <= 0)
+	{
+		mapContentCache = QPixmap();
+		isMapContentCacheDirty = false;
+		return;
+	}
+
+	QPixmap newCache(size());
+	newCache.fill(Qt::transparent);
+
+	QPainter cachePainter(&newCache);
+	cachePainter.setClipRect(QRectF(QPointF(0.0, 0.0), QSizeF(newCache.size())));
+	DrawMapContent(cachePainter, QRectF(QPointF(0.0, 0.0), QSizeF(newCache.size())));
+	cachePainter.end();
+
+	mapContentCache = newCache;
+	mapContentCacheViewExtent = viewExtent;
+	mapContentCachePixelSize = pixelSize;
+	mapContentCacheClipMapTilesToCrsValidArea = clipMapTilesToCrsValidArea;
+	mapContentCacheCrsWkt = crsWkt;
+	isMapContentCacheDirty = false;
+}
+
+void QMainCanvas::InvalidateMapContentCache() const
+{
+	isMapContentCacheDirty = true;
 }
 
 void QMainCanvas::DrawCoordinateAxes(QPainter& painter) const
@@ -1358,6 +1543,7 @@ void QMainCanvas::SetViewExtentInternal(const GB_Rectangle& extent, bool emitSig
 
 	viewExtent = normalizedExtent;
 	UpdatePixelSizeFromViewExtent();
+	InvalidateMapContentCache();
 
 	if (emitSignal)
 	{

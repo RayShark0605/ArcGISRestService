@@ -11,9 +11,11 @@
 #include "GeoBase/GB_Network.h"
 #include "GeoBase/GB_Utf8String.h"
 #include "GeoBase/CV/GB_Image.h"
+#include "GeoBase/GB_FileSystem.h"
 
 #include <QByteArray>
 #include <QMetaObject>
+#include <QTimer>
 
 #include <algorithm>
 #include <atomic>
@@ -35,6 +37,7 @@ namespace
 {
 	constexpr size_t FallbackLogicalCpuCoreCount = 4;
 	constexpr size_t MinParallelTileWorkerCount = 4;
+	constexpr size_t MaxParallelTileWorkerCount = 16;
 	constexpr unsigned int DefaultTileConnectTimeoutMs = 5000;
 	constexpr unsigned int DefaultTileTotalTimeoutMs = 60000;
 	constexpr double InitialZoomMarginRatio = 0.05;
@@ -523,8 +526,8 @@ namespace
 	{
 		const unsigned int hardwareThreadCount = std::thread::hardware_concurrency();
 		const size_t logicalCpuCoreCount = (hardwareThreadCount > 0) ? static_cast<size_t>(hardwareThreadCount) : FallbackLogicalCpuCoreCount;
-		const size_t preferredThreadCount = logicalCpuCoreCount * 2;
-		return std::max<size_t>(MinParallelTileWorkerCount, preferredThreadCount);
+		const size_t preferredThreadCount = std::max<size_t>(MinParallelTileWorkerCount, logicalCpuCoreCount);
+		return std::min<size_t>(MaxParallelTileWorkerCount, preferredThreadCount);
 	}
 
 	std::string PrefixRequestUrlIfNeeded(const std::string& requestUrl, const ArcGISRestConnectionSettings& connectionSettings)
@@ -1106,6 +1109,9 @@ public:
 	void StopRefresh()
 	{
 		currentGeneration.fetch_add(1, std::memory_order_acq_rel);
+		pendingTileResults.clear();
+		isTileResultFlushScheduled = false;
+
 		{
 			std::lock_guard<std::mutex> lock(taskQueueMutex);
 			ClearPendingTasksNoLock();
@@ -1799,20 +1805,32 @@ private:
 			return false;
 		}
 
-		const GB_NetworkDownloadedFile downloadedFile = GB_DownloadFile(downloadUrl, task.networkOptions);
-		if (!downloadedFile.ok || downloadedFile.data.empty())
+		const GB_NetworkResponse response = GB_RequestUrlData(downloadUrl, task.networkOptions);
+		//const GB_NetworkDownloadedFile downloadedFile = GB_DownloadFile(downloadUrl, task.networkOptions);
+		//if (!downloadedFile.ok || downloadedFile.data.empty())
+		//{
+		//	return false;
+		//}
+		if (!response.ok || response.body.empty())
 		{
 			return false;
 		}
 
-		if (!outImage.LoadFromMemory(downloadedFile.data, loadOptions) || outImage.IsEmpty())
+		//if (!outImage.LoadFromMemory(downloadedFile.data, loadOptions) || outImage.IsEmpty())
+		//{
+		//	outImage.Clear();
+		//	return false;
+		//}
+		if (!outImage.LoadFromMemory(response.body.data(), response.body.size(), loadOptions) || outImage.IsEmpty())
 		{
 			outImage.Clear();
 			return false;
 		}
 
-		const std::string preferredFileExt = GuessPreferredCacheFileExt(task, downloadedFile);
-		TileImageCache::PutEncodedImage(cacheKey, downloadedFile.data, preferredFileExt);
+		//const std::string preferredFileExt = GuessPreferredCacheFileExt(task, downloadedFile);
+		const std::string preferredFileExt = GB_GuessFileExt(GB_StringToByteBuffer(response.body));
+		TileImageCache::PutEncodedImage(cacheKey, response.body, preferredFileExt);
+		//TileImageCache::PutEncodedImage(cacheKey, downloadedFile.data, preferredFileExt);
 		return true;
 	}
 
@@ -1932,7 +1950,7 @@ private:
 				return;
 			}
 
-			refresher->impl->OnTileReady(result);
+			refresher->impl->AppendPendingTileResult(std::move(result));
 			}, Qt::QueuedConnection);
 	}
 
@@ -1961,6 +1979,61 @@ private:
 			}, Qt::QueuedConnection);
 	}
 
+	void AppendPendingTileResult(TileResult&& result)
+	{
+		if (!IsTaskGenerationCurrent(result.generation))
+		{
+			return;
+		}
+
+		pendingTileResults.push_back(std::move(result));
+		SchedulePendingTileResultFlush();
+	}
+
+	void SchedulePendingTileResultFlush()
+	{
+		if (isTileResultFlushScheduled)
+		{
+			return;
+		}
+
+		LayerRefresher* owner = ownerPointer.data();
+		if (!owner)
+		{
+			return;
+		}
+
+		isTileResultFlushScheduled = true;
+		const QPointer<LayerRefresher> safeOwnerPointer = ownerPointer;
+		QTimer::singleShot(0, owner, [safeOwnerPointer]() mutable {
+			LayerRefresher* refresher = safeOwnerPointer.data();
+			if (!refresher || !refresher->impl)
+			{
+				return;
+			}
+
+			refresher->impl->FlushPendingTileResults();
+			});
+	}
+
+	void FlushPendingTileResults()
+	{
+		isTileResultFlushScheduled = false;
+		if (pendingTileResults.empty())
+		{
+			return;
+		}
+
+		std::vector<TileResult> results;
+		results.swap(pendingTileResults);
+		OnTileResultsReady(results);
+
+		if (!pendingTileResults.empty())
+		{
+			SchedulePendingTileResultFlush();
+		}
+	}
+
 	void OnTileTaskFinished(std::uint64_t generation)
 	{
 		if (!IsTaskGenerationCurrent(generation))
@@ -1971,35 +2044,59 @@ private:
 		MarkTileTaskFinished(generation);
 	}
 
-	void OnTileReady(const TileResult& result)
+	void OnTileResultsReady(std::vector<TileResult>& results)
 	{
-		if (!mainCanvas || !IsTaskGenerationCurrent(result.generation))
+		if (!mainCanvas)
 		{
 			return;
 		}
 
-		const auto targetIter = currentTargetsByUid.find(result.tileUid);
-		if (targetIter != currentTargetsByUid.end())
-		{
-			const TargetTileRecord& target = targetIter->second;
-			if (target.layerUid == result.layerUid && target.layerNumber == result.layerNumber && displayedTilesByUid.find(result.tileUid) == displayedTilesByUid.end())
-			{
-				std::vector<std::string> singleUid;
-				singleUid.push_back(result.tileUid);
-				mainCanvas->RemoveDrawables(singleUid);
-				transitionTilesByUid.erase(result.tileUid);
-				mainCanvas->AddMapTile(result.tile, target.layerNumber);
+		std::vector<std::string> uidsToRemove;
+		std::vector<MapTile> tilesToAdd;
+		uidsToRemove.reserve(results.size());
+		tilesToAdd.reserve(results.size());
 
-				DisplayedTileRecord displayedTile;
-				displayedTile.tile = result.tile;
-				displayedTile.tile.layerNumber = target.layerNumber;
-				displayedTile.layerUid = result.layerUid;
-				displayedTile.layerNumber = target.layerNumber;
-				displayedTilesByUid[result.tileUid] = std::move(displayedTile);
+		for (TileResult& result : results)
+		{
+			if (!IsTaskGenerationCurrent(result.generation))
+			{
+				continue;
 			}
+
+			const auto targetIter = currentTargetsByUid.find(result.tileUid);
+			if (targetIter != currentTargetsByUid.end())
+			{
+				const TargetTileRecord& target = targetIter->second;
+				if (target.layerUid == result.layerUid && target.layerNumber == result.layerNumber && displayedTilesByUid.find(result.tileUid) == displayedTilesByUid.end())
+				{
+					result.tile.layerNumber = target.layerNumber;
+					result.tile.visible = true;
+
+					uidsToRemove.push_back(result.tileUid);
+					transitionTilesByUid.erase(result.tileUid);
+					tilesToAdd.push_back(result.tile);
+
+					DisplayedTileRecord displayedTile;
+					displayedTile.tile = result.tile;
+					displayedTile.tile.layerNumber = target.layerNumber;
+					displayedTile.layerUid = result.layerUid;
+					displayedTile.layerNumber = target.layerNumber;
+					displayedTilesByUid[result.tileUid] = std::move(displayedTile);
+				}
+			}
+
+			MarkTileTaskFinished(result.generation);
 		}
 
-		MarkTileTaskFinished(result.generation);
+		if (!uidsToRemove.empty())
+		{
+			mainCanvas->RemoveDrawables(uidsToRemove);
+		}
+
+		if (!tilesToAdd.empty())
+		{
+			mainCanvas->AddMapTiles(tilesToAdd);
+		}
 	}
 
 private:
@@ -2018,6 +2115,9 @@ private:
 	std::unordered_map<std::string, TargetTileRecord> currentTargetsByUid;
 	std::unordered_map<std::string, DisplayedTileRecord> displayedTilesByUid;
 	std::unordered_map<std::string, DisplayedTileRecord> transitionTilesByUid;
+
+	std::vector<TileResult> pendingTileResults;
+	bool isTileResultFlushScheduled = false;
 
 	std::atomic<std::uint64_t> currentGeneration;
 	std::uint64_t nextTaskSequence;
