@@ -1,5 +1,9 @@
 ﻿#include "QLayerManagerPanel.h"
 
+#include "GeoBoundingBox.h"
+#include "GeoCrsTransform.h"
+#include "QMainCanvas.h"
+
 #include <QAbstractItemModel>
 #include <QAbstractItemView>
 #include <QAction>
@@ -28,12 +32,254 @@
 #include <QWidget>
 
 #include <algorithm>
+#include <cctype>
+#include <cmath>
 
 namespace
 {
 	QString ToQString(const std::string& textUtf8)
 	{
 		return QString::fromUtf8(textUtf8.c_str());
+	}
+
+	bool IsFiniteCoordinate(double value)
+	{
+		return std::isfinite(value);
+	}
+
+	std::string TrimTrailingSlash(const std::string& text)
+	{
+		std::string result = text;
+		while (!result.empty() && result.back() == '/')
+		{
+			result.pop_back();
+		}
+		return result;
+	}
+
+	std::string StripUrlQueryAndFragment(const std::string& url)
+	{
+		const size_t queryPos = url.find('?');
+		const size_t fragmentPos = url.find('#');
+		size_t cutPos = std::string::npos;
+		if (queryPos != std::string::npos && fragmentPos != std::string::npos)
+		{
+			cutPos = std::min(queryPos, fragmentPos);
+		}
+		else if (queryPos != std::string::npos)
+		{
+			cutPos = queryPos;
+		}
+		else
+		{
+			cutPos = fragmentPos;
+		}
+
+		if (cutPos == std::string::npos)
+		{
+			return url;
+		}
+		return url.substr(0, cutPos);
+	}
+
+	bool IsAsciiDigitText(const std::string& text)
+	{
+		if (text.empty())
+		{
+			return false;
+		}
+
+		for (char ch : text)
+		{
+			if (!std::isdigit(static_cast<unsigned char>(ch)))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	std::string ExtractLastNumericPathSegment(const std::string& url)
+	{
+		const std::string path = TrimTrailingSlash(StripUrlQueryAndFragment(url));
+		const size_t slashPos = path.find_last_of('/');
+		const std::string segment = (slashPos == std::string::npos) ? path : path.substr(slashPos + 1);
+		return IsAsciiDigitText(segment) ? segment : std::string();
+	}
+
+	std::string ResolveLayerIdFromRequest(const LayerImportRequestInfo& request)
+	{
+		if (!request.layerId.empty())
+		{
+			return request.layerId;
+		}
+
+		std::string layerId = ExtractLastNumericPathSegment(request.nodeUrl);
+		if (!layerId.empty())
+		{
+			return layerId;
+		}
+
+		return ExtractLastNumericPathSegment(request.serviceUrl);
+	}
+
+	std::string ResolveFallbackServiceWkt(const ArcGISRestServiceInfo& serviceInfo)
+	{
+		if (serviceInfo.hasSpatialReference && !serviceInfo.spatialReference.wkt.empty())
+		{
+			return serviceInfo.spatialReference.wkt;
+		}
+
+		if (serviceInfo.hasTileInfo && !serviceInfo.tileInfo.spatialReference.wkt.empty())
+		{
+			return serviceInfo.tileInfo.spatialReference.wkt;
+		}
+
+		return std::string();
+	}
+
+	std::string ResolveEnvelopeWkt(const ArcGISRestEnvelope& envelope, const std::string& fallbackWkt)
+	{
+		if (!envelope.spatialReference.wkt.empty())
+		{
+			return envelope.spatialReference.wkt;
+		}
+		return fallbackWkt;
+	}
+
+	bool TryCreateBoundingBoxFromEnvelope(const ArcGISRestEnvelope& envelope, const std::string& fallbackWkt, GeoBoundingBox& outBox)
+	{
+		outBox.Reset();
+
+		if (!IsFiniteCoordinate(envelope.xmin) || !IsFiniteCoordinate(envelope.ymin) ||
+			!IsFiniteCoordinate(envelope.xmax) || !IsFiniteCoordinate(envelope.ymax))
+		{
+			return false;
+		}
+
+		GB_Rectangle rect(envelope.xmin, envelope.ymin, envelope.xmax, envelope.ymax);
+		rect.Normalize();
+		if (!rect.IsValid())
+		{
+			return false;
+		}
+
+		outBox.Set(ResolveEnvelopeWkt(envelope, fallbackWkt), rect);
+		return outBox.rect.IsValid();
+	}
+
+	const ArcGISRestLayerOrTableInfo* FindLayerOrTableInfoById(const ArcGISRestServiceInfo& serviceInfo, const std::string& layerId)
+	{
+		if (layerId.empty())
+		{
+			return nullptr;
+		}
+
+		if (serviceInfo.layerOrTable.id == layerId)
+		{
+			return &serviceInfo.layerOrTable;
+		}
+
+		for (const ArcGISRestLayerOrTableInfo& layerInfo : serviceInfo.allLayers)
+		{
+			if (layerInfo.id == layerId)
+			{
+				return &layerInfo;
+			}
+		}
+
+		for (const ArcGISRestLayerOrTableInfo& tableInfo : serviceInfo.allTables)
+		{
+			if (tableInfo.id == layerId)
+			{
+				return &tableInfo;
+			}
+		}
+
+		return nullptr;
+	}
+
+	bool TryCreateBoundingBoxFromLayerOrTableInfo(const ArcGISRestLayerOrTableInfo& layerInfo, const std::string& serviceFallbackWkt, GeoBoundingBox& outBox)
+	{
+		outBox.Reset();
+		if (!layerInfo.hasExtent)
+		{
+			return false;
+		}
+
+		std::string fallbackWkt = serviceFallbackWkt;
+		if (fallbackWkt.empty() && layerInfo.hasSourceSpatialReference && !layerInfo.sourceSpatialReference.wkt.empty())
+		{
+			fallbackWkt = layerInfo.sourceSpatialReference.wkt;
+		}
+
+		return TryCreateBoundingBoxFromEnvelope(layerInfo.extent, fallbackWkt, outBox);
+	}
+
+	bool TryCreateServiceBoundingBox(const ArcGISRestServiceInfo& serviceInfo, GeoBoundingBox& outBox)
+	{
+		outBox.Reset();
+
+		const std::string fallbackWkt = ResolveFallbackServiceWkt(serviceInfo);
+		if (serviceInfo.hasFullExtent && TryCreateBoundingBoxFromEnvelope(serviceInfo.fullExtent, fallbackWkt, outBox))
+		{
+			return true;
+		}
+
+		if (serviceInfo.hasInitialExtent && TryCreateBoundingBoxFromEnvelope(serviceInfo.initialExtent, fallbackWkt, outBox))
+		{
+			return true;
+		}
+
+		return false;
+	}
+
+	bool TryCreateUnionBoundingBoxFromDetailedLayers(const ArcGISRestServiceInfo& serviceInfo, GeoBoundingBox& outBox)
+	{
+		outBox.Reset();
+
+		const std::string serviceFallbackWkt = ResolveFallbackServiceWkt(serviceInfo);
+		std::string unionWkt;
+		GB_Rectangle unionRect;
+		unionRect.Reset();
+
+		const auto appendLayer = [&serviceFallbackWkt, &unionWkt, &unionRect](const ArcGISRestLayerOrTableInfo& layerInfo) -> bool
+			{
+				GeoBoundingBox layerBox;
+				if (!TryCreateBoundingBoxFromLayerOrTableInfo(layerInfo, serviceFallbackWkt, layerBox) || !layerBox.rect.IsValid())
+				{
+					return false;
+				}
+
+				if (unionWkt.empty())
+				{
+					unionWkt = layerBox.wktUtf8;
+				}
+				else if (unionWkt != layerBox.wktUtf8)
+				{
+					return false;
+				}
+
+				unionRect.Expand(layerBox.rect);
+				return true;
+			};
+
+		bool hasAnyLayer = false;
+		for (const ArcGISRestLayerOrTableInfo& layerInfo : serviceInfo.allLayers)
+		{
+			if (appendLayer(layerInfo))
+			{
+				hasAnyLayer = true;
+			}
+		}
+
+		if (!hasAnyLayer || !unionRect.IsValid())
+		{
+			return false;
+		}
+
+		outBox.Set(unionWkt, unionRect);
+		return outBox.rect.IsValid();
 	}
 
 	void DrawLayerStack(QPainter& painter, const QRectF& bounds)
@@ -233,6 +479,23 @@ bool QLayerManagerPanel::BindServiceBrowserPanel(QServiceBrowserPanel* serviceBr
 		&QLayerManagerPanel::HandleLayerImportRequested,
 		Qt::UniqueConnection);
 	return static_cast<bool>(connection);
+}
+
+bool QLayerManagerPanel::BindMainCanvas(QMainCanvas* canvas)
+{
+	if (mainCanvas.data() == canvas)
+	{
+		return canvas != nullptr;
+	}
+
+	mainCanvas = canvas;
+	UpdateSelectionDependentButtons();
+	return mainCanvas != nullptr;
+}
+
+QMainCanvas* QLayerManagerPanel::GetMainCanvas() const
+{
+	return mainCanvas.data();
 }
 
 int QLayerManagerPanel::GetLayerCount() const
@@ -475,13 +738,7 @@ void QLayerManagerPanel::OnZoomToSelectedLayersClicked()
 		return;
 	}
 
-	std::vector<int> selectedRows;
-	selectedRows.reserve(selectedLayers.size());
-	for (const LayerManagerLayerInfo& layerInfo : selectedLayers)
-	{
-		selectedRows.push_back(layerInfo.row);
-	}
-	EmitChange(LayerManagerActionType::ZoomToSelectedLayers, selectedLayers, selectedRows, true);
+	ZoomToLayers(selectedLayers);
 }
 
 void QLayerManagerPanel::OnZoomToAllLayersClicked()
@@ -492,8 +749,7 @@ void QLayerManagerPanel::OnZoomToAllLayersClicked()
 		return;
 	}
 
-	const std::vector<int> affectedRows = BuildAllVisualRowsTopToBottom();
-	EmitChange(LayerManagerActionType::ZoomToAllLayers, allLayers, affectedRows, true);
+	ZoomToLayers(allLayers);
 }
 
 void QLayerManagerPanel::OnRemoveSelectedLayersClicked()
@@ -984,6 +1240,160 @@ void QLayerManagerPanel::EmitChange(LayerManagerActionType actionType,
 	emit LayersChanged(changeInfo);
 }
 
+bool QLayerManagerPanel::ZoomToLayers(const std::vector<LayerManagerLayerInfo>& targetLayers)
+{
+	if (targetLayers.empty() || mainCanvas.isNull())
+	{
+		return false;
+	}
+
+	GB_Rectangle targetExtent;
+	if (!TryCalculateLayersExtentInCanvasCrs(targetLayers, targetExtent) || !targetExtent.IsValid())
+	{
+		return false;
+	}
+
+	mainCanvas->ZoomToExtent(targetExtent, 0.05);
+	return true;
+}
+
+bool QLayerManagerPanel::TryCalculateLayersExtentInCanvasCrs(const std::vector<LayerManagerLayerInfo>& targetLayers, GB_Rectangle& outExtent) const
+{
+	outExtent.Reset();
+
+	if (targetLayers.empty() || mainCanvas.isNull())
+	{
+		return false;
+	}
+
+	bool hasAnyExtent = false;
+	for (const LayerManagerLayerInfo& layerInfo : targetLayers)
+	{
+		GB_Rectangle layerExtent;
+		if (!TryCalculateLayerExtentInCanvasCrs(layerInfo, layerExtent) || !layerExtent.IsValid())
+		{
+			continue;
+		}
+
+		outExtent.Expand(layerExtent);
+		hasAnyExtent = true;
+	}
+
+	if (!hasAnyExtent || !outExtent.IsValid())
+	{
+		outExtent.Reset();
+		return false;
+	}
+
+	outExtent.Normalize();
+	return outExtent.IsValid();
+}
+
+bool QLayerManagerPanel::TryCalculateLayerExtentInCanvasCrs(const LayerManagerLayerInfo& layerInfo, GB_Rectangle& outExtent) const
+{
+	outExtent.Reset();
+
+	GeoBoundingBox layerBox;
+	if (!TryGetLayerBoundingBox(layerInfo, layerBox) || !layerBox.rect.IsValid())
+	{
+		return false;
+	}
+
+	return TryTransformBoundingBoxToCanvasCrs(layerBox, outExtent);
+}
+
+bool QLayerManagerPanel::TryGetLayerBoundingBox(const LayerManagerLayerInfo& layerInfo, GeoBoundingBox& outBox) const
+{
+	outBox.Reset();
+	if (!layerInfo.importRequest.serviceInfo)
+	{
+		return false;
+	}
+
+	const ArcGISRestServiceInfo& serviceInfo = *(layerInfo.importRequest.serviceInfo);
+	const std::string serviceFallbackWkt = ResolveFallbackServiceWkt(serviceInfo);
+	const std::string requestLayerId = ResolveLayerIdFromRequest(layerInfo.importRequest);
+
+	if (layerInfo.importRequest.nodeType == ArcGISRestServiceTreeNode::NodeType::AllLayers)
+	{
+		if (TryCreateServiceBoundingBox(serviceInfo, outBox))
+		{
+			return true;
+		}
+
+		return TryCreateUnionBoundingBoxFromDetailedLayers(serviceInfo, outBox);
+	}
+
+	const ArcGISRestLayerOrTableInfo* requestedLayerInfo = FindLayerOrTableInfoById(serviceInfo, requestLayerId);
+	if (requestedLayerInfo && TryCreateBoundingBoxFromLayerOrTableInfo(*requestedLayerInfo, serviceFallbackWkt, outBox))
+	{
+		return true;
+	}
+
+	if (serviceInfo.resourceType == ArcGISRestResourceType::LayerOrTable &&
+		TryCreateBoundingBoxFromLayerOrTableInfo(serviceInfo.layerOrTable, serviceFallbackWkt, outBox))
+	{
+		return true;
+	}
+
+	if (layerInfo.importRequest.nodeType == ArcGISRestServiceTreeNode::NodeType::MapService ||
+		layerInfo.importRequest.nodeType == ArcGISRestServiceTreeNode::NodeType::FeatureService ||
+		layerInfo.importRequest.nodeType == ArcGISRestServiceTreeNode::NodeType::ImageService ||
+		layerInfo.importRequest.nodeType == ArcGISRestServiceTreeNode::NodeType::RasterLayer ||
+		layerInfo.importRequest.nodeType == ArcGISRestServiceTreeNode::NodeType::PointVectorLayer ||
+		layerInfo.importRequest.nodeType == ArcGISRestServiceTreeNode::NodeType::LineVectorLayer ||
+		layerInfo.importRequest.nodeType == ArcGISRestServiceTreeNode::NodeType::PolygonVectorLayer ||
+		layerInfo.importRequest.nodeType == ArcGISRestServiceTreeNode::NodeType::UnknownVectorLayer)
+	{
+		if (TryCreateServiceBoundingBox(serviceInfo, outBox))
+		{
+			return true;
+		}
+	}
+
+	return TryCreateServiceBoundingBox(serviceInfo, outBox);
+}
+
+bool QLayerManagerPanel::TryTransformBoundingBoxToCanvasCrs(const GeoBoundingBox& sourceBox, GB_Rectangle& outExtent) const
+{
+	outExtent.Reset();
+
+	if (mainCanvas.isNull() || !sourceBox.rect.IsValid())
+	{
+		return false;
+	}
+
+	GB_Rectangle sourceRect = sourceBox.rect;
+	sourceRect.Normalize();
+	if (!sourceRect.IsValid())
+	{
+		return false;
+	}
+
+	const std::string& targetWkt = mainCanvas->GetCrsWkt();
+	if (targetWkt.empty() || sourceBox.wktUtf8.empty() || sourceBox.wktUtf8 == targetWkt)
+	{
+		outExtent = sourceRect;
+		return outExtent.IsValid();
+	}
+
+	GeoBoundingBox normalizedSourceBox(sourceBox.wktUtf8, sourceRect);
+	GeoBoundingBox targetBox;
+	if (!GeoCrsTransform::TransformBoundingBox(normalizedSourceBox, targetWkt, targetBox, 21))
+	{
+		return false;
+	}
+
+	if (!targetBox.rect.IsValid())
+	{
+		return false;
+	}
+
+	outExtent = targetBox.rect;
+	outExtent.Normalize();
+	return outExtent.IsValid();
+}
+
 void QLayerManagerPanel::SetAllLayersVisible(bool visible)
 {
 	if (layers.empty())
@@ -1205,9 +1615,14 @@ void QLayerManagerPanel::SelectOnlyRow(int row)
 void QLayerManagerPanel::UpdateSelectionDependentButtons()
 {
 	const bool hasSelection = listWidget && !listWidget->selectedItems().isEmpty();
+	const bool hasCanvas = !mainCanvas.isNull();
 	if (zoomSelectedButton)
 	{
-		zoomSelectedButton->setEnabled(hasSelection);
+		zoomSelectedButton->setEnabled(hasSelection && hasCanvas);
+	}
+	if (zoomAllButton)
+	{
+		zoomAllButton->setEnabled(!layers.empty() && hasCanvas);
 	}
 	if (removeSelectedButton)
 	{

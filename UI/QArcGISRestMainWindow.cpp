@@ -37,6 +37,7 @@ void QArcGISRestMainWindow::InitializeUi()
 	layerManagerPanel->setObjectName(QStringLiteral("layerManagerPanel"));
 	layerManagerPanel->setMinimumWidth(260);
 	layerManagerPanel->BindServiceBrowserPanel(serviceBrowserPanel);
+	layerManagerPanel->BindMainCanvas(mainCanvas);
 	addDockWidget(QLayerManagerPanel::GetDefaultDockWidgetArea(), layerManagerPanel);
 }
 

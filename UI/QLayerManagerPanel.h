@@ -4,6 +4,7 @@
 #include <QIcon>
 #include <QHash>
 #include <QMetaType>
+#include <QPointer>
 #include <QString>
 
 #include <vector>
@@ -17,6 +18,9 @@ class QModelIndex;
 class QPoint;
 class QToolButton;
 class QServiceBrowserPanel;
+class QMainCanvas;
+class GB_Rectangle;
+class GeoBoundingBox;
 
 /**
  * @brief 图层管理面板中的动作类型。
@@ -75,8 +79,9 @@ Q_DECLARE_METATYPE(LayerManagerChangeInfo)
  * @brief 图层管理 Dock 面板。
  *
  * 该面板负责展示当前已导入图层的列表，并维护每个图层的显示状态。
- * 面板本身不直接操作主画布；当用户改变显示状态、调整图层顺序、请求缩放或请求移除图层时，
- * 通过 LayersChanged() 把完整状态快照发送给外部业务层处理。
+ * 显示、隐藏、导入、移除、重命名、克隆、排序等状态变化仍通过 LayersChanged() 向外部业务层发送快照；
+ * 缩放至单个图层 / 选中图层 / 全部图层属于纯视图定位操作，会直接计算图层范围并设置已绑定主画布的当前视口，
+ * 不再额外发出 LayersChanged() 信号。
  */
 	class QLayerManagerPanel : public QDockWidget
 {
@@ -91,6 +96,8 @@ public:
 	QListWidget* GetListWidget() const;
 
 	bool BindServiceBrowserPanel(QServiceBrowserPanel* serviceBrowserPanel);
+	bool BindMainCanvas(QMainCanvas* canvas);
+	QMainCanvas* GetMainCanvas() const;
 
 	int GetLayerCount() const;
 	std::vector<LayerManagerLayerInfo> GetLayers() const;
@@ -159,6 +166,12 @@ private:
 		const std::vector<int>& affectedRows = std::vector<int>(),
 		bool targetVisible = true);
 
+	bool ZoomToLayers(const std::vector<LayerManagerLayerInfo>& targetLayers);
+	bool TryCalculateLayersExtentInCanvasCrs(const std::vector<LayerManagerLayerInfo>& targetLayers, GB_Rectangle& outExtent) const;
+	bool TryCalculateLayerExtentInCanvasCrs(const LayerManagerLayerInfo& layerInfo, GB_Rectangle& outExtent) const;
+	bool TryGetLayerBoundingBox(const LayerManagerLayerInfo& layerInfo, GeoBoundingBox& outBox) const;
+	bool TryTransformBoundingBoxToCanvasCrs(const GeoBoundingBox& sourceBox, GB_Rectangle& outExtent) const;
+
 	void SetAllLayersVisible(bool visible);
 	bool RemoveRows(const std::vector<int>& rowsToRemove, LayerManagerActionType actionType);
 	bool ConfirmRemoveLayers(int layerCount, LayerManagerActionType actionType) const;
@@ -176,6 +189,7 @@ private:
 	QToolButton* zoomAllButton = nullptr;
 	QToolButton* removeSelectedButton = nullptr;
 	QToolButton* removeAllButton = nullptr;
+	QPointer<QMainCanvas> mainCanvas;
 
 	// 内部顺序始终与列表可视顺序一致：index 0 为最顶层，最后一个为最底层。
 	std::vector<LayerManagerLayerInfo> layers;
