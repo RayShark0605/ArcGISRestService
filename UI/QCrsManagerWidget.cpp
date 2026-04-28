@@ -4,10 +4,16 @@
 #include "GeoCrsManager.h"
 #include "QMainCanvas.h"
 #include "GeoBase/GB_Utf8String.h"
+#include "GeoBase/GB_FileSystem.h"
+#include "GeoBase/GB_IO.h"
 
+#include <QAction>
 #include <QApplication>
 #include <QBrush>
+#include <QCloseEvent>
 #include <QComboBox>
+#include <QCursor>
+#include <QFont>
 #include <QFrame>
 #include <QHeaderView>
 #include <QHBoxLayout>
@@ -15,10 +21,13 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QList>
+#include <QMenu>
 #include <QMessageBox>
 #include <QModelIndexList>
+#include <QPoint>
 #include <QPushButton>
 #include <QShowEvent>
+#include <QSettings>
 #include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QSplitter>
@@ -27,17 +36,24 @@
 #include <QTableWidget>
 #include <QTableWidgetItem>
 #include <QTextEdit>
+#include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <QVariant>
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstdint>
+#include <exception>
+#include <functional>
 #include <iomanip>
+#include <limits>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -52,6 +68,14 @@ namespace
 
 	constexpr int CrsUniqueIdRole = Qt::UserRole + 1;
 	constexpr int CrsLogicalSortTextRole = Qt::UserRole + 2;
+
+	constexpr const char* CrsCacheMagic = "MWCRSCACHE";
+	constexpr std::uint32_t CrsCacheVersion = 1;
+	constexpr std::uint64_t MaxCachedCrsRecordCount = 1000000ULL;
+	constexpr std::uint32_t MaxCachedStringLength = 64U * 1024U * 1024U;
+
+	const QString BaseWindowTitle = QStringLiteral("坐标系管理");
+	const QString LoadingWindowTitle = QStringLiteral("坐标系管理（正在加载全部坐标系......）");
 
 	QString ToQString(const std::string& textUtf8)
 	{
@@ -177,6 +201,283 @@ namespace
 		return simplifiedText.split(QLatin1Char(' '), QString::SkipEmptyParts);
 	}
 
+	QString EscapeHtml(const QString& text)
+	{
+		return text.toHtmlEscaped();
+	}
+
+	QString EscapeHtmlUtf8(const std::string& textUtf8)
+	{
+		return EscapeHtml(ToQString(textUtf8));
+	}
+
+	QString BuildDetailRowHtml(const QString& label, const QString& value)
+	{
+		return QStringLiteral("<div><b>%1：</b>%2</div>").arg(EscapeHtml(label), EscapeHtml(value));
+	}
+
+	QString BuildDetailRowHtmlUtf8(const QString& label, const std::string& valueUtf8)
+	{
+		return BuildDetailRowHtml(label, ToQString(valueUtf8));
+	}
+
+	QSize& GetProcessLastDialogSize()
+	{
+		static QSize lastSize;
+		return lastSize;
+	}
+
+	std::string GetCrsCacheFilePathUtf8()
+	{
+		const std::string tempDirectory = GB_GetTempDirectory();
+		if (tempDirectory.empty())
+		{
+			return "";
+		}
+
+		const std::string cacheDirectory = GB_JoinPath(tempDirectory, "MapWeaver");
+		return GB_JoinPath(cacheDirectory, "CrsCache.bin");
+	}
+
+	void AppendUInt8(GB_ByteBuffer& buffer, std::uint8_t value)
+	{
+		buffer.push_back(value);
+	}
+
+	bool ReadUInt8(const GB_ByteBuffer& buffer, size_t& offset, std::uint8_t& value)
+	{
+		if (offset >= buffer.size())
+		{
+			return false;
+		}
+
+		value = static_cast<std::uint8_t>(buffer[offset]);
+		offset++;
+		return true;
+	}
+
+	void AppendAsciiBytes(GB_ByteBuffer& buffer, const char* text)
+	{
+		if (text == nullptr)
+		{
+			return;
+		}
+
+		while (*text != '\0')
+		{
+			buffer.push_back(static_cast<unsigned char>(*text));
+			text++;
+		}
+	}
+
+	bool ReadAndCheckAsciiBytes(const GB_ByteBuffer& buffer, size_t& offset, const char* expectedText)
+	{
+		if (expectedText == nullptr)
+		{
+			return false;
+		}
+
+		while (*expectedText != '\0')
+		{
+			if (offset >= buffer.size() || static_cast<unsigned char>(*expectedText) != static_cast<unsigned char>(buffer[offset]))
+			{
+				return false;
+			}
+
+			offset++;
+			expectedText++;
+		}
+
+		return true;
+	}
+
+	bool AppendUtf8String(GB_ByteBuffer& buffer, const std::string& textUtf8)
+	{
+		if (textUtf8.size() > static_cast<size_t>(std::numeric_limits<std::uint32_t>::max()))
+		{
+			return false;
+		}
+
+		GB_ByteBufferIO::AppendUInt32LE(buffer, static_cast<std::uint32_t>(textUtf8.size()));
+		buffer.insert(buffer.end(), textUtf8.begin(), textUtf8.end());
+		return true;
+	}
+
+	bool ReadUtf8String(const GB_ByteBuffer& buffer, size_t& offset, std::string& textUtf8)
+	{
+		std::uint32_t stringLength = 0;
+		if (!GB_ByteBufferIO::ReadUInt32LE(buffer, offset, stringLength))
+		{
+			return false;
+		}
+
+		if (stringLength > MaxCachedStringLength)
+		{
+			return false;
+		}
+
+		if (static_cast<size_t>(stringLength) > buffer.size() - offset)
+		{
+			return false;
+		}
+
+		if (stringLength == 0)
+		{
+			textUtf8.clear();
+		}
+		else
+		{
+			textUtf8.assign(reinterpret_cast<const char*>(buffer.data() + offset), static_cast<size_t>(stringLength));
+		}
+
+		offset += static_cast<size_t>(stringLength);
+		return true;
+	}
+
+	bool AppendCrsRecord(GB_ByteBuffer& buffer, const QCrsManagerWidget::CrsRecord& record)
+	{
+		return AppendUtf8String(buffer, record.uniqueIdUtf8)
+			&& AppendUtf8String(buffer, record.nameUtf8)
+			&& AppendUtf8String(buffer, record.ellipsoidUtf8)
+			&& AppendUtf8String(buffer, record.sourceUtf8)
+			&& AppendUtf8String(buffer, record.codeUtf8)
+			&& AppendUtf8String(buffer, record.definitionUtf8)
+			&& AppendUtf8String(buffer, record.wktUtf8)
+			&& AppendUtf8String(buffer, record.areaNameUtf8)
+			&& AppendUtf8String(buffer, record.projectionMethodUtf8)
+			&& AppendUtf8String(buffer, record.bboxTextUtf8);
+	}
+
+	bool ReadCrsRecord(const GB_ByteBuffer& buffer, size_t& offset, QCrsManagerWidget::CrsRecord& record)
+	{
+		std::uint32_t categoryValue = 0;
+		std::uint8_t isCustomValue = 0;
+		std::uint8_t isDeprecatedValue = 0;
+
+		if (!ReadUtf8String(buffer, offset, record.uniqueIdUtf8)
+			|| !ReadUtf8String(buffer, offset, record.nameUtf8)
+			|| !ReadUtf8String(buffer, offset, record.ellipsoidUtf8)
+			|| !ReadUtf8String(buffer, offset, record.sourceUtf8)
+			|| !ReadUtf8String(buffer, offset, record.codeUtf8)
+			|| !ReadUtf8String(buffer, offset, record.definitionUtf8)
+			|| !ReadUtf8String(buffer, offset, record.wktUtf8)
+			|| !ReadUtf8String(buffer, offset, record.areaNameUtf8)
+			|| !ReadUtf8String(buffer, offset, record.projectionMethodUtf8)
+			|| !ReadUtf8String(buffer, offset, record.bboxTextUtf8)
+			|| !GB_ByteBufferIO::ReadUInt32LE(buffer, offset, categoryValue)
+			|| !ReadUInt8(buffer, offset, isCustomValue)
+			|| !ReadUInt8(buffer, offset, isDeprecatedValue))
+		{
+			return false;
+		}
+
+		if (categoryValue > static_cast<std::uint32_t>(QCrsManagerWidget::CrsCategory::Custom))
+		{
+			return false;
+		}
+
+		record.category = static_cast<QCrsManagerWidget::CrsCategory>(categoryValue);
+		record.isCustom = isCustomValue != 0;
+		record.isDeprecated = isDeprecatedValue != 0;
+		return !record.uniqueIdUtf8.empty() && !record.nameUtf8.empty();
+	}
+
+	bool BuildSystemCrsRecordsCacheData(const std::vector<QCrsManagerWidget::CrsRecord>& records, GB_ByteBuffer& outData)
+	{
+		outData.clear();
+
+		AppendAsciiBytes(outData, CrsCacheMagic);
+		GB_ByteBufferIO::AppendUInt32LE(outData, CrsCacheVersion);
+		GB_ByteBufferIO::AppendUInt64LE(outData, static_cast<std::uint64_t>(records.size()));
+
+		for (const QCrsManagerWidget::CrsRecord& record : records)
+		{
+			if (!AppendCrsRecord(outData, record))
+			{
+				outData.clear();
+				return false;
+			}
+
+			GB_ByteBufferIO::AppendUInt32LE(outData, static_cast<std::uint32_t>(record.category));
+			AppendUInt8(outData, record.isCustom ? 1 : 0);
+			AppendUInt8(outData, record.isDeprecated ? 1 : 0);
+		}
+
+		return true;
+	}
+
+	bool TryReadSystemCrsRecordsCache(std::vector<QCrsManagerWidget::CrsRecord>& outRecords)
+	{
+		outRecords.clear();
+
+		const std::string cacheFilePathUtf8 = GetCrsCacheFilePathUtf8();
+		if (cacheFilePathUtf8.empty() || !GB_IsFileExists(cacheFilePathUtf8))
+		{
+			return false;
+		}
+
+		const GB_ByteBuffer cacheData = GB_ReadBinaryFromFile(cacheFilePathUtf8);
+		if (cacheData.empty())
+		{
+			return false;
+		}
+
+		size_t offset = 0;
+		std::uint32_t version = 0;
+		std::uint64_t recordCount = 0;
+		if (!ReadAndCheckAsciiBytes(cacheData, offset, CrsCacheMagic)
+			|| !GB_ByteBufferIO::ReadUInt32LE(cacheData, offset, version)
+			|| version != CrsCacheVersion
+			|| !GB_ByteBufferIO::ReadUInt64LE(cacheData, offset, recordCount)
+			|| recordCount > MaxCachedCrsRecordCount)
+		{
+			return false;
+		}
+
+		std::vector<QCrsManagerWidget::CrsRecord> records;
+		records.reserve(static_cast<size_t>(recordCount));
+		for (std::uint64_t recordIndex = 0; recordIndex < recordCount; recordIndex++)
+		{
+			QCrsManagerWidget::CrsRecord record;
+			if (!ReadCrsRecord(cacheData, offset, record))
+			{
+				return false;
+			}
+
+			records.push_back(std::move(record));
+		}
+
+		if (offset != cacheData.size() || records.empty())
+		{
+			return false;
+		}
+
+		outRecords = std::move(records);
+		return true;
+	}
+
+	bool TryWriteSystemCrsRecordsCache(const std::vector<QCrsManagerWidget::CrsRecord>& records)
+	{
+		if (records.empty())
+		{
+			return false;
+		}
+
+		const std::string cacheFilePathUtf8 = GetCrsCacheFilePathUtf8();
+		if (cacheFilePathUtf8.empty())
+		{
+			return false;
+		}
+
+		GB_ByteBuffer cacheData;
+		if (!BuildSystemCrsRecordsCacheData(records, cacheData))
+		{
+			return false;
+		}
+
+		return GB_WriteBinaryToFile(cacheData, cacheFilePathUtf8);
+	}
+
 	class CrsTableWidgetItem : public QTableWidgetItem
 	{
 	public:
@@ -231,39 +532,245 @@ namespace
 		tableWidget->setItem(row, column, item.release());
 	}
 
-	void AppendAuthorityCrsRecords(const std::string& authorityNameUtf8, std::vector<QCrsManagerWidget::CrsRecord>& records)
+	QCrsManagerWidget::CrsRecord BuildCrsRecordFromDatabaseRecord(const GeoCrsDatabaseRecord& databaseRecord, bool& outValid)
+	{
+		outValid = false;
+
+		if (!IsSupportedMapCrsType(databaseRecord.type))
+		{
+			return QCrsManagerWidget::CrsRecord();
+		}
+
+		QCrsManagerWidget::CrsRecord record;
+		record.sourceUtf8 = databaseRecord.sourceUtf8;
+		record.codeUtf8 = databaseRecord.codeUtf8;
+		record.nameUtf8 = databaseRecord.nameUtf8;
+		record.category = ToCategory(databaseRecord.type);
+		record.isCustom = false;
+		record.isDeprecated = databaseRecord.isDeprecated;
+		record.areaNameUtf8 = databaseRecord.areaNameUtf8;
+		record.projectionMethodUtf8 = databaseRecord.projectionMethodUtf8;
+		record.bboxTextUtf8 = BuildBboxText(databaseRecord);
+
+		if (record.sourceUtf8.empty() || record.codeUtf8.empty() || record.nameUtf8.empty())
+		{
+			return QCrsManagerWidget::CrsRecord();
+		}
+
+		record.uniqueIdUtf8 = databaseRecord.GetAuthorityCodeUtf8();
+		record.definitionUtf8 = record.uniqueIdUtf8;
+		record.ellipsoidUtf8 = ExtractReferenceEllipsoidNameUtf8(record.definitionUtf8);
+
+		outValid = true;
+		return record;
+	}
+
+	typedef std::function<void(const std::vector<QCrsManagerWidget::CrsRecord>&)> CrsRecordsProgressCallback;
+
+	void AppendAuthorityCrsRecords(const std::string& authorityNameUtf8, std::vector<QCrsManagerWidget::CrsRecord>& records, const CrsRecordsProgressCallback& progressCallback)
 	{
 		const std::vector<GeoCrsDatabaseRecord> databaseRecords = GeoCrsManager::ListDatabaseCrsRecords(authorityNameUtf8);
-		for (const GeoCrsDatabaseRecord& databaseRecord : databaseRecords)
+		if (databaseRecords.empty())
 		{
-			if (!IsSupportedMapCrsType(databaseRecord.type))
+			return;
+		}
+
+		records.reserve(records.size() + databaseRecords.size());
+
+		std::vector<QCrsManagerWidget::CrsRecord> localRecords(databaseRecords.size());
+		std::vector<unsigned char> validFlags(databaseRecords.size(), 0);
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(dynamic, 64)
+#endif
+		for (long long recordIndex = 0; recordIndex < static_cast<long long>(databaseRecords.size()); recordIndex++)
+		{
+			bool isValid = false;
+			QCrsManagerWidget::CrsRecord record = BuildCrsRecordFromDatabaseRecord(databaseRecords[static_cast<size_t>(recordIndex)], isValid);
+			if (isValid)
 			{
-				continue;
+				localRecords[static_cast<size_t>(recordIndex)] = std::move(record);
+				validFlags[static_cast<size_t>(recordIndex)] = 1;
 			}
+		}
 
-			QCrsManagerWidget::CrsRecord record;
-			record.sourceUtf8 = databaseRecord.sourceUtf8;
-			record.codeUtf8 = databaseRecord.codeUtf8;
-			record.nameUtf8 = databaseRecord.nameUtf8;
-			record.category = ToCategory(databaseRecord.type);
-			record.isCustom = false;
-			record.isDeprecated = databaseRecord.isDeprecated;
-			record.areaNameUtf8 = databaseRecord.areaNameUtf8;
-			record.projectionMethodUtf8 = databaseRecord.projectionMethodUtf8;
-			record.bboxTextUtf8 = BuildBboxText(databaseRecord);
-
-			if (record.sourceUtf8.empty() || record.codeUtf8.empty() || record.nameUtf8.empty())
+		const size_t oldRecordCount = records.size();
+		for (size_t recordIndex = 0; recordIndex < localRecords.size(); recordIndex++)
+		{
+			if (validFlags[recordIndex] != 0)
 			{
-				continue;
+				records.push_back(std::move(localRecords[recordIndex]));
 			}
+		}
 
-			record.uniqueIdUtf8 = databaseRecord.GetAuthorityCodeUtf8();
-			record.definitionUtf8 = record.uniqueIdUtf8;
-			record.ellipsoidUtf8 = ExtractReferenceEllipsoidNameUtf8(record.definitionUtf8);
-
-			records.push_back(std::move(record));
+		if (progressCallback && records.size() != oldRecordCount)
+		{
+			progressCallback(records);
 		}
 	}
+
+	std::vector<QCrsManagerWidget::CrsRecord> BuildSystemCrsRecordsInternal(const CrsRecordsProgressCallback& progressCallback = CrsRecordsProgressCallback())
+	{
+		std::vector<QCrsManagerWidget::CrsRecord> records;
+
+		GeoCrsManager::GetProjDbDirectoryUtf8();
+		AppendAuthorityCrsRecords("EPSG", records, progressCallback);
+		AppendAuthorityCrsRecords("ESRI", records, progressCallback);
+
+		std::sort(records.begin(), records.end(), [](const QCrsManagerWidget::CrsRecord& left, const QCrsManagerWidget::CrsRecord& right) -> bool
+			{
+				const int sourceCompare = GB_Utf8CompareLogical(left.sourceUtf8, right.sourceUtf8);
+				if (sourceCompare != 0)
+				{
+					return sourceCompare < 0;
+				}
+
+				return GB_Utf8CompareLogical(left.codeUtf8, right.codeUtf8) < 0;
+			});
+
+		if (progressCallback)
+		{
+			progressCallback(records);
+		}
+
+		return records;
+	}
+
+	struct SystemCrsRecordsInitializationState
+	{
+		std::mutex mutex;
+		std::condition_variable condition;
+		bool isStarted = false;
+		bool isFinished = false;
+		bool isSucceeded = false;
+		std::uint64_t dataRevision = 0;
+		std::vector<QCrsManagerWidget::CrsRecord> records;
+		std::string errorMessageUtf8 = "";
+	};
+
+	SystemCrsRecordsInitializationState& GetSystemCrsRecordsInitializationState()
+	{
+		static SystemCrsRecordsInitializationState* state = new SystemCrsRecordsInitializationState();
+		return *state;
+	}
+
+	void PublishSystemCrsRecordsSnapshot(const std::vector<QCrsManagerWidget::CrsRecord>& records, bool isFinished, bool isSucceeded, const std::string& errorMessageUtf8)
+	{
+		SystemCrsRecordsInitializationState& state = GetSystemCrsRecordsInitializationState();
+		{
+			std::lock_guard<std::mutex> lock(state.mutex);
+			state.records = records;
+			state.errorMessageUtf8 = errorMessageUtf8;
+			state.isSucceeded = isSucceeded;
+			state.isFinished = isFinished;
+			state.dataRevision++;
+		}
+		state.condition.notify_all();
+	}
+
+	bool CopySystemCrsRecordsSnapshotIfChanged(std::uint64_t knownRevision,
+		std::vector<QCrsManagerWidget::CrsRecord>& outRecords,
+		bool& outIsFinished,
+		bool& outIsSucceeded,
+		std::string& outErrorMessageUtf8,
+		std::uint64_t& outRevision)
+	{
+		SystemCrsRecordsInitializationState& state = GetSystemCrsRecordsInitializationState();
+		std::lock_guard<std::mutex> lock(state.mutex);
+
+		outIsFinished = state.isFinished;
+		outIsSucceeded = state.isSucceeded;
+		outErrorMessageUtf8 = state.errorMessageUtf8;
+		outRevision = state.dataRevision;
+
+		if (state.dataRevision == knownRevision)
+		{
+			return false;
+		}
+
+		outRecords = state.records;
+		return true;
+	}
+
+	void StartWriteSystemCrsRecordsCacheAsync(const std::vector<QCrsManagerWidget::CrsRecord>& records)
+	{
+		if (records.empty())
+		{
+			return;
+		}
+
+		try
+		{
+			std::vector<QCrsManagerWidget::CrsRecord> recordsCopy = records;
+			std::thread([recordsCopy = std::move(recordsCopy)]() mutable
+				{
+					TryWriteSystemCrsRecordsCache(recordsCopy);
+				}).detach();
+		}
+		catch (...)
+		{
+			// 缓存只是性能优化，写入失败不能影响主流程。
+		}
+	}
+
+	void RunSystemCrsRecordsInitialization()
+	{
+		std::vector<QCrsManagerWidget::CrsRecord> records;
+		std::string errorMessageUtf8;
+		bool isSucceeded = false;
+		bool shouldWriteCache = false;
+
+		try
+		{
+			if (TryReadSystemCrsRecordsCache(records))
+			{
+				isSucceeded = true;
+				PublishSystemCrsRecordsSnapshot(records, true, true, "");
+				return;
+			}
+
+			const CrsRecordsProgressCallback progressCallback = [](const std::vector<QCrsManagerWidget::CrsRecord>& partialRecords)
+				{
+					PublishSystemCrsRecordsSnapshot(partialRecords, false, false, "");
+				};
+
+			records = BuildSystemCrsRecordsInternal(progressCallback);
+			isSucceeded = true;
+			shouldWriteCache = !records.empty();
+		}
+		catch (const std::exception& exception)
+		{
+			errorMessageUtf8 = exception.what();
+		}
+		catch (...)
+		{
+			errorMessageUtf8 = "Unknown exception while initializing CRS records.";
+		}
+
+		PublishSystemCrsRecordsSnapshot(records, true, isSucceeded, errorMessageUtf8);
+
+		if (isSucceeded && shouldWriteCache)
+		{
+			StartWriteSystemCrsRecordsCacheAsync(records);
+		}
+	}
+
+	class OverrideCursorGuard
+	{
+	public:
+		explicit OverrideCursorGuard(Qt::CursorShape cursorShape)
+		{
+			QApplication::setOverrideCursor(QCursor(cursorShape));
+		}
+
+		~OverrideCursorGuard()
+		{
+			QApplication::restoreOverrideCursor();
+		}
+
+		OverrideCursorGuard(const OverrideCursorGuard&) = delete;
+		OverrideCursorGuard& operator=(const OverrideCursorGuard&) = delete;
+	};
 
 	bool IsSameAuthorityCode(const std::string& left, const std::string& right)
 	{
@@ -271,7 +778,7 @@ namespace
 	}
 }
 
-QCrsManagerWidget::QCrsManagerWidget(QWidget* parent) : QWidget(parent)
+QCrsManagerWidget::QCrsManagerWidget(QWidget* parent) : QDialog(parent)
 {
 	InitializeUi();
 	InitializeConnections();
@@ -280,6 +787,54 @@ QCrsManagerWidget::QCrsManagerWidget(QWidget* parent) : QWidget(parent)
 
 QCrsManagerWidget::~QCrsManagerWidget()
 {
+	SaveDialogSize();
+}
+
+void QCrsManagerWidget::InitializeSystemCrsRecordsAsync()
+{
+	SystemCrsRecordsInitializationState& state = GetSystemCrsRecordsInitializationState();
+
+	{
+		std::lock_guard<std::mutex> lock(state.mutex);
+		if (state.isStarted)
+		{
+			return;
+		}
+
+		state.isStarted = true;
+		state.isFinished = false;
+		state.isSucceeded = false;
+		state.errorMessageUtf8.clear();
+	}
+
+	try
+	{
+		std::thread(RunSystemCrsRecordsInitialization).detach();
+	}
+	catch (const std::exception& exception)
+	{
+		{
+			std::lock_guard<std::mutex> lock(state.mutex);
+			state.isStarted = false;
+			state.isFinished = true;
+			state.isSucceeded = false;
+			state.errorMessageUtf8 = exception.what();
+			state.dataRevision++;
+		}
+		state.condition.notify_all();
+	}
+	catch (...)
+	{
+		{
+			std::lock_guard<std::mutex> lock(state.mutex);
+			state.isStarted = false;
+			state.isFinished = true;
+			state.isSucceeded = false;
+			state.errorMessageUtf8 = "Unknown exception while starting CRS initialization thread.";
+			state.dataRevision++;
+		}
+		state.condition.notify_all();
+	}
 }
 
 void QCrsManagerWidget::BindMainCanvas(QMainCanvas* canvas)
@@ -319,14 +874,33 @@ void QCrsManagerWidget::ReloadCoordinateSystems()
 
 void QCrsManagerWidget::showEvent(QShowEvent* event)
 {
-	QWidget::showEvent(event);
+	QDialog::showEvent(event);
+	LoadSystemCrsRecords();
+
+	// 每次窗口从隐藏状态重新显示时，都重新按当前画布坐标系执行一次初始定位。
+	// 这样可以避免在对话框尚未显示前已完成选中，但视口滚动位置未生效的问题。
+	hasSelectedInitialCanvasCrs = false;
 	SelectCanvasCrsIfAvailable();
+	ScheduleScrollSelectedCrsToCenterIfAvailable();
+}
+
+void QCrsManagerWidget::closeEvent(QCloseEvent* event)
+{
+	SaveDialogSize();
+	QDialog::closeEvent(event);
+}
+
+void QCrsManagerWidget::done(int result)
+{
+	SaveDialogSize();
+	QDialog::done(result);
 }
 
 void QCrsManagerWidget::InitializeUi()
 {
 	setObjectName(QStringLiteral("QCrsManagerWidget"));
-	setWindowTitle(QStringLiteral("坐标系管理"));
+	setWindowTitle(BaseWindowTitle);
+	setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint);
 	resize(900, 600);
 
 	QVBoxLayout* mainLayout = new QVBoxLayout(this);
@@ -394,20 +968,51 @@ void QCrsManagerWidget::InitializeUi()
 	crsTableWidget->setEditTriggers(QAbstractItemView::NoEditTriggers);
 	crsTableWidget->setSelectionBehavior(QAbstractItemView::SelectRows);
 	crsTableWidget->setSelectionMode(QAbstractItemView::ExtendedSelection);
+	crsTableWidget->setContextMenuPolicy(Qt::CustomContextMenu);
 	crsTableWidget->setAlternatingRowColors(true);
 	crsTableWidget->setSortingEnabled(true);
 	crsTableWidget->verticalHeader()->setVisible(false);
 	crsTableWidget->verticalHeader()->setDefaultSectionSize(24);
-	crsTableWidget->horizontalHeader()->setStretchLastSection(false);
-	crsTableWidget->horizontalHeader()->setSectionResizeMode(ColumnName, QHeaderView::Stretch);
-	crsTableWidget->horizontalHeader()->setSectionResizeMode(ColumnEllipsoid, QHeaderView::ResizeToContents);
-	crsTableWidget->horizontalHeader()->setSectionResizeMode(ColumnSource, QHeaderView::ResizeToContents);
-	crsTableWidget->horizontalHeader()->setSectionResizeMode(ColumnCode, QHeaderView::ResizeToContents);
-	crsTableWidget->horizontalHeader()->setSectionResizeMode(ColumnType, QHeaderView::ResizeToContents);
+	QHeaderView* horizontalHeader = crsTableWidget->horizontalHeader();
+	horizontalHeader->setStretchLastSection(false);
+	horizontalHeader->setSectionsMovable(false);
+	horizontalHeader->setMinimumSectionSize(60);
+	horizontalHeader->setDefaultSectionSize(120);
+	horizontalHeader->setSectionResizeMode(QHeaderView::Interactive);
+	crsTableWidget->setColumnWidth(ColumnName, 260);
+	crsTableWidget->setColumnWidth(ColumnEllipsoid, 150);
+	crsTableWidget->setColumnWidth(ColumnSource, 90);
+	crsTableWidget->setColumnWidth(ColumnCode, 90);
+	crsTableWidget->setColumnWidth(ColumnType, 110);
 	leftLayout->addWidget(crsTableWidget, 1);
 
 	applyToCanvasButton = new QPushButton(QStringLiteral("应用到画布"), leftWidget);
 	applyToCanvasButton->setObjectName(QStringLiteral("applyToCanvasButton"));
+	applyToCanvasButton->setToolTip(QStringLiteral("将当前选中的一个坐标系应用到主画布"));
+	applyToCanvasButton->setIcon(style()->standardIcon(QStyle::SP_DialogApplyButton));
+	applyToCanvasButton->setMinimumHeight(36);
+	applyToCanvasButton->setDefault(true);
+	applyToCanvasButton->setAutoDefault(true);
+	QFont applyButtonFont = applyToCanvasButton->font();
+	applyButtonFont.setBold(true);
+	applyToCanvasButton->setFont(applyButtonFont);
+	applyToCanvasButton->setStyleSheet(QStringLiteral(
+		"QPushButton#applyToCanvasButton {"
+		"  font-weight: 600;"
+		"  padding: 6px 14px;"
+		"  border-radius: 4px;"
+		"  border: 1px solid #1f6feb;"
+		"  background: #2f81f7;"
+		"  color: white;"
+		"}"
+		"QPushButton#applyToCanvasButton:hover {"
+		"  background: #1f6feb;"
+		"}"
+		"QPushButton#applyToCanvasButton:disabled {"
+		"  border: 1px solid #a0a0a0;"
+		"  background: #d0d0d0;"
+		"  color: #707070;"
+		"}"));
 	applyToCanvasButton->setEnabled(false);
 	leftLayout->addWidget(applyToCanvasButton, 0);
 
@@ -438,6 +1043,12 @@ void QCrsManagerWidget::InitializeUi()
 	splitter->setStretchFactor(0, 3);
 	splitter->setStretchFactor(1, 2);
 	splitter->setSizes(QList<int>() << 540 << 340);
+
+	systemCrsInitializationPollTimer = new QTimer(this);
+	systemCrsInitializationPollTimer->setInterval(250);
+
+	RestoreDialogSize();
+	UpdateInitializationUiState();
 }
 
 void QCrsManagerWidget::InitializeConnections()
@@ -474,30 +1085,96 @@ void QCrsManagerWidget::InitializeConnections()
 				UpdateDetailsAndButtons();
 			}
 		});
-}
 
-void QCrsManagerWidget::LoadSystemCrsRecords()
-{
-	systemCrsRecords.clear();
-
-	QApplication::setOverrideCursor(Qt::WaitCursor);
-
-	GeoCrsManager::GetProjDbDirectoryUtf8();
-	AppendAuthorityCrsRecords("EPSG", systemCrsRecords);
-	AppendAuthorityCrsRecords("ESRI", systemCrsRecords);
-
-	std::sort(systemCrsRecords.begin(), systemCrsRecords.end(), [](const CrsRecord& left, const CrsRecord& right) -> bool
+	connect(crsTableWidget, &QTableWidget::customContextMenuRequested, this, [this](const QPoint& pos)
 		{
-			const int sourceCompare = GB_Utf8CompareLogical(left.sourceUtf8, right.sourceUtf8);
-			if (sourceCompare != 0)
-			{
-				return sourceCompare < 0;
-			}
-
-			return GB_Utf8CompareLogical(left.codeUtf8, right.codeUtf8) < 0;
+			ShowTableContextMenu(pos);
 		});
 
-	QApplication::restoreOverrideCursor();
+	connect(systemCrsInitializationPollTimer, &QTimer::timeout, this, [this]()
+		{
+			PollSystemCrsRecordsInitialization();
+		});
+}
+
+bool QCrsManagerWidget::LoadSystemCrsRecords()
+{
+	InitializeSystemCrsRecordsAsync();
+
+	std::vector<CrsRecord> recordsSnapshot;
+	bool isFinished = false;
+	bool isSucceeded = false;
+	std::string errorMessageUtf8;
+	std::uint64_t revision = loadedSystemCrsRecordsRevision;
+
+	const bool hasNewSnapshot = CopySystemCrsRecordsSnapshotIfChanged(loadedSystemCrsRecordsRevision,
+		recordsSnapshot,
+		isFinished,
+		isSucceeded,
+		errorMessageUtf8,
+		revision);
+
+	isSystemCrsInitializationFinished = isFinished;
+
+	if (hasNewSnapshot)
+	{
+		systemCrsRecords = std::move(recordsSnapshot);
+		loadedSystemCrsRecordsRevision = revision;
+	}
+
+	if (!isSystemCrsInitializationFinished)
+	{
+		systemCrsInitializationPollTimer->start();
+	}
+	else
+	{
+		systemCrsInitializationPollTimer->stop();
+	}
+
+	UpdateInitializationUiState();
+	return hasNewSnapshot;
+}
+
+void QCrsManagerWidget::PollSystemCrsRecordsInitialization()
+{
+	const bool hasNewSnapshot = LoadSystemCrsRecords();
+	if (hasNewSnapshot)
+	{
+		RefreshTable(true);
+		SelectCanvasCrsIfAvailable();
+	}
+}
+
+void QCrsManagerWidget::UpdateInitializationUiState()
+{
+	setWindowTitle(isSystemCrsInitializationFinished ? BaseWindowTitle : LoadingWindowTitle);
+}
+
+void QCrsManagerWidget::RestoreDialogSize()
+{
+	QSize restoredSize = GetProcessLastDialogSize();
+	if (!restoredSize.isValid())
+	{
+		QSettings settings;
+		restoredSize = settings.value(QStringLiteral("QCrsManagerWidget/size")).toSize();
+	}
+
+	if (restoredSize.isValid() && restoredSize.width() >= 640 && restoredSize.height() >= 360)
+	{
+		resize(restoredSize);
+	}
+}
+
+void QCrsManagerWidget::SaveDialogSize() const
+{
+	if (size().width() <= 0 || size().height() <= 0)
+	{
+		return;
+	}
+
+	GetProcessLastDialogSize() = size();
+	QSettings settings;
+	settings.setValue(QStringLiteral("QCrsManagerWidget/size"), size());
 }
 
 void QCrsManagerWidget::RebuildCustomCrsRecords()
@@ -579,37 +1256,39 @@ void QCrsManagerWidget::RefreshTable(bool preserveSelection)
 	const CrsCategory category = static_cast<CrsCategory>(categoryComboBox->currentData().toInt());
 	const QString searchText = searchLineEdit->text();
 
-	const auto AppendRecordToTable = [this, category, searchText](const CrsRecord& record)
-		{
-			if (!DoesRecordPassFilter(record, category, searchText))
-			{
-				return;
-			}
+	std::vector<const CrsRecord*> visibleRecords;
+	visibleRecords.reserve(systemCrsRecords.size() + customCrsRecords.size());
 
-			const int row = crsTableWidget->rowCount();
-			crsTableWidget->insertRow(row);
-			SetTableItem(crsTableWidget, row, ColumnName, ToQString(record.nameUtf8), record);
-			SetTableItem(crsTableWidget, row, ColumnEllipsoid, ToQString(record.ellipsoidUtf8), record);
-			SetTableItem(crsTableWidget, row, ColumnSource, ToQString(record.sourceUtf8), record);
-			SetTableItem(crsTableWidget, row, ColumnCode, ToQString(record.codeUtf8), record);
-			SetTableItem(crsTableWidget, row, ColumnType, ToCategoryText(record.category, record.isCustom), record);
+	const auto AppendVisibleRecord = [this, category, searchText, &visibleRecords](const CrsRecord& record)
+		{
+			if (DoesRecordPassFilter(record, category, searchText))
+			{
+				visibleRecords.push_back(&record);
+			}
 		};
 
 	for (const CrsRecord& record : systemCrsRecords)
 	{
-		AppendRecordToTable(record);
+		AppendVisibleRecord(record);
 	}
 	for (const CrsRecord& record : customCrsRecords)
 	{
-		AppendRecordToTable(record);
+		AppendVisibleRecord(record);
+	}
+
+	crsTableWidget->setRowCount(static_cast<int>(visibleRecords.size()));
+	for (int row = 0; row < static_cast<int>(visibleRecords.size()); row++)
+	{
+		const CrsRecord& record = *visibleRecords[static_cast<size_t>(row)];
+		SetTableItem(crsTableWidget, row, ColumnName, ToQString(record.nameUtf8), record);
+		SetTableItem(crsTableWidget, row, ColumnEllipsoid, ToQString(record.ellipsoidUtf8), record);
+		SetTableItem(crsTableWidget, row, ColumnSource, ToQString(record.sourceUtf8), record);
+		SetTableItem(crsTableWidget, row, ColumnCode, ToQString(record.codeUtf8), record);
+		SetTableItem(crsTableWidget, row, ColumnType, ToCategoryText(record.category, record.isCustom), record);
 	}
 
 	crsTableWidget->setSortingEnabled(true);
 	crsTableWidget->sortItems(sortColumn, sortOrder);
-	crsTableWidget->resizeColumnToContents(ColumnSource);
-	crsTableWidget->resizeColumnToContents(ColumnCode);
-	crsTableWidget->resizeColumnToContents(ColumnType);
-
 	if (preserveSelection && !selectedUniqueIds.empty())
 	{
 		QItemSelectionModel* selectionModel = crsTableWidget->selectionModel();
@@ -641,9 +1320,9 @@ void QCrsManagerWidget::SelectCanvasCrsIfAvailable()
 		return;
 	}
 
-	hasSelectedInitialCanvasCrs = true;
 	if (!mainCanvas)
 	{
+		hasSelectedInitialCanvasCrs = true;
 		ClearTableSelection();
 		return;
 	}
@@ -651,6 +1330,7 @@ void QCrsManagerWidget::SelectCanvasCrsIfAvailable()
 	const std::string& canvasWkt = mainCanvas->GetCrsWkt();
 	if (canvasWkt.empty())
 	{
+		hasSelectedInitialCanvasCrs = true;
 		ClearTableSelection();
 		return;
 	}
@@ -658,24 +1338,68 @@ void QCrsManagerWidget::SelectCanvasCrsIfAvailable()
 	const std::string authorityCode = GeoCrsManager::WktToEpsgCodeUtf8(canvasWkt);
 	if (authorityCode.empty())
 	{
+		hasSelectedInitialCanvasCrs = true;
 		ClearTableSelection();
 		return;
 	}
 
-	SelectCrsByUniqueId(authorityCode);
+	if (SelectCrsByUniqueId(authorityCode))
+	{
+		hasSelectedInitialCanvasCrs = true;
+		return;
+	}
+
+	if (isSystemCrsInitializationFinished)
+	{
+		hasSelectedInitialCanvasCrs = true;
+	}
 }
 
-void QCrsManagerWidget::SelectCrsByUniqueId(const std::string& uniqueIdUtf8)
+bool QCrsManagerWidget::SelectCrsByUniqueId(const std::string& uniqueIdUtf8)
 {
 	if (uniqueIdUtf8.empty())
 	{
+		pendingCenteredCrsUniqueIdUtf8.clear();
 		ClearTableSelection();
-		return;
+		return false;
+	}
+
+	if (!crsTableWidget || !crsTableWidget->selectionModel())
+	{
+		pendingCenteredCrsUniqueIdUtf8.clear();
+		return false;
+	}
+
+	crsTableWidget->selectionModel()->clearSelection();
+
+	int targetRow = -1;
+	if (SelectVisibleCrsRowByUniqueId(uniqueIdUtf8, &targetRow))
+	{
+		pendingCenteredCrsUniqueIdUtf8 = uniqueIdUtf8;
+		ScrollCrsRowToCenter(targetRow);
+		ScheduleScrollSelectedCrsToCenterIfAvailable();
+		UpdateDetailsAndButtons();
+		return true;
+	}
+
+	pendingCenteredCrsUniqueIdUtf8.clear();
+	UpdateDetailsAndButtons();
+	return false;
+}
+
+bool QCrsManagerWidget::SelectVisibleCrsRowByUniqueId(const std::string& uniqueIdUtf8, int* outRow)
+{
+	if (outRow)
+	{
+		*outRow = -1;
+	}
+
+	if (uniqueIdUtf8.empty() || !crsTableWidget || !crsTableWidget->selectionModel() || !crsTableWidget->model())
+	{
+		return false;
 	}
 
 	QItemSelectionModel* selectionModel = crsTableWidget->selectionModel();
-	selectionModel->clearSelection();
-
 	for (int row = 0; row < crsTableWidget->rowCount(); row++)
 	{
 		QTableWidgetItem* item = crsTableWidget->item(row, ColumnName);
@@ -685,21 +1409,112 @@ void QCrsManagerWidget::SelectCrsByUniqueId(const std::string& uniqueIdUtf8)
 		}
 
 		const std::string rowUniqueId = ToUtf8(item->data(CrsUniqueIdRole).toString());
-		if (IsSameAuthorityCode(rowUniqueId, uniqueIdUtf8))
+		if (!IsSameAuthorityCode(rowUniqueId, uniqueIdUtf8))
 		{
-			selectionModel->select(crsTableWidget->model()->index(row, 0), QItemSelectionModel::Select | QItemSelectionModel::Rows);
-			crsTableWidget->scrollToItem(item, QAbstractItemView::PositionAtCenter);
-			UpdateDetailsAndButtons();
-			return;
+			continue;
+		}
+
+		const QModelIndex targetIndex = crsTableWidget->model()->index(row, ColumnName);
+		selectionModel->setCurrentIndex(targetIndex, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+
+		// setCurrentIndex(... | Rows) 理论上已经会选择整行；这里再显式调用表格层接口，
+		// 是为了抵抗 showEvent 后焦点/布局初始化过程中的 selection 状态被刷新掉的情况。
+		crsTableWidget->setCurrentCell(row, ColumnName, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+		crsTableWidget->selectRow(row);
+
+		if (outRow)
+		{
+			*outRow = row;
+		}
+		return true;
+	}
+
+	return false;
+}
+
+void QCrsManagerWidget::ScrollCrsRowToCenter(int row)
+{
+	if (!crsTableWidget || row < 0 || row >= crsTableWidget->rowCount())
+	{
+		return;
+	}
+
+	QTableWidgetItem* item = crsTableWidget->item(row, ColumnName);
+	if (!item)
+	{
+		return;
+	}
+
+	crsTableWidget->scrollToItem(item, QAbstractItemView::PositionAtCenter);
+}
+
+void QCrsManagerWidget::ScrollSelectedCrsToCenterIfAvailable()
+{
+	if (!crsTableWidget || !crsTableWidget->selectionModel())
+	{
+		return;
+	}
+
+	QItemSelectionModel* selectionModel = crsTableWidget->selectionModel();
+	int targetRow = -1;
+
+	const QModelIndex currentIndex = crsTableWidget->currentIndex();
+	if (currentIndex.isValid() && selectionModel->isRowSelected(currentIndex.row(), QModelIndex()))
+	{
+		targetRow = currentIndex.row();
+	}
+	else
+	{
+		const QModelIndexList selectedRows = selectionModel->selectedRows(ColumnName);
+		if (!selectedRows.empty())
+		{
+			targetRow = selectedRows.first().row();
 		}
 	}
 
-	UpdateDetailsAndButtons();
+	if (targetRow < 0 || targetRow >= crsTableWidget->rowCount())
+	{
+		return;
+	}
+
+	ScrollCrsRowToCenter(targetRow);
+}
+
+void QCrsManagerWidget::ScheduleScrollSelectedCrsToCenterIfAvailable()
+{
+	if (!crsTableWidget || !isVisible())
+	{
+		return;
+	}
+
+	const std::string targetUniqueIdUtf8 = pendingCenteredCrsUniqueIdUtf8;
+	QTimer::singleShot(0, this, [this, targetUniqueIdUtf8]()
+		{
+			if (!crsTableWidget || !crsTableWidget->selectionModel())
+			{
+				return;
+			}
+
+			int targetRow = -1;
+			if (!targetUniqueIdUtf8.empty() && SelectVisibleCrsRowByUniqueId(targetUniqueIdUtf8, &targetRow))
+			{
+				ScrollCrsRowToCenter(targetRow);
+				crsTableWidget->setFocus(Qt::OtherFocusReason);
+				UpdateDetailsAndButtons();
+				return;
+			}
+
+			ScrollSelectedCrsToCenterIfAvailable();
+		});
 }
 
 void QCrsManagerWidget::ClearTableSelection()
 {
-	crsTableWidget->selectionModel()->clearSelection();
+	pendingCenteredCrsUniqueIdUtf8.clear();
+	if (crsTableWidget && crsTableWidget->selectionModel())
+	{
+		crsTableWidget->selectionModel()->clearSelection();
+	}
 	UpdateDetailsAndButtons();
 }
 
@@ -718,7 +1533,7 @@ void QCrsManagerWidget::UpdateCrsDetails()
 		return;
 	}
 
-	crsDetailTextEdit->setPlainText(BuildDetailText(*selectedRecords[0]));
+	crsDetailTextEdit->setHtml(BuildDetailHtml(*selectedRecords[0]));
 }
 
 void QCrsManagerWidget::UpdateActionButtons()
@@ -789,21 +1604,31 @@ void QCrsManagerWidget::OnDeleteSelectedCrsClicked()
 
 void QCrsManagerWidget::OnApplyToCanvasClicked()
 {
+	ApplySelectedCrsToCanvas(true);
+}
+
+bool QCrsManagerWidget::ApplySelectedCrsToCanvas(bool closeDialogAfterApply)
+{
 	const std::vector<const CrsRecord*> selectedRecords = GetSelectedCrsRecords();
 	if (selectedRecords.size() != 1 || selectedRecords[0] == nullptr || mainCanvas == nullptr)
 	{
-		return;
+		return false;
 	}
 
 	const std::string wktUtf8 = ResolveWktForRecord(*selectedRecords[0]);
 	if (wktUtf8.empty())
 	{
 		QMessageBox::warning(this, QStringLiteral("设置坐标系失败"), QStringLiteral("未能生成当前坐标系的 WKT。"));
-		return;
+		return false;
 	}
 
 	mainCanvas->SetCrsWkt(wktUtf8);
-	CloseOwningWindow();
+	if (closeDialogAfterApply)
+	{
+		CloseOwningWindow();
+	}
+
+	return true;
 }
 
 void QCrsManagerWidget::OnAddCustomCrsClicked()
@@ -811,16 +1636,41 @@ void QCrsManagerWidget::OnAddCustomCrsClicked()
 	// TODO: 后续在这里接入“添加自定义坐标系”的编辑对话框。
 }
 
-void QCrsManagerWidget::CloseOwningWindow()
+void QCrsManagerWidget::ShowTableContextMenu(const QPoint& pos)
 {
-	QWidget* ownerWindow = window();
-	if (ownerWindow && ownerWindow != this)
+	const QModelIndex index = crsTableWidget->indexAt(pos);
+	if (!index.isValid())
 	{
-		ownerWindow->close();
 		return;
 	}
 
-	close();
+	QItemSelectionModel* selectionModel = crsTableWidget->selectionModel();
+	if (!selectionModel->isRowSelected(index.row(), QModelIndex()))
+	{
+		selectionModel->clearSelection();
+		selectionModel->select(crsTableWidget->model()->index(index.row(), 0), QItemSelectionModel::Select | QItemSelectionModel::Rows);
+	}
+
+	const std::vector<const CrsRecord*> selectedRecords = GetSelectedCrsRecords();
+	if (selectedRecords.size() != 1 || selectedRecords[0] == nullptr)
+	{
+		return;
+	}
+
+	QMenu menu(this);
+	QAction* applyAction = menu.addAction(style()->standardIcon(QStyle::SP_DialogApplyButton), QStringLiteral("应用到画布"));
+	applyAction->setEnabled(mainCanvas != nullptr);
+	connect(applyAction, &QAction::triggered, this, [this]()
+		{
+			ApplySelectedCrsToCanvas(false);
+		});
+
+	menu.exec(crsTableWidget->viewport()->mapToGlobal(pos));
+}
+
+void QCrsManagerWidget::CloseOwningWindow()
+{
+	accept();
 }
 
 std::vector<const QCrsManagerWidget::CrsRecord*> QCrsManagerWidget::GetSelectedCrsRecords() const
@@ -897,32 +1747,42 @@ std::string QCrsManagerWidget::ResolveWktForRecord(const CrsRecord& record) cons
 	return crs->ExportToWktUtf8(GeoCrs::WktFormat::Wkt2_2018, true);
 }
 
-QString QCrsManagerWidget::BuildDetailText(const CrsRecord& record) const
+QString QCrsManagerWidget::BuildDetailHtml(const CrsRecord& record) const
 {
-	QString text;
-	text += QStringLiteral("名称: ") + ToQString(record.nameUtf8) + QLatin1Char('\n');
-	text += QStringLiteral("类型: ") + ToCategoryText(record.category, record.isCustom) + QLatin1Char('\n');
-	text += QStringLiteral("来源: ") + ToQString(record.sourceUtf8) + QLatin1Char('\n');
-	text += QStringLiteral("代码: ") + ToQString(record.codeUtf8) + QLatin1Char('\n');
-	text += QStringLiteral("参考椭球: ") + ToQString(record.ellipsoidUtf8) + QLatin1Char('\n');
+	QString html;
+	html += QStringLiteral("<html><body style=\"font-family: '%1'; font-size: %2pt;\">")
+		.arg(font().family())
+		.arg(font().pointSize() > 0 ? font().pointSize() : 9);
+
+	html += BuildDetailRowHtmlUtf8(QStringLiteral("名称"), record.nameUtf8);
+	html += BuildDetailRowHtml(QStringLiteral("类型"), ToCategoryText(record.category, record.isCustom));
+	html += BuildDetailRowHtmlUtf8(QStringLiteral("来源"), record.sourceUtf8);
+	html += BuildDetailRowHtmlUtf8(QStringLiteral("代码"), record.codeUtf8);
+	html += BuildDetailRowHtmlUtf8(QStringLiteral("参考椭球"), record.ellipsoidUtf8);
+
 	if (!record.projectionMethodUtf8.empty())
 	{
-		text += QStringLiteral("投影方法: ") + ToQString(record.projectionMethodUtf8) + QLatin1Char('\n');
+		html += BuildDetailRowHtmlUtf8(QStringLiteral("投影方法"), record.projectionMethodUtf8);
 	}
+
 	if (!record.areaNameUtf8.empty())
 	{
-		text += QStringLiteral("适用区域: ") + ToQString(record.areaNameUtf8) + QLatin1Char('\n');
+		html += BuildDetailRowHtmlUtf8(QStringLiteral("适用区域"), record.areaNameUtf8);
 	}
+
 	if (!record.bboxTextUtf8.empty())
 	{
-		text += QStringLiteral("经纬度范围: ") + ToQString(record.bboxTextUtf8) + QLatin1Char('\n');
+		html += BuildDetailRowHtmlUtf8(QStringLiteral("经纬度范围"), record.bboxTextUtf8);
 	}
-	text += QStringLiteral("是否废弃: ") + (record.isDeprecated ? QStringLiteral("是") : QStringLiteral("否")) + QLatin1Char('\n');
-	text += QStringLiteral("唯一标识: ") + ToQString(record.uniqueIdUtf8) + QLatin1Char('\n');
-	text += QLatin1Char('\n');
-	text += QStringLiteral("WKT:") + QLatin1Char('\n');
-	text += ToQString(ResolveWktForRecord(record));
-	return text;
+
+	html += BuildDetailRowHtml(QStringLiteral("是否废弃"), record.isDeprecated ? QStringLiteral("是") : QStringLiteral("否"));
+	html += BuildDetailRowHtmlUtf8(QStringLiteral("唯一标识"), record.uniqueIdUtf8);
+
+	const QString wktHtml = EscapeHtmlUtf8(ResolveWktForRecord(record));
+	html += QStringLiteral("<div style=\"margin-top: 10px;\"><b>WKT：</b></div>");
+	html += QStringLiteral("<pre style=\"margin-top: 4px; white-space: pre; font-family: Consolas, 'Courier New', monospace;\">%1</pre>").arg(wktHtml);
+	html += QStringLiteral("</body></html>");
+	return html;
 }
 
 bool QCrsManagerWidget::DoesRecordPassFilter(const CrsRecord& record, CrsCategory category, const QString& searchText) const

@@ -195,6 +195,7 @@ namespace
 QArcGISRestMainWindow::QArcGISRestMainWindow(QWidget* parent) : QMainWindow(parent)
 {
 	InitializeUi();
+	QCrsManagerWidget::InitializeSystemCrsRecordsAsync();
 
 	LayerRefresher* refresher = LayerRefresher::GetInstance();
 	if (refresher)
@@ -458,10 +459,9 @@ void QArcGISRestMainWindow::OnLongitudeLatitudeCheckBoxStateChanged(int checkSta
 
 void QArcGISRestMainWindow::OnCrsStatusButtonClicked()
 {
-
-
-
-
+	QCrsManagerWidget crsManagerWidget(this);
+	crsManagerWidget.BindMainCanvas(mainCanvas);
+	crsManagerWidget.exec();
 }
 
 void QArcGISRestMainWindow::OnCrsValidAreaVisibleButtonToggled(bool checked)
