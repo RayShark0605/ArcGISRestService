@@ -67,6 +67,32 @@ namespace
         GeoBoundingBox selfArea;
     };
 
+    std::string SafeCString(const char* text)
+    {
+        return text ? std::string(text) : std::string();
+    }
+
+    GeoCrsDatabaseType ToGeoCrsDatabaseType(OSRCRSType type)
+    {
+        switch (type)
+        {
+        case OSR_CRS_TYPE_GEOGRAPHIC_2D:
+        case OSR_CRS_TYPE_GEOGRAPHIC_3D:
+            return GeoCrsDatabaseType::Geographic;
+        case OSR_CRS_TYPE_PROJECTED:
+            return GeoCrsDatabaseType::Projected;
+        case OSR_CRS_TYPE_GEOCENTRIC:
+            return GeoCrsDatabaseType::Geocentric;
+        case OSR_CRS_TYPE_VERTICAL:
+            return GeoCrsDatabaseType::Vertical;
+        case OSR_CRS_TYPE_COMPOUND:
+            return GeoCrsDatabaseType::Compound;
+        case OSR_CRS_TYPE_OTHER:
+        default:
+            return GeoCrsDatabaseType::Other;
+        }
+    }
+
     // -------------------- 全局状态与缓存 --------------------
 
     std::atomic_bool g_isInitialized(false);
@@ -722,6 +748,10 @@ namespace
         {
             return 0;
         }
+
+#ifdef max
+#undef max
+#endif
         if (value <= 0 || value > static_cast<long long>(std::numeric_limits<int>::max()))
         {
             return 0;
@@ -731,6 +761,65 @@ namespace
 
     }
 } // namespace
+
+std::string GeoCrsDatabaseRecord::GetAuthorityCodeUtf8() const
+{
+    if (sourceUtf8.empty() || codeUtf8.empty())
+    {
+        return "";
+    }
+
+    return sourceUtf8 + ":" + codeUtf8;
+}
+
+std::vector<GeoCrsDatabaseRecord> GeoCrsManager::ListDatabaseCrsRecords(const std::string& authorityNameUtf8)
+{
+    EnsureInitializedInternal();
+
+    std::vector<GeoCrsDatabaseRecord> records;
+    const std::string trimmedAuthorityName = GB_Utf8Trim(authorityNameUtf8);
+
+    int resultCount = 0;
+    OSRCRSInfo** crsInfoList = OSRGetCRSInfoListFromDatabase(trimmedAuthorityName.empty() ? nullptr : trimmedAuthorityName.c_str(), nullptr, &resultCount);
+    if (crsInfoList == nullptr)
+    {
+        return records;
+    }
+    if (resultCount <= 0)
+    {
+        OSRDestroyCRSInfoList(crsInfoList);
+        return records;
+    }
+
+    records.reserve(static_cast<size_t>(resultCount));
+    for (int i = 0; i < resultCount; i++)
+    {
+        const OSRCRSInfo* crsInfo = crsInfoList[i];
+        if (crsInfo == nullptr)
+        {
+            continue;
+        }
+
+        GeoCrsDatabaseRecord record;
+        record.sourceUtf8 = SafeCString(crsInfo->pszAuthName);
+        record.codeUtf8 = SafeCString(crsInfo->pszCode);
+        record.nameUtf8 = SafeCString(crsInfo->pszName);
+        record.type = ToGeoCrsDatabaseType(crsInfo->eType);
+        record.isDeprecated = crsInfo->bDeprecated != 0;
+        record.hasLonLatBbox = crsInfo->bBboxValid != 0;
+        record.westLongitudeDeg = crsInfo->dfWestLongitudeDeg;
+        record.southLatitudeDeg = crsInfo->dfSouthLatitudeDeg;
+        record.eastLongitudeDeg = crsInfo->dfEastLongitudeDeg;
+        record.northLatitudeDeg = crsInfo->dfNorthLatitudeDeg;
+        record.areaNameUtf8 = SafeCString(crsInfo->pszAreaName);
+        record.projectionMethodUtf8 = SafeCString(crsInfo->pszProjectionMethod);
+
+        records.push_back(std::move(record));
+    }
+
+    OSRDestroyCRSInfoList(crsInfoList);
+    return records;
+}
 
 bool GeoCrsManager::IsInitialized()
 {

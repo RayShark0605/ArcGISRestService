@@ -133,6 +133,7 @@
     <ClCompile Include="LayerRefresher.cpp" />
     <ClCompile Include="QArcGISRestConnectionDialog.cpp" />
     <ClCompile Include="QArcGISRestMainWindow.cpp" />
+    <ClCompile Include="QCrsManagerWidget.cpp" />
     <ClCompile Include="QLayerManagerPanel.cpp" />
     <ClCompile Include="QMainCanvas.cpp" />
     <ClCompile Include="QServiceBrowserPanel.cpp" />
@@ -140,6 +141,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="DataDef.h" />
+    <QtMoc Include="QCrsManagerWidget.h" />
     <ClInclude Include="TileImageCache.h" />
     <QtMoc Include="QLayerManagerPanel.h" />
     <QtMoc Include="LayerRefresher.h" />

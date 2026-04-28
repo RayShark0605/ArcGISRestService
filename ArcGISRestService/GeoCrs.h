@@ -2,6 +2,7 @@
 #define GEO_CRS_H
 
 #include "ArcGISRestServicePort.h"
+#include "GeoBase/Geometry/GB_Point2d.h"
 
 #include <cstdint>
 #include <memory>
@@ -11,7 +12,6 @@
 
 class GeoBoundingBox;
 class OGRSpatialReference;
-class GB_Point2d;
 class GB_Rectangle;
 
 struct GeoCrsOgrSrsDeleter
@@ -70,6 +70,12 @@ public:
     bool IsValid() const;
 
     std::string GetNameUtf8() const;
+
+    // 获取当前坐标系使用的参考椭球名称。
+    // - 对 WKT2 坐标系，优先读取 ELLIPSOID 节点；
+    // - 对 WKT1 坐标系，退化读取 SPHEROID 节点；
+    // - 若坐标系为空或节点不存在，返回空字符串。
+    std::string GetReferenceEllipsoidNameUtf8() const;
 
     bool IsGeographic() const;
 
@@ -135,8 +141,18 @@ public:
     // 返回的每段范围均满足 west <= east，单位为度，且使用 EPSG:4326 的经度/纬度含义。
     std::vector<LonLatAreaSegment> GetValidAreaLonLatSegments() const;
 
-    // 获取坐标系在它本身下的范围
+    // 获取坐标系在它本身下的范围。
+    // 注意：本函数返回的是该范围的轴对齐包络矩形；若需要跨日期变更线分段、非矩形边界等更精确表达，
+    // 请使用 GetValidAreaPolygons()。
     GeoBoundingBox GetValidArea() const;
+
+    // 获取坐标系在它本身下的有效范围多边形。
+    // - 返回值：外层 vector 表示多个分段区域；内层 vector 表示单个闭合多边形环。
+    // - 坐标单位与轴顺序遵循当前 GeoCrs 对象本身：默认使用传统 GIS 顺序 (X=经度/Easting, Y=纬度/Northing)；
+    //   当 SetTraditionalGisAxisOrder(false) 后，会尽量遵循 CRS 权威轴序。
+    // - edgeSampleCount 表示每条经纬度边界边的采样点数量，最小会夹取为 2；值越大，投影后曲线边界越精细。
+    // - 当底层 CRS 缺少 area of use 或坐标变换失败到无法形成有效多边形时，返回空数组。
+    std::vector<std::vector<GB_Point2d>> GetValidAreaPolygons(int edgeSampleCount = 129) const;
 
     // 获取坐标系的经纬度范围（EPSG:4326）。
     // 注意：GeoBoundingBox 只能表示一个矩形。当 CRS 的有效范围跨越日期变更线时，
@@ -178,6 +194,8 @@ private:
     GeoBoundingBox GetValidAreaLonLatNoLock() const;
 
     GeoBoundingBox GetValidAreaNoLock() const;
+
+    std::vector<std::vector<GB_Point2d>> GetValidAreaPolygonsNoLock(int edgeSampleCount) const;
 
 private:
     std::unique_ptr<OGRSpatialReference, GeoCrsOgrSrsDeleter> spatialReference;

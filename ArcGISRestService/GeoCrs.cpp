@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace
@@ -203,6 +204,198 @@ namespace
 				latitudes.push_back(lat);
 			}
 		}
+	}
+
+	static int NormalizeValidAreaPolygonEdgeSampleCount(int edgeSampleCount)
+	{
+		if (edgeSampleCount < 2)
+		{
+			return 2;
+		}
+
+		// 防止外部误传过大的采样密度导致一次性构造过多点。
+		const int maxEdgeSampleCount = 2049;
+		return std::min(edgeSampleCount, maxEdgeSampleCount);
+	}
+
+	static bool IsValidLonLatAreaSegment(const GeoCrs::LonLatAreaSegment& segment)
+	{
+		if (!IsFinite(segment.west) || !IsFinite(segment.south) || !IsFinite(segment.east) || !IsFinite(segment.north))
+		{
+			return false;
+		}
+
+		return segment.west < segment.east && segment.south < segment.north;
+	}
+
+	static void AppendLonLatBoundarySamples(
+		double west,
+		double south,
+		double east,
+		double north,
+		int edgeSampleCount,
+		std::vector<double>& longitudes,
+		std::vector<double>& latitudes)
+	{
+		const int count = NormalizeValidAreaPolygonEdgeSampleCount(edgeSampleCount);
+		longitudes.reserve(longitudes.size() + static_cast<size_t>(4 * count + 1));
+		latitudes.reserve(latitudes.size() + static_cast<size_t>(4 * count + 1));
+
+		// 按逆时针方向采样：左下 -> 右下 -> 右上 -> 左上 -> 左下。
+		for (int xIndex = 0; xIndex < count; xIndex++)
+		{
+			const double t = (count <= 1) ? 0.0 : static_cast<double>(xIndex) / static_cast<double>(count - 1);
+			longitudes.push_back(west + (east - west) * t);
+			latitudes.push_back(south);
+		}
+
+		for (int yIndex = 1; yIndex < count; yIndex++)
+		{
+			const double t = (count <= 1) ? 0.0 : static_cast<double>(yIndex) / static_cast<double>(count - 1);
+			longitudes.push_back(east);
+			latitudes.push_back(south + (north - south) * t);
+		}
+
+		for (int xIndex = count - 2; xIndex >= 0; xIndex--)
+		{
+			const double t = (count <= 1) ? 0.0 : static_cast<double>(xIndex) / static_cast<double>(count - 1);
+			longitudes.push_back(west + (east - west) * t);
+			latitudes.push_back(north);
+		}
+
+		for (int yIndex = count - 2; yIndex >= 1; yIndex--)
+		{
+			const double t = (count <= 1) ? 0.0 : static_cast<double>(yIndex) / static_cast<double>(count - 1);
+			longitudes.push_back(west);
+			latitudes.push_back(south + (north - south) * t);
+		}
+
+		// 显式闭合，避免调用方误把返回值当成开环折线。
+		longitudes.push_back(west);
+		latitudes.push_back(south);
+	}
+
+	static bool IsNearlySamePoint(const GB_Point2d& left, const GB_Point2d& right, double tolerance = 1e-10)
+	{
+		if (!left.IsValid() || !right.IsValid())
+		{
+			return false;
+		}
+
+		return std::fabs(left.x - right.x) <= tolerance && std::fabs(left.y - right.y) <= tolerance;
+	}
+
+	static void AppendDistinctPoint(std::vector<GB_Point2d>& points, const GB_Point2d& point)
+	{
+		if (!point.IsValid())
+		{
+			return;
+		}
+
+		if (!points.empty() && IsNearlySamePoint(points.back(), point))
+		{
+			return;
+		}
+
+		points.push_back(point);
+	}
+
+	static bool FinalizeClosedPolygon(std::vector<GB_Point2d>& polygon)
+	{
+		while (polygon.size() > 1 && IsNearlySamePoint(polygon[polygon.size() - 2], polygon.back()))
+		{
+			polygon.pop_back();
+		}
+
+		if (polygon.size() < 3)
+		{
+			polygon.clear();
+			return false;
+		}
+
+		if (!IsNearlySamePoint(polygon.front(), polygon.back()))
+		{
+			polygon.push_back(polygon.front());
+		}
+
+		if (polygon.size() < 4)
+		{
+			polygon.clear();
+			return false;
+		}
+
+		double minX = std::numeric_limits<double>::infinity();
+		double minY = std::numeric_limits<double>::infinity();
+		double maxX = -std::numeric_limits<double>::infinity();
+		double maxY = -std::numeric_limits<double>::infinity();
+
+		for (const GB_Point2d& point : polygon)
+		{
+			if (!point.IsValid())
+			{
+				polygon.clear();
+				return false;
+			}
+
+			minX = std::min(minX, point.x);
+			minY = std::min(minY, point.y);
+			maxX = std::max(maxX, point.x);
+			maxY = std::max(maxY, point.y);
+		}
+
+		if (!(maxX > minX) || !(maxY > minY))
+		{
+			polygon.clear();
+			return false;
+		}
+
+		return true;
+	}
+
+	static bool TryTransformLonLatBoundaryToSelfPolygon(
+		OGRCoordinateTransformation& transform,
+		const std::vector<double>& sourceLongitudes,
+		const std::vector<double>& sourceLatitudes,
+		std::vector<GB_Point2d>& outPolygon)
+	{
+		outPolygon.clear();
+
+		const size_t numPoints = sourceLongitudes.size();
+		if (numPoints == 0 || numPoints != sourceLatitudes.size() || numPoints > static_cast<size_t>(std::numeric_limits<int>::max()))
+		{
+			return false;
+		}
+
+		std::vector<double> xValues = sourceLongitudes;
+		std::vector<double> yValues = sourceLatitudes;
+		std::vector<int> successFlags(numPoints, FALSE);
+
+		const int overallOk = transform.Transform(static_cast<int>(numPoints), xValues.data(), yValues.data(), nullptr, successFlags.data());
+		bool allPointsOk = (overallOk != FALSE);
+
+		outPolygon.reserve(numPoints);
+		for (size_t i = 0; i < numPoints; i++)
+		{
+			if (successFlags[i] == FALSE || !IsFinite(xValues[i]) || !IsFinite(yValues[i]))
+			{
+				allPointsOk = false;
+				continue;
+			}
+
+			AppendDistinctPoint(outPolygon, GB_Point2d(xValues[i], yValues[i]));
+		}
+
+		if (!FinalizeClosedPolygon(outPolygon))
+		{
+			return false;
+		}
+
+		if (!allPointsOk)
+		{
+			GBLOG_WARNING(GB_STR("【GeoCrs::GetValidAreaPolygons】部分边界点转换失败，已使用成功点构造多边形。"));
+		}
+
+		return true;
 	}
 
 	static inline GeoBoundingBox MakeInvalidGeoBoundingBox()
@@ -858,6 +1051,75 @@ GeoBoundingBox GeoCrs::GetValidAreaNoLock() const
 
 	return result;
 }
+std::vector<std::vector<GB_Point2d>> GeoCrs::GetValidAreaPolygonsNoLock(int edgeSampleCount) const
+{
+	std::vector<std::vector<GB_Point2d>> result;
+
+	if (IsEmptyNoLock())
+	{
+		GBLOG_WARNING(GB_STR("【GeoCrs::GetValidAreaPolygons】对象为空。"));
+		return result;
+	}
+
+	const std::vector<LonLatAreaSegment> lonLatSegments = GetValidAreaLonLatSegmentsNoLock();
+	if (lonLatSegments.empty())
+	{
+		GBLOG_WARNING(GB_STR("【GeoCrs::GetValidAreaPolygons】lonLatSegments为空。"));
+		return result;
+	}
+
+	OGRSpatialReference sourceSrs;
+	if (sourceSrs.importFromEPSG(4326) != OGRERR_NONE)
+	{
+		GBLOG_WARNING(GB_STR("【GeoCrs::GetValidAreaPolygons】WGS 84 坐标系导入失败。"));
+		return result;
+	}
+	EnsureTraditionalGisAxisOrder(sourceSrs);
+
+	std::unique_ptr<OGRSpatialReference, GeoCrsOgrSrsDeleter> targetSrs(spatialReference->Clone());
+	if (!targetSrs)
+	{
+		GBLOG_WARNING(GB_STR("【GeoCrs::GetValidAreaPolygons】坐标系克隆失败。"));
+		return result;
+	}
+
+	// 输出坐标应与当前 GeoCrs 对象的轴顺序一致：默认传统 GIS 顺序；关闭后遵循权威轴序。
+	ApplyAxisOrderStrategy(*targetSrs, useTraditionalGisAxisOrder);
+
+	CoordinateTransformationPtr transform(OGRCreateCoordinateTransformation(&sourceSrs, targetSrs.get()));
+	if (transform == nullptr)
+	{
+		GBLOG_WARNING(GB_STR("【GeoCrs::GetValidAreaPolygons】OGRCreateCoordinateTransformation 失败。"));
+		return result;
+	}
+
+	const int normalizedEdgeSampleCount = NormalizeValidAreaPolygonEdgeSampleCount(edgeSampleCount);
+	result.reserve(lonLatSegments.size());
+
+	for (const LonLatAreaSegment& segment : lonLatSegments)
+	{
+		if (!IsValidLonLatAreaSegment(segment))
+		{
+			GBLOG_WARNING(GB_STR("【GeoCrs::GetValidAreaPolygons】跳过无效经纬度分段。"));
+			continue;
+		}
+
+		std::vector<double> longitudes;
+		std::vector<double> latitudes;
+		AppendLonLatBoundarySamples(segment.west, segment.south, segment.east, segment.north, normalizedEdgeSampleCount, longitudes, latitudes);
+
+		std::vector<GB_Point2d> polygon;
+		if (!TryTransformLonLatBoundaryToSelfPolygon(*transform, longitudes, latitudes, polygon))
+		{
+			GBLOG_WARNING(GB_STR("【GeoCrs::GetValidAreaPolygons】经纬度边界转换失败或无法形成有效多边形。"));
+			continue;
+		}
+
+		result.push_back(std::move(polygon));
+	}
+
+	return result;
+}
 
 
 GeoCrs::~GeoCrs() = default;
@@ -1171,6 +1433,25 @@ std::string GeoCrs::GetNameUtf8() const
 
 	const char* name = spatialReference->GetName();
 	return name ? std::string(name) : std::string();
+}
+
+
+std::string GeoCrs::GetReferenceEllipsoidNameUtf8() const
+{
+	std::lock_guard<std::recursive_mutex> lock(mutex);
+	if (IsEmptyNoLock())
+	{
+		GBLOG_WARNING(GB_STR("【GeoCrs::GetReferenceEllipsoidNameUtf8】变量为空。"));
+		return "";
+	}
+
+	const char* ellipsoidName = spatialReference->GetAttrValue("ELLIPSOID", 0);
+	if (ellipsoidName == nullptr || ellipsoidName[0] == '\0')
+	{
+		ellipsoidName = spatialReference->GetAttrValue("SPHEROID", 0);
+	}
+
+	return ellipsoidName ? std::string(ellipsoidName) : std::string();
 }
 
 
@@ -1528,6 +1809,13 @@ GeoBoundingBox GeoCrs::GetValidArea() const
 	std::lock_guard<std::recursive_mutex> lock(mutex);
 	return GetValidAreaNoLock();
 }
+
+std::vector<std::vector<GB_Point2d>> GeoCrs::GetValidAreaPolygons(int edgeSampleCount) const
+{
+	std::lock_guard<std::recursive_mutex> lock(mutex);
+	return GetValidAreaPolygonsNoLock(edgeSampleCount);
+}
+
 
 GeoBoundingBox GeoCrs::GetValidAreaLonLat() const
 {

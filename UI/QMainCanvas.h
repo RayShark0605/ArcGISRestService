@@ -15,8 +15,10 @@
 #include "DataDef.h"
 #include "GeoBase/Geometry/GB_Point2d.h"
 #include "GeoBase/Geometry/GB_Rectangle.h"
+#include "GeoBase/CV/GB_ColorRGBA.h"
 
 Q_DECLARE_METATYPE(GB_Rectangle)
+Q_DECLARE_METATYPE(GB_Point2d)
 class QDragEnterEvent;
 class QDragMoveEvent;
 class QDropEvent;
@@ -41,12 +43,18 @@ public:
 	static double GetDefaultLayerNumber();
 	static double GetTopLayerNumber();
 	static double GetBottomLayerNumber();
+	static const std::string& GetCrsValidAreaDrawableUid();
 
 	void SetCrsWkt(const std::string& wktUtf8);
 	const std::string& GetCrsWkt() const;
+	QString GetCrsDisplayText() const;
 
 	void SetClipMapTilesToCrsValidArea(bool enabled);
 	bool IsClipMapTilesToCrsValidAreaEnabled() const;
+
+	void SetCrsValidAreaVisible(bool visible, const GB_ColorRGBA& color = GB_ColorRGBA(255, 0, 0, 80));
+	void HideCrsValidArea();
+	bool GetCrsValidAreaVisible(GB_ColorRGBA& outColor) const;
 
 	void SetViewCenter(double centerX, double centerY);
 	void SetViewCenter(const GB_Point2d& center);
@@ -63,6 +71,7 @@ public:
 
 	GB_Point2d WorldToScreen(const GB_Point2d& point) const;
 	GB_Point2d ScreenToWorld(const GB_Point2d& point) const;
+	bool TryGetCurrentMouseWorldPosition(GB_Point2d& outPosition) const;
 
 	void AddMapTile(const MapTile& tile);
 	void AddMapTile(const MapTile& tile, double layerNumber);
@@ -76,6 +85,9 @@ public:
 
 signals:
 	void ViewStateChanged(const GB_Rectangle& extent, double approximateMetersPerPixel);
+	void ViewExtentDisplayChanged(const GB_Rectangle& extent);
+	void MousePositionChanged(const GB_Point2d& position, bool hasPosition);
+	void CrsDisplayTextChanged(const QString& crsDisplayText);
 	void LayerDropRequested(const QString& nodeUid, const QString& url, const QString& text, int nodeType);
 
 protected:
@@ -84,7 +96,6 @@ protected:
 	virtual void mousePressEvent(QMouseEvent* event) override;
 	virtual void mouseMoveEvent(QMouseEvent* event) override;
 	virtual void mouseReleaseEvent(QMouseEvent* event) override;
-	virtual void mouseDoubleClickEvent(QMouseEvent* event) override;
 	virtual void wheelEvent(QWheelEvent* event) override;
 	virtual void leaveEvent(QEvent* event) override;
 	virtual void dragEnterEvent(QDragEnterEvent* event) override;
@@ -104,6 +115,12 @@ private:
 	GB_Rectangle viewExtent;
 	double pixelSize = 1;
 	bool clipMapTilesToCrsValidArea = false;
+	bool crsValidAreaVisible = false;
+	GB_ColorRGBA crsValidAreaColor = GB_ColorRGBA(255, 0, 0, 80);
+
+	mutable std::vector<std::vector<GB_Point2d>> crsValidAreaPolygonsCache;
+	mutable bool crsValidAreaPolygonsCacheDirty = true;
+	mutable std::string crsValidAreaPolygonsCacheCrsWkt;
 
 	std::vector<CachedMapTile> mapTiles;
 	std::uint64_t nextDrawableInsertionSequence = 0;
@@ -120,6 +137,8 @@ private:
 	mutable double mapContentCachePixelSize = 0.0;
 	mutable bool mapContentCacheClipMapTilesToCrsValidArea = false;
 	mutable std::string mapContentCacheCrsWkt;
+	mutable bool mapContentCacheCrsValidAreaVisible = false;
+	mutable GB_ColorRGBA mapContentCacheCrsValidAreaColor = GB_ColorRGBA(255, 0, 0, 80);
 
 	QPixmap panPreviewPixmap;
 	bool hasPanPreview = false;
@@ -141,15 +160,17 @@ private:
 	void DrawBackground(QPainter& painter) const;
 	void DrawMapTiles(QPainter& painter, const QRectF& exposedRect) const;
 	void DrawCoordinateAxes(QPainter& painter) const;
+	void DrawCrsValidArea(QPainter& painter) const;
 	void DrawMapContent(QPainter& painter, const QRectF& exposedRect) const;
 	void EnsureMapContentCache() const;
 	void InvalidateMapContentCache() const;
 	bool IsMapContentCacheValid() const;
 	//void DrawVectorDrawables(QPainter& painter) const;
 	//void DrawExtentMarkers(QPainter& painter) const;
-	void DrawOverlay(QPainter& painter) const;
 	void UpdateCrsDisplayText();
 	bool TryGetCrsValidArea(GB_Rectangle& outValidArea) const;
+	bool EnsureCrsValidAreaPolygonsCache() const;
+	void InvalidateCrsValidAreaPolygonsCache() const;
 
 	bool IsDrawableUidInSet(const std::vector<std::string>& drawablesUids, const std::string& uid) const;
 	GB_Rectangle CalculateAllDrawableExtent() const;
@@ -165,6 +186,10 @@ private:
 	GB_Rectangle NormalizeExtentForCurrentWidget(const GB_Rectangle& extent) const;
 	GB_Rectangle EnsureUsableExtent(const GB_Rectangle& extent) const;
 	void ScheduleViewStateChanged();
+	void EmitViewExtentDisplayChangedIfNeeded(const GB_Rectangle& previousExtent);
+	bool SetMousePosition(const QPoint& position);
+	bool ClearMousePosition();
+	void EmitMousePositionChanged();
 	void ScheduleViewStateChangedWithDelay(int debounceIntervalMs);
 	void ScheduleWheelZoomViewStateChanged();
 	void FlushPendingViewStateChanged();

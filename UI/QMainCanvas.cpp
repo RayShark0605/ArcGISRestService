@@ -44,10 +44,189 @@ namespace
 	constexpr double BottomLayerNumberValue = static_cast<double>(GB_IntMax / 2);
 	constexpr int ViewStateChangedDebounceIntervalMs = 180;
 	constexpr int WheelZoomEndDetectionIntervalMs = 300;
+	constexpr int CrsValidAreaPolygonEdgeSampleCount = 129;
+	const std::string CrsValidAreaDrawableUid = "__QMainCanvas_CrsValidArea__";
 
 	QColor ToQColor(const GB_ColorRGBA& color)
 	{
 		return QColor(static_cast<int>(color.r), static_cast<int>(color.g), static_cast<int>(color.b), static_cast<int>(color.a));
+	}
+
+	bool IsPointFinite(const GB_Point2d& point)
+	{
+		return std::isfinite(point.x) && std::isfinite(point.y);
+	}
+
+	enum class ClipBoundary
+	{
+		Left,
+		Right,
+		Bottom,
+		Top
+	};
+
+	bool IsPointInsideClipBoundary(const GB_Point2d& point, const GB_Rectangle& clipRect, ClipBoundary boundary)
+	{
+		switch (boundary)
+		{
+		case ClipBoundary::Left:
+			return point.x >= clipRect.minX - GB_Epsilon;
+		case ClipBoundary::Right:
+			return point.x <= clipRect.maxX + GB_Epsilon;
+		case ClipBoundary::Bottom:
+			return point.y >= clipRect.minY - GB_Epsilon;
+		case ClipBoundary::Top:
+			return point.y <= clipRect.maxY + GB_Epsilon;
+		default:
+			return false;
+		}
+	}
+
+	bool TryGetClipBoundaryIntersection(const GB_Point2d& startPoint, const GB_Point2d& endPoint, const GB_Rectangle& clipRect, ClipBoundary boundary, GB_Point2d& outPoint)
+	{
+		outPoint = GB_Point2d(std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN());
+
+		const double deltaX = endPoint.x - startPoint.x;
+		const double deltaY = endPoint.y - startPoint.y;
+		double t = std::numeric_limits<double>::quiet_NaN();
+
+		switch (boundary)
+		{
+		case ClipBoundary::Left:
+			if (std::abs(deltaX) <= GB_Epsilon)
+			{
+				return false;
+			}
+			t = (clipRect.minX - startPoint.x) / deltaX;
+			outPoint.Set(clipRect.minX, startPoint.y + deltaY * t);
+			break;
+		case ClipBoundary::Right:
+			if (std::abs(deltaX) <= GB_Epsilon)
+			{
+				return false;
+			}
+			t = (clipRect.maxX - startPoint.x) / deltaX;
+			outPoint.Set(clipRect.maxX, startPoint.y + deltaY * t);
+			break;
+		case ClipBoundary::Bottom:
+			if (std::abs(deltaY) <= GB_Epsilon)
+			{
+				return false;
+			}
+			t = (clipRect.minY - startPoint.y) / deltaY;
+			outPoint.Set(startPoint.x + deltaX * t, clipRect.minY);
+			break;
+		case ClipBoundary::Top:
+			if (std::abs(deltaY) <= GB_Epsilon)
+			{
+				return false;
+			}
+			t = (clipRect.maxY - startPoint.y) / deltaY;
+			outPoint.Set(startPoint.x + deltaX * t, clipRect.maxY);
+			break;
+		default:
+			return false;
+		}
+
+		return t >= -GB_Epsilon && t <= 1.0 + GB_Epsilon && IsPointFinite(outPoint);
+	}
+
+	void AppendPointIfUseful(std::vector<GB_Point2d>& points, const GB_Point2d& point)
+	{
+		if (!IsPointFinite(point))
+		{
+			return;
+		}
+
+		if (!points.empty() && points.back().IsNearEqual(point, GB_Epsilon))
+		{
+			return;
+		}
+
+		points.push_back(point);
+	}
+
+	std::vector<GB_Point2d> ClipPolygonByBoundary(const std::vector<GB_Point2d>& sourcePolygon, const GB_Rectangle& clipRect, ClipBoundary boundary)
+	{
+		std::vector<GB_Point2d> result;
+		if (sourcePolygon.empty())
+		{
+			return result;
+		}
+
+		result.reserve(sourcePolygon.size() + 4);
+		GB_Point2d previousPoint = sourcePolygon.back();
+		bool previousInside = IsPointInsideClipBoundary(previousPoint, clipRect, boundary);
+
+		for (const GB_Point2d& currentPoint : sourcePolygon)
+		{
+			const bool currentInside = IsPointInsideClipBoundary(currentPoint, clipRect, boundary);
+			if (currentInside != previousInside)
+			{
+				GB_Point2d intersectionPoint;
+				if (TryGetClipBoundaryIntersection(previousPoint, currentPoint, clipRect, boundary, intersectionPoint))
+				{
+					AppendPointIfUseful(result, intersectionPoint);
+				}
+			}
+
+			if (currentInside)
+			{
+				AppendPointIfUseful(result, currentPoint);
+			}
+
+			previousPoint = currentPoint;
+			previousInside = currentInside;
+		}
+
+		if (result.size() > 1 && result.front().IsNearEqual(result.back(), GB_Epsilon))
+		{
+			result.pop_back();
+		}
+
+		return result;
+	}
+
+	std::vector<GB_Point2d> ClipPolygonToRectangle(const std::vector<GB_Point2d>& sourcePolygon, const GB_Rectangle& clipRect)
+	{
+		std::vector<GB_Point2d> workingPolygon;
+		workingPolygon.reserve(sourcePolygon.size());
+		for (const GB_Point2d& point : sourcePolygon)
+		{
+			if (!IsPointFinite(point))
+			{
+				return std::vector<GB_Point2d>();
+			}
+
+			AppendPointIfUseful(workingPolygon, point);
+		}
+
+		if (workingPolygon.size() > 1 && workingPolygon.front().IsNearEqual(workingPolygon.back(), GB_Epsilon))
+		{
+			workingPolygon.pop_back();
+		}
+
+		if (workingPolygon.size() < 3)
+		{
+			return std::vector<GB_Point2d>();
+		}
+
+		workingPolygon = ClipPolygonByBoundary(workingPolygon, clipRect, ClipBoundary::Left);
+		workingPolygon = ClipPolygonByBoundary(workingPolygon, clipRect, ClipBoundary::Right);
+		workingPolygon = ClipPolygonByBoundary(workingPolygon, clipRect, ClipBoundary::Bottom);
+		workingPolygon = ClipPolygonByBoundary(workingPolygon, clipRect, ClipBoundary::Top);
+
+		if (workingPolygon.size() > 1 && workingPolygon.front().IsNearEqual(workingPolygon.back(), GB_Epsilon))
+		{
+			workingPolygon.pop_back();
+		}
+
+		if (workingPolygon.size() < 3)
+		{
+			return std::vector<GB_Point2d>();
+		}
+
+		return workingPolygon;
 	}
 
 	bool IsFinitePositive(double value)
@@ -89,20 +268,6 @@ namespace
 			AreNearlyEqual(firstRect.maxY, secondRect.maxY);
 	}
 
-	QString FormatCoordinate(double value)
-	{
-		if (!std::isfinite(value))
-		{
-			return QStringLiteral("-");
-		}
-
-		if (std::abs(value) < 0.00005)
-		{
-			value = 0.0;
-		}
-
-		return QString::number(value, 'f', 4);
-	}
 
 	int SafeWidgetWidth(const QWidget* widget)
 	{
@@ -172,6 +337,7 @@ namespace
 QMainCanvas::QMainCanvas(QWidget* parent) : QWidget(parent)
 {
 	qRegisterMetaType<GB_Rectangle>("GB_Rectangle");
+	qRegisterMetaType<GB_Point2d>("GB_Point2d");
 
 	setMinimumSize(400, 300);
 	setMouseTracking(true);
@@ -217,6 +383,11 @@ double QMainCanvas::GetBottomLayerNumber()
 	return BottomLayerNumberValue;
 }
 
+const std::string& QMainCanvas::GetCrsValidAreaDrawableUid()
+{
+	return CrsValidAreaDrawableUid;
+}
+
 void QMainCanvas::SetCrsWkt(const std::string& wktUtf8)
 {
 	if (crsWkt == wktUtf8)
@@ -226,7 +397,11 @@ void QMainCanvas::SetCrsWkt(const std::string& wktUtf8)
 
 	crsWkt = wktUtf8;
 	UpdateCrsDisplayText();
+	InvalidateCrsValidAreaPolygonsCache();
 	InvalidateMapContentCache();
+	hasPanPreview = false;
+	panPreviewPixmap = QPixmap();
+	EmitMousePositionChanged();
 	EmitViewStateChanged();
 	update();
 }
@@ -234,6 +409,11 @@ void QMainCanvas::SetCrsWkt(const std::string& wktUtf8)
 const std::string& QMainCanvas::GetCrsWkt() const
 {
 	return crsWkt;
+}
+
+QString QMainCanvas::GetCrsDisplayText() const
+{
+	return crsDisplayText;
 }
 
 void QMainCanvas::SetClipMapTilesToCrsValidArea(bool enabled)
@@ -253,22 +433,63 @@ bool QMainCanvas::IsClipMapTilesToCrsValidAreaEnabled() const
 	return clipMapTilesToCrsValidArea;
 }
 
+void QMainCanvas::SetCrsValidAreaVisible(bool visible, const GB_ColorRGBA& color)
+{
+	GB_ColorRGBA targetColor = crsValidAreaColor;
+	if (visible)
+	{
+		targetColor = color;
+	}
+
+	if (crsValidAreaVisible == visible && crsValidAreaColor == targetColor)
+	{
+		return;
+	}
+
+	crsValidAreaVisible = visible;
+	crsValidAreaColor = targetColor;
+	hasPanPreview = false;
+	panPreviewPixmap = QPixmap();
+	InvalidateMapContentCache();
+	update();
+}
+
+void QMainCanvas::HideCrsValidArea()
+{
+	SetCrsValidAreaVisible(false, crsValidAreaColor);
+}
+
+bool QMainCanvas::GetCrsValidAreaVisible(GB_ColorRGBA& outColor) const
+{
+	outColor = crsValidAreaColor;
+	return crsValidAreaVisible;
+}
+
 void QMainCanvas::UpdateCrsDisplayText()
 {
+	const QString previousCrsDisplayText = crsDisplayText;
+
 	if (crsWkt.empty())
 	{
 		crsDisplayText = QStringLiteral("未设置");
-		return;
 	}
-
-	const std::string epsgStringUtf8 = GeoCrsManager::WktToEpsgCodeUtf8(crsWkt);
-	if (!epsgStringUtf8.empty())
+	else
 	{
-		crsDisplayText = QString::fromUtf8(epsgStringUtf8.c_str());
-		return;
+		const std::string epsgStringUtf8 = GeoCrsManager::WktToEpsgCodeUtf8(crsWkt);
+		if (!epsgStringUtf8.empty())
+		{
+			crsDisplayText = QString::fromUtf8(epsgStringUtf8.c_str());
+		}
+		else
+		{
+			crsDisplayText = QStringLiteral("自定义坐标系");
+		}
 	}
 
-	crsDisplayText = QStringLiteral("自定义坐标系");
+	if (crsDisplayText != previousCrsDisplayText)
+	{
+		emit CrsDisplayTextChanged(crsDisplayText);
+	}
 }
 
 void QMainCanvas::SetViewCenter(double centerX, double centerY)
@@ -283,8 +504,11 @@ void QMainCanvas::SetViewCenter(const GB_Point2d& center)
 		return;
 	}
 
+	const GB_Rectangle previousExtent = viewExtent;
 	UpdateViewExtentFromCenterAndPixelSize(center);
 	InvalidateMapContentCache();
+	EmitViewExtentDisplayChangedIfNeeded(previousExtent);
+	EmitMousePositionChanged();
 	EmitViewStateChanged();
 	update();
 }
@@ -406,6 +630,18 @@ GB_Point2d QMainCanvas::ScreenToWorld(const GB_Point2d& point) const
 	const double worldX = viewExtent.minX + point.x * pixelSize;
 	const double worldY = viewExtent.maxY - point.y * pixelSize;
 	return GB_Point2d(worldX, worldY);
+}
+
+bool QMainCanvas::TryGetCurrentMouseWorldPosition(GB_Point2d& outPosition) const
+{
+	outPosition = GB_Point2d(std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN());
+	if (!hasMousePosition)
+	{
+		return false;
+	}
+
+	outPosition = ScreenToWorld(GB_Point2d(static_cast<double>(lastMousePosition.x()), static_cast<double>(lastMousePosition.y())));
+	return outPosition.IsValid();
 }
 
 void QMainCanvas::AddMapTile(const MapTile& tile)
@@ -559,6 +795,11 @@ void QMainCanvas::SetDrawablesVisible(const std::vector<std::string>& drawablesU
 
 	const std::unordered_set<std::string> uidSet(drawablesUids.begin(), drawablesUids.end());
 
+	if (uidSet.find(GetCrsValidAreaDrawableUid()) != uidSet.end())
+	{
+		SetCrsValidAreaVisible(visible, crsValidAreaColor);
+	}
+
 	bool hasChanged = false;
 	for (CachedMapTile& item : mapTiles)
 	{
@@ -654,7 +895,6 @@ void QMainCanvas::paintEvent(QPaintEvent* event)
 		}
 	}
 
-	DrawOverlay(painter);
 }
 
 void QMainCanvas::resizeEvent(QResizeEvent* event)
@@ -671,6 +911,8 @@ void QMainCanvas::resizeEvent(QResizeEvent* event)
 		UpdateViewExtentFromCenterAndPixelSize(center);
 		if (!AreRectanglesNearlyEqual(viewExtent, previousExtent))
 		{
+			EmitViewExtentDisplayChangedIfNeeded(previousExtent);
+			EmitMousePositionChanged();
 			ScheduleViewStateChanged();
 		}
 	}
@@ -683,9 +925,7 @@ void QMainCanvas::mousePressEvent(QMouseEvent* event)
 		return;
 	}
 
-	hasMousePosition = true;
-	lastMousePosition = event->pos();
-	update();
+	SetMousePosition(event->pos());
 
 	if (event->button() == Qt::LeftButton || event->button() == Qt::MiddleButton)
 	{
@@ -713,9 +953,7 @@ void QMainCanvas::mouseMoveEvent(QMouseEvent* event)
 	}
 
 	const QPoint currentMousePosition = event->pos();
-	const bool mousePositionChanged = !hasMousePosition || lastMousePosition != currentMousePosition;
-	hasMousePosition = true;
-	lastMousePosition = currentMousePosition;
+	const bool mousePositionChanged = SetMousePosition(currentMousePosition);
 
 	if (isPanning && viewExtent.IsValid() && IsFinitePositive(pixelSize))
 	{
@@ -745,9 +983,12 @@ void QMainCanvas::mouseMoveEvent(QMouseEvent* event)
 			return;
 		}
 
+		const GB_Rectangle previousExtent = viewExtent;
 		viewExtent = newExtent;
 		pixelSize = safePixelSize;
 		InvalidateMapContentCache();
+		EmitViewExtentDisplayChangedIfNeeded(previousExtent);
+		EmitMousePositionChanged();
 
 		ScheduleViewStateChanged();
 		update();
@@ -755,10 +996,7 @@ void QMainCanvas::mouseMoveEvent(QMouseEvent* event)
 		return;
 	}
 
-	if (mousePositionChanged)
-	{
-		update();
-	}
+	Q_UNUSED(mousePositionChanged);
 
 	QWidget::mouseMoveEvent(event);
 }
@@ -770,9 +1008,7 @@ void QMainCanvas::mouseReleaseEvent(QMouseEvent* event)
 		return;
 	}
 
-	hasMousePosition = true;
-	lastMousePosition = event->pos();
-	update();
+	SetMousePosition(event->pos());
 
 	if ((event->button() == Qt::LeftButton || event->button() == Qt::MiddleButton) && isPanning)
 	{
@@ -790,30 +1026,6 @@ void QMainCanvas::mouseReleaseEvent(QMouseEvent* event)
 	QWidget::mouseReleaseEvent(event);
 }
 
-void QMainCanvas::mouseDoubleClickEvent(QMouseEvent* event)
-{
-	if (!event)
-	{
-		return;
-	}
-
-	hasMousePosition = true;
-	lastMousePosition = event->pos();
-
-	if (event->button() == Qt::MiddleButton)
-	{
-		isPanning = false;
-		hasPanPreview = false;
-		panPreviewPixmap = QPixmap();
-		unsetCursor();
-		FlushPendingViewStateChanged();
-		ZoomFull();
-		event->accept();
-		return;
-	}
-
-	QWidget::mouseDoubleClickEvent(event);
-}
 
 void QMainCanvas::wheelEvent(QWheelEvent* event)
 {
@@ -822,8 +1034,7 @@ void QMainCanvas::wheelEvent(QWheelEvent* event)
 		return;
 	}
 
-	hasMousePosition = true;
-	lastMousePosition = event->pos();
+	SetMousePosition(event->pos());
 
 	const bool isWheelBeginEvent = event->phase() == Qt::ScrollBegin;
 	const bool isWheelEndEvent = event->phase() == Qt::ScrollEnd;
@@ -890,9 +1101,12 @@ void QMainCanvas::wheelEvent(QWheelEvent* event)
 		return;
 	}
 
+	const GB_Rectangle previousExtent = viewExtent;
 	viewExtent = newExtent;
 	UpdatePixelSizeFromViewExtent();
 	InvalidateMapContentCache();
+	EmitViewExtentDisplayChangedIfNeeded(previousExtent);
+	EmitMousePositionChanged();
 	ScheduleWheelZoomViewStateChanged();
 	update();
 
@@ -906,8 +1120,7 @@ void QMainCanvas::wheelEvent(QWheelEvent* event)
 
 void QMainCanvas::leaveEvent(QEvent* event)
 {
-	hasMousePosition = false;
-	update();
+	ClearMousePosition();
 	QWidget::leaveEvent(event);
 }
 
@@ -1180,6 +1393,7 @@ void QMainCanvas::DrawMapContent(QPainter& painter, const QRectF& exposedRect) c
 	DrawBackground(painter);
 	DrawMapTiles(painter, exposedRect);
 	DrawCoordinateAxes(painter);
+	DrawCrsValidArea(painter);
 }
 
 bool QMainCanvas::IsMapContentCacheValid() const
@@ -1205,6 +1419,16 @@ bool QMainCanvas::IsMapContentCacheValid() const
 	}
 
 	if (mapContentCacheClipMapTilesToCrsValidArea != clipMapTilesToCrsValidArea)
+	{
+		return false;
+	}
+
+	if (mapContentCacheCrsValidAreaVisible != crsValidAreaVisible)
+	{
+		return false;
+	}
+
+	if (mapContentCacheCrsValidAreaColor != crsValidAreaColor)
 	{
 		return false;
 	}
@@ -1239,12 +1463,94 @@ void QMainCanvas::EnsureMapContentCache() const
 	mapContentCachePixelSize = pixelSize;
 	mapContentCacheClipMapTilesToCrsValidArea = clipMapTilesToCrsValidArea;
 	mapContentCacheCrsWkt = crsWkt;
+	mapContentCacheCrsValidAreaVisible = crsValidAreaVisible;
+	mapContentCacheCrsValidAreaColor = crsValidAreaColor;
 	isMapContentCacheDirty = false;
 }
 
 void QMainCanvas::InvalidateMapContentCache() const
 {
 	isMapContentCacheDirty = true;
+}
+
+void QMainCanvas::DrawCrsValidArea(QPainter& painter) const
+{
+	if (!crsValidAreaVisible || crsValidAreaColor.IsTransparent() || !viewExtent.IsValid() || !IsFinitePositive(pixelSize))
+	{
+		return;
+	}
+
+	if (!EnsureCrsValidAreaPolygonsCache() || crsValidAreaPolygonsCache.empty())
+	{
+		return;
+	}
+
+	QPainterPath fillPath;
+	for (const std::vector<GB_Point2d>& polygon : crsValidAreaPolygonsCache)
+	{
+		if (polygon.size() < 3)
+		{
+			continue;
+		}
+
+		GB_Rectangle polygonExtent;
+		polygonExtent.Reset();
+		bool hasInvalidPoint = false;
+		for (const GB_Point2d& point : polygon)
+		{
+			if (!IsPointFinite(point))
+			{
+				hasInvalidPoint = true;
+				break;
+			}
+
+			polygonExtent.Expand(point);
+		}
+
+		if (hasInvalidPoint || !polygonExtent.IsValid() || !polygonExtent.IsIntersects(viewExtent))
+		{
+			continue;
+		}
+
+		const std::vector<GB_Point2d> clippedPolygon = ClipPolygonToRectangle(polygon, viewExtent);
+		if (clippedPolygon.size() < 3)
+		{
+			continue;
+		}
+
+		QPolygonF screenPolygon;
+		screenPolygon.reserve(static_cast<int>(clippedPolygon.size()));
+		for (const GB_Point2d& point : clippedPolygon)
+		{
+			const GB_Point2d screenPoint = WorldToScreen(point);
+			if (!IsPointFinite(screenPoint))
+			{
+				screenPolygon.clear();
+				break;
+			}
+
+			screenPolygon << QPointF(screenPoint.x, screenPoint.y);
+		}
+
+		if (screenPolygon.size() >= 3)
+		{
+			fillPath.addPolygon(screenPolygon);
+			fillPath.closeSubpath();
+		}
+	}
+
+	if (fillPath.isEmpty())
+	{
+		return;
+	}
+
+	painter.save();
+	painter.setRenderHint(QPainter::Antialiasing, true);
+	painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
+	painter.setPen(Qt::NoPen);
+	painter.setBrush(ToQColor(crsValidAreaColor));
+	painter.drawPath(fillPath);
+	painter.restore();
 }
 
 void QMainCanvas::DrawCoordinateAxes(QPainter& painter) const
@@ -1436,49 +1742,75 @@ void QMainCanvas::DrawCoordinateAxes(QPainter& painter) const
 	painter.restore();
 }
 
-void QMainCanvas::DrawOverlay(QPainter& painter) const
+bool QMainCanvas::EnsureCrsValidAreaPolygonsCache() const
 {
-	painter.save();
-	painter.setPen(QColor(64, 64, 64));
-	painter.setBrush(QColor(255, 255, 255, 210));
-
-	const QString crsText = QStringLiteral("坐标系: %1").arg(crsDisplayText);
-
-	QString mouseText = QStringLiteral("鼠标: (-, -)");
-	if (hasMousePosition)
+	if (!crsValidAreaPolygonsCacheDirty && crsValidAreaPolygonsCacheCrsWkt == crsWkt)
 	{
-		const GB_Point2d mouseWorldPoint = ScreenToWorld(GB_Point2d(static_cast<double>(lastMousePosition.x()), static_cast<double>(lastMousePosition.y())));
-		if (mouseWorldPoint.IsValid())
+		return !crsValidAreaPolygonsCache.empty();
+	}
+
+	crsValidAreaPolygonsCache.clear();
+	crsValidAreaPolygonsCacheCrsWkt = crsWkt;
+	crsValidAreaPolygonsCacheDirty = false;
+
+	if (crsWkt.empty())
+	{
+		return false;
+	}
+
+	std::shared_ptr<const GeoCrs> crs = GeoCrsManager::GetFromWktCached(crsWkt);
+	if (!crs || !crs->IsValid())
+	{
+		return false;
+	}
+
+	const std::vector<std::vector<GB_Point2d>> polygons = crs->GetValidAreaPolygons(CrsValidAreaPolygonEdgeSampleCount);
+	crsValidAreaPolygonsCache.reserve(polygons.size());
+	for (const std::vector<GB_Point2d>& polygon : polygons)
+	{
+		if (polygon.size() < 3)
 		{
-			mouseText = QStringLiteral("鼠标: (%1, %2)")
-				.arg(FormatCoordinate(mouseWorldPoint.x))
-				.arg(FormatCoordinate(mouseWorldPoint.y));
+			continue;
+		}
+
+		std::vector<GB_Point2d> filteredPolygon;
+		filteredPolygon.reserve(polygon.size());
+		bool hasInvalidPoint = false;
+		for (const GB_Point2d& point : polygon)
+		{
+			if (!IsPointFinite(point))
+			{
+				hasInvalidPoint = true;
+				break;
+			}
+
+			AppendPointIfUseful(filteredPolygon, point);
+		}
+
+		if (hasInvalidPoint)
+		{
+			continue;
+		}
+
+		if (filteredPolygon.size() > 1 && filteredPolygon.front().IsNearEqual(filteredPolygon.back(), GB_Epsilon))
+		{
+			filteredPolygon.pop_back();
+		}
+
+		if (filteredPolygon.size() >= 3)
+		{
+			crsValidAreaPolygonsCache.push_back(std::move(filteredPolygon));
 		}
 	}
 
-	const QString extentText = viewExtent.IsValid() ?
-		QStringLiteral("范围: [%1, %2, %3, %4]")
-		.arg(FormatCoordinate(viewExtent.minX))
-		.arg(FormatCoordinate(viewExtent.minY))
-		.arg(FormatCoordinate(viewExtent.maxX))
-		.arg(FormatCoordinate(viewExtent.maxY)) :
-		QStringLiteral("范围: 无效");
+	return !crsValidAreaPolygonsCache.empty();
+}
 
-	const QString text = crsText + QLatin1Char('\n') + extentText + QLatin1Char('\n') + mouseText;
-	const QFontMetrics metrics(painter.font());
-	const QRect textBounds = metrics.boundingRect(QRect(0, 0, std::numeric_limits<int>::max() / 4, std::numeric_limits<int>::max() / 4), Qt::AlignLeft | Qt::AlignTop, text);
-	const int horizontalPadding = 8;
-	const int verticalPadding = 6;
-	const int margin = 8;
-	const int backgroundWidth = textBounds.width() + horizontalPadding * 2;
-	const int backgroundHeight = textBounds.height() + verticalPadding * 2;
-	const int left = std::max(margin, width() - backgroundWidth - margin);
-	const int top = std::max(margin, height() - backgroundHeight - margin);
-	const QRect backgroundRect(left, top, backgroundWidth, backgroundHeight);
-
-	painter.drawRect(backgroundRect);
-	painter.drawText(backgroundRect.adjusted(horizontalPadding, verticalPadding, -horizontalPadding, -verticalPadding), Qt::AlignLeft | Qt::AlignTop, text);
-	painter.restore();
+void QMainCanvas::InvalidateCrsValidAreaPolygonsCache() const
+{
+	crsValidAreaPolygonsCacheDirty = true;
+	crsValidAreaPolygonsCacheCrsWkt.clear();
+	crsValidAreaPolygonsCache.clear();
 }
 
 bool QMainCanvas::IsDrawableUidInSet(const std::vector<std::string>& drawablesUids, const std::string& uid) const
@@ -1541,9 +1873,12 @@ void QMainCanvas::SetViewExtentInternal(const GB_Rectangle& extent, bool emitSig
 		return;
 	}
 
+	const GB_Rectangle previousExtent = viewExtent;
 	viewExtent = normalizedExtent;
 	UpdatePixelSizeFromViewExtent();
 	InvalidateMapContentCache();
+	EmitViewExtentDisplayChangedIfNeeded(previousExtent);
+	EmitMousePositionChanged();
 
 	if (emitSignal)
 	{
@@ -1731,6 +2066,47 @@ GB_Rectangle QMainCanvas::EnsureUsableExtent(const GB_Rectangle& extent) const
 	}
 
 	return result;
+}
+
+void QMainCanvas::EmitViewExtentDisplayChangedIfNeeded(const GB_Rectangle& previousExtent)
+{
+	if (!AreRectanglesNearlyEqual(viewExtent, previousExtent))
+	{
+		emit ViewExtentDisplayChanged(viewExtent);
+	}
+}
+
+bool QMainCanvas::SetMousePosition(const QPoint& position)
+{
+	const bool changed = !hasMousePosition || lastMousePosition != position;
+	hasMousePosition = true;
+	lastMousePosition = position;
+	if (changed)
+	{
+		EmitMousePositionChanged();
+	}
+
+	return changed;
+}
+
+bool QMainCanvas::ClearMousePosition()
+{
+	if (!hasMousePosition)
+	{
+		return false;
+	}
+
+	hasMousePosition = false;
+	lastMousePosition = QPoint();
+	EmitMousePositionChanged();
+	return true;
+}
+
+void QMainCanvas::EmitMousePositionChanged()
+{
+	GB_Point2d mouseWorldPosition;
+	const bool hasPosition = TryGetCurrentMouseWorldPosition(mouseWorldPosition);
+	emit MousePositionChanged(mouseWorldPosition, hasPosition);
 }
 
 void QMainCanvas::ScheduleViewStateChanged()

@@ -7,9 +7,52 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <vector>
 
 class GeoBoundingBox;
 class GeoCrs;
+
+#ifdef _MSC_VER
+#  pragma warning(push)
+#  pragma warning(disable: 4251)
+#endif
+
+// GeoCrsDatabaseType
+// - 用于描述坐标系数据库记录的基础类型。
+// - 该枚举刻意不暴露 GDAL/OGR 类型，避免 UI 层直接依赖第三方 GIS 库接口。
+enum class GeoCrsDatabaseType
+{
+	Unknown = 0,
+	Geographic,
+	Projected,
+	Geocentric,
+	Vertical,
+	Compound,
+	Other
+};
+
+// GeoCrsDatabaseRecord
+// - GeoCrsManager 从底层坐标系数据库中枚举出的轻量记录。
+// - 坐标系定义可用 sourceUtf8 + ":" + codeUtf8 组合得到，例如 "EPSG:4326"。
+struct ARCGIS_RESTSERVICE_PORT GeoCrsDatabaseRecord
+{
+	std::string sourceUtf8 = "";
+	std::string codeUtf8 = "";
+	std::string nameUtf8 = "";
+	GeoCrsDatabaseType type = GeoCrsDatabaseType::Unknown;
+	bool isDeprecated = false;
+
+	bool hasLonLatBbox = false;
+	double westLongitudeDeg = 0.0;
+	double southLatitudeDeg = 0.0;
+	double eastLongitudeDeg = 0.0;
+	double northLatitudeDeg = 0.0;
+
+	std::string areaNameUtf8 = "";
+	std::string projectionMethodUtf8 = "";
+
+	std::string GetAuthorityCodeUtf8() const;
+};
 
 // GeoCrsManager
 // - 静态 CRS 管理器：
@@ -40,6 +83,12 @@ public:
 
 	// 清空内部所有缓存（不改变 PROJ 搜索路径）。
 	static void ClearCaches();
+
+	// 枚举坐标系数据库中的 CRS 记录。
+	// - authorityNameUtf8 典型值为 "EPSG"、"ESRI"；为空时由底层数据库决定返回范围。
+	// - 仅返回轻量描述，不构造完整 GeoCrs 对象；适合 UI 列表展示。
+	// - 本接口内部可以调用 GDAL/OGR，但调用方不需要也不应直接依赖 GDAL/OGR 头文件。
+	static std::vector<GeoCrsDatabaseRecord> ListDatabaseCrsRecords(const std::string& authorityNameUtf8);
 
 	// 常见 EPSG：WGS84 / WebMercator。
 	static std::shared_ptr<const GeoCrs> GetWgs84();       // EPSG:4326
@@ -119,5 +168,9 @@ private:
 };
 
 #define GB_ToWkt(str) GeoCrsManager::UserInputToWktUtf8(str, true, true)
+
+#ifdef _MSC_VER
+#  pragma warning(pop)
+#endif
 
 #endif

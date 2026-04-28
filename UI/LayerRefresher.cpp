@@ -10,11 +10,13 @@
 #include "GeoBase/GB_Crypto.h"
 #include "GeoBase/GB_Network.h"
 #include "GeoBase/GB_Utf8String.h"
+#include "GeoBase/GB_Timer.h"
 #include "GeoBase/CV/GB_Image.h"
 #include "GeoBase/GB_FileSystem.h"
 
 #include <QByteArray>
 #include <QMetaObject>
+#include <QDebug>
 #include <QTimer>
 
 #include <algorithm>
@@ -37,7 +39,6 @@ namespace
 {
 	constexpr size_t FallbackLogicalCpuCoreCount = 4;
 	constexpr size_t MinParallelTileWorkerCount = 4;
-	constexpr size_t MaxParallelTileWorkerCount = 16;
 	constexpr unsigned int DefaultTileConnectTimeoutMs = 5000;
 	constexpr unsigned int DefaultTileTotalTimeoutMs = 60000;
 	constexpr double InitialZoomMarginRatio = 0.05;
@@ -524,10 +525,10 @@ namespace
 
 	size_t ChooseWorkerThreadCount()
 	{
-		const unsigned int hardwareThreadCount = std::thread::hardware_concurrency();
+		//const unsigned int hardwareThreadCount = 2 * std::thread::hardware_concurrency();
+		const unsigned int hardwareThreadCount = 40;
 		const size_t logicalCpuCoreCount = (hardwareThreadCount > 0) ? static_cast<size_t>(hardwareThreadCount) : FallbackLogicalCpuCoreCount;
-		const size_t preferredThreadCount = std::max<size_t>(MinParallelTileWorkerCount, logicalCpuCoreCount);
-		return std::min<size_t>(MaxParallelTileWorkerCount, preferredThreadCount);
+		return std::max<size_t>(MinParallelTileWorkerCount, logicalCpuCoreCount);
 	}
 
 	std::string PrefixRequestUrlIfNeeded(const std::string& requestUrl, const ArcGISRestConnectionSettings& connectionSettings)
@@ -1790,6 +1791,11 @@ private:
 		return GuessFileExtFromImageFormatForLayerRefresher(task.requestItem.imageFormat);
 	}
 
+	static void DownloadCompleteCallback(const std::string& name, int64_t elapsedNs)
+	{
+		qDebug() << QString::fromStdString(name) << ":" << elapsedNs / 1000000.0 << "ms";
+	}
+
 	bool TryLoadRawImageFromCacheOrNetwork(const TileTask& task, const std::string& downloadUrl, const GB_ImageLoadOptions& loadOptions, GB_Image& outImage) const
 	{
 		outImage.Clear();
@@ -1805,32 +1811,36 @@ private:
 			return false;
 		}
 
+		//const double sleepingTime = GB_RandomInt(50, 2000);
+		//std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(sleepingTime)));
+		//outImage.LoadFromFile("0aea755541b65721e72b2d76e9c691942c7431e5e0a8dfee02b537084600d519.jpg");
+
+#if 1
+		GB_NetworkResponse response;
+		{
+			GB_ScopeTimer timer("download", &std::cerr, DownloadCompleteCallback);
+			response = GB_RequestUrlData(downloadUrl, task.networkOptions);
+			if (!response.ok || response.body.empty())
+			{
+				return false;
+			}
+		}
+#else
 		const GB_NetworkResponse response = GB_RequestUrlData(downloadUrl, task.networkOptions);
-		//const GB_NetworkDownloadedFile downloadedFile = GB_DownloadFile(downloadUrl, task.networkOptions);
-		//if (!downloadedFile.ok || downloadedFile.data.empty())
-		//{
-		//	return false;
-		//}
 		if (!response.ok || response.body.empty())
 		{
 			return false;
 		}
-
-		//if (!outImage.LoadFromMemory(downloadedFile.data, loadOptions) || outImage.IsEmpty())
-		//{
-		//	outImage.Clear();
-		//	return false;
-		//}
+#endif
+		
 		if (!outImage.LoadFromMemory(response.body.data(), response.body.size(), loadOptions) || outImage.IsEmpty())
 		{
 			outImage.Clear();
 			return false;
 		}
-
-		//const std::string preferredFileExt = GuessPreferredCacheFileExt(task, downloadedFile);
+		
 		const std::string preferredFileExt = GB_GuessFileExt(GB_StringToByteBuffer(response.body));
 		TileImageCache::PutEncodedImage(cacheKey, response.body, preferredFileExt);
-		//TileImageCache::PutEncodedImage(cacheKey, downloadedFile.data, preferredFileExt);
 		return true;
 	}
 
