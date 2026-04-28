@@ -8,8 +8,10 @@
 #include "GeoBase/GB_IO.h"
 
 #include <QAction>
+#include <QAbstractItemView>
 #include <QApplication>
 #include <QBrush>
+#include <QColor>
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QCursor>
@@ -24,11 +26,20 @@
 #include <QMenu>
 #include <QMessageBox>
 #include <QModelIndexList>
+#include <QMouseEvent>
+#include <QPaintEvent>
+#include <QPainter>
+#include <QPalette>
+#include <QPen>
 #include <QPoint>
+#include <QPixmap>
 #include <QPushButton>
+#include <QRectF>
+#include <QResizeEvent>
 #include <QShowEvent>
 #include <QSettings>
 #include <QSignalBlocker>
+#include <QSizeF>
 #include <QSizePolicy>
 #include <QSplitter>
 #include <QStringList>
@@ -40,8 +51,10 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <QVariant>
+#include <QWheelEvent>
 
 #include <algorithm>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
@@ -73,6 +86,9 @@ namespace
 	constexpr std::uint32_t CrsCacheVersion = 1;
 	constexpr std::uint64_t MaxCachedCrsRecordCount = 1000000ULL;
 	constexpr std::uint32_t MaxCachedStringLength = 64U * 1024U * 1024U;
+
+	constexpr double PreviewMinUserScale = 1.0;
+	constexpr double PreviewMaxUserScale = 64.0;
 
 	const QString BaseWindowTitle = QStringLiteral("坐标系管理");
 	const QString LoadingWindowTitle = QStringLiteral("坐标系管理（正在加载全部坐标系......）");
@@ -772,11 +788,371 @@ namespace
 		OverrideCursorGuard& operator=(const OverrideCursorGuard&) = delete;
 	};
 
+
 	bool IsSameAuthorityCode(const std::string& left, const std::string& right)
 	{
 		return GB_Utf8Equals(left, right, false);
 	}
 }
+
+class QCrsAreaPreviewFrame : public QFrame
+{
+public:
+	explicit QCrsAreaPreviewFrame(QWidget* parent = nullptr) : QFrame(parent)
+	{
+		setMouseTracking(false);
+		setFocusPolicy(Qt::StrongFocus);
+		setCursor(Qt::OpenHandCursor);
+		globalMapPixmap = QPixmap(QStringLiteral(":/resources/Resources/GlobalMap.jpg"));
+	}
+
+	void SetValidAreaSegments(const std::vector<GeoCrs::LonLatAreaSegment>& segments)
+	{
+		validAreaSegments = segments;
+		hasPreview = true;
+		statusText = validAreaSegments.empty() ? QStringLiteral("当前坐标系没有可用的经纬度有效范围。") : QString();
+		ResetView();
+		update();
+	}
+
+	void ClearPreview()
+	{
+		validAreaSegments.clear();
+		hasPreview = false;
+		statusText.clear();
+		ResetView();
+		update();
+	}
+
+protected:
+	virtual void paintEvent(QPaintEvent* event) override
+	{
+		QFrame::paintEvent(event);
+
+		QPainter painter(this);
+		painter.setRenderHint(QPainter::Antialiasing, true);
+		painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+
+		const QRectF contentRect = GetContentRect();
+		if (contentRect.width() <= 1.0 || contentRect.height() <= 1.0)
+		{
+			return;
+		}
+
+		if (!hasPreview)
+		{
+			DrawCenteredText(painter, contentRect, QStringLiteral("未选择单个坐标系。"));
+			return;
+		}
+
+		if (globalMapPixmap.isNull())
+		{
+			DrawCenteredText(painter, contentRect, QStringLiteral("无法加载预览地图资源：:/resources/Resources/GlobalMap.png"));
+			return;
+		}
+
+		const QRectF imageTargetRect = GetImageTargetRect(contentRect);
+		painter.save();
+		painter.setClipRect(contentRect);
+		painter.drawPixmap(imageTargetRect, globalMapPixmap, QRectF(globalMapPixmap.rect()));
+		DrawValidAreaSegments(painter, imageTargetRect);
+		painter.restore();
+
+		if (!statusText.isEmpty())
+		{
+			DrawCornerText(painter, contentRect, statusText);
+		}
+	}
+
+	virtual void wheelEvent(QWheelEvent* event) override
+	{
+		if (!CanInteract())
+		{
+			QFrame::wheelEvent(event);
+			return;
+		}
+
+		const int wheelDelta = event->angleDelta().y();
+		if (wheelDelta == 0)
+		{
+			event->ignore();
+			return;
+		}
+
+		const QRectF contentRect = GetContentRect();
+		if (contentRect.width() <= 1.0 || contentRect.height() <= 1.0)
+		{
+			event->ignore();
+			return;
+		}
+
+		const QPointF cursorPos = event->pos();
+		const QRectF oldImageTargetRect = GetImageTargetRect(contentRect);
+		if (oldImageTargetRect.width() <= 0.0 || oldImageTargetRect.height() <= 0.0)
+		{
+			event->ignore();
+			return;
+		}
+
+		const QPointF imagePoint((cursorPos.x() - oldImageTargetRect.left()) / oldImageTargetRect.width() * static_cast<double>(globalMapPixmap.width()),
+			(cursorPos.y() - oldImageTargetRect.top()) / oldImageTargetRect.height() * static_cast<double>(globalMapPixmap.height()));
+
+		const double factor = std::pow(1.0015, static_cast<double>(wheelDelta));
+		userScale = ClampDouble(userScale * factor, PreviewMinUserScale, PreviewMaxUserScale);
+
+		const double baseScale = GetBaseScale(contentRect);
+		const double displayScale = baseScale * userScale;
+		const QSizeF imageSize(static_cast<double>(globalMapPixmap.width()) * displayScale,
+			static_cast<double>(globalMapPixmap.height()) * displayScale);
+		const QPointF baseTopLeft(contentRect.center().x() - imageSize.width() * 0.5,
+			contentRect.center().y() - imageSize.height() * 0.5);
+		const QPointF desiredTopLeft(cursorPos.x() - imagePoint.x() * displayScale,
+			cursorPos.y() - imagePoint.y() * displayScale);
+
+		userPanPixels = desiredTopLeft - baseTopLeft;
+		ClampPanPixels();
+		update();
+		event->accept();
+	}
+
+	virtual void mousePressEvent(QMouseEvent* event) override
+	{
+		if (event->button() == Qt::LeftButton && CanInteract())
+		{
+			isPanning = true;
+			lastPanPos = event->pos();
+			setCursor(Qt::ClosedHandCursor);
+			event->accept();
+			return;
+		}
+
+		QFrame::mousePressEvent(event);
+	}
+
+	virtual void mouseMoveEvent(QMouseEvent* event) override
+	{
+		if (isPanning)
+		{
+			const QPoint currentPos = event->pos();
+			const QPoint delta = currentPos - lastPanPos;
+			lastPanPos = currentPos;
+			userPanPixels += QPointF(delta);
+			ClampPanPixels();
+			update();
+			event->accept();
+			return;
+		}
+
+		QFrame::mouseMoveEvent(event);
+	}
+
+	virtual void mouseReleaseEvent(QMouseEvent* event) override
+	{
+		if (event->button() == Qt::LeftButton && isPanning)
+		{
+			isPanning = false;
+			setCursor(Qt::OpenHandCursor);
+			event->accept();
+			return;
+		}
+
+		QFrame::mouseReleaseEvent(event);
+	}
+
+	virtual void mouseDoubleClickEvent(QMouseEvent* event) override
+	{
+		if (event->button() == Qt::LeftButton && CanInteract())
+		{
+			ResetView();
+			update();
+			event->accept();
+			return;
+		}
+
+		QFrame::mouseDoubleClickEvent(event);
+	}
+
+	virtual void resizeEvent(QResizeEvent* event) override
+	{
+		QFrame::resizeEvent(event);
+		ClampPanPixels();
+		update();
+	}
+
+private:
+	QPixmap globalMapPixmap;
+	std::vector<GeoCrs::LonLatAreaSegment> validAreaSegments;
+	bool hasPreview = false;
+	QString statusText;
+	double userScale = 1.0;
+	QPointF userPanPixels;
+	bool isPanning = false;
+	QPoint lastPanPos;
+
+	static double ClampDouble(double value, double minValue, double maxValue)
+	{
+		if (value < minValue)
+		{
+			return minValue;
+		}
+		if (value > maxValue)
+		{
+			return maxValue;
+		}
+		return value;
+	}
+
+	static bool IsFinite(double value)
+	{
+		return std::isfinite(value);
+	}
+
+	static bool NormalizeSegment(const GeoCrs::LonLatAreaSegment& segment, double& west, double& south, double& east, double& north)
+	{
+		if (!IsFinite(segment.west) || !IsFinite(segment.south) || !IsFinite(segment.east) || !IsFinite(segment.north))
+		{
+			return false;
+		}
+
+		west = ClampDouble(segment.west, -180.0, 180.0);
+		east = ClampDouble(segment.east, -180.0, 180.0);
+		south = ClampDouble(segment.south, -90.0, 90.0);
+		north = ClampDouble(segment.north, -90.0, 90.0);
+
+		if (east < west || north < south)
+		{
+			return false;
+		}
+
+		return (east - west) > 0.0 && (north - south) > 0.0;
+	}
+
+	void ResetView()
+	{
+		userScale = 1.0;
+		userPanPixels = QPointF(0.0, 0.0);
+		isPanning = false;
+		setCursor(Qt::OpenHandCursor);
+	}
+
+	bool CanInteract() const
+	{
+		return hasPreview && !globalMapPixmap.isNull();
+	}
+
+	QRectF GetContentRect() const
+	{
+		return QRectF(contentsRect()).adjusted(6.0, 6.0, -6.0, -6.0);
+	}
+
+	double GetBaseScale(const QRectF& contentRect) const
+	{
+		if (globalMapPixmap.isNull() || contentRect.width() <= 0.0 || contentRect.height() <= 0.0)
+		{
+			return 1.0;
+		}
+
+		const double scaleX = contentRect.width() / static_cast<double>(globalMapPixmap.width());
+		const double scaleY = contentRect.height() / static_cast<double>(globalMapPixmap.height());
+		return std::max(0.000001, std::min(scaleX, scaleY));
+	}
+
+	QRectF GetImageTargetRect(const QRectF& contentRect) const
+	{
+		if (globalMapPixmap.isNull())
+		{
+			return QRectF();
+		}
+
+		const double displayScale = GetBaseScale(contentRect) * userScale;
+		const QSizeF imageSize(static_cast<double>(globalMapPixmap.width()) * displayScale,
+			static_cast<double>(globalMapPixmap.height()) * displayScale);
+		const QPointF center = contentRect.center() + userPanPixels;
+		return QRectF(center.x() - imageSize.width() * 0.5,
+			center.y() - imageSize.height() * 0.5,
+			imageSize.width(),
+			imageSize.height());
+	}
+
+	void ClampPanPixels()
+	{
+		if (globalMapPixmap.isNull())
+		{
+			userPanPixels = QPointF(0.0, 0.0);
+			return;
+		}
+
+		const QRectF contentRect = GetContentRect();
+		const double displayScale = GetBaseScale(contentRect) * userScale;
+		const QSizeF imageSize(static_cast<double>(globalMapPixmap.width()) * displayScale,
+			static_cast<double>(globalMapPixmap.height()) * displayScale);
+
+		const double maxPanX = std::max(0.0, (imageSize.width() - contentRect.width()) * 0.5);
+		const double maxPanY = std::max(0.0, (imageSize.height() - contentRect.height()) * 0.5);
+		userPanPixels.setX(ClampDouble(userPanPixels.x(), -maxPanX, maxPanX));
+		userPanPixels.setY(ClampDouble(userPanPixels.y(), -maxPanY, maxPanY));
+	}
+
+	void DrawCenteredText(QPainter& painter, const QRectF& rect, const QString& text) const
+	{
+		painter.save();
+		painter.setPen(palette().color(QPalette::Disabled, QPalette::Text));
+		painter.drawText(rect, Qt::AlignCenter | Qt::TextWordWrap, text);
+		painter.restore();
+	}
+
+	void DrawCornerText(QPainter& painter, const QRectF& rect, const QString& text) const
+	{
+		painter.save();
+		QFont textFont = font();
+		textFont.setPointSize(std::max(8, textFont.pointSize()));
+		painter.setFont(textFont);
+
+		const QRectF textRect = painter.boundingRect(rect.adjusted(8.0, 8.0, -8.0, -8.0), Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap, text);
+		const QRectF backgroundRect = textRect.adjusted(-6.0, -4.0, 6.0, 4.0);
+		painter.fillRect(backgroundRect, QColor(255, 255, 255, 210));
+		painter.setPen(QColor(80, 80, 80));
+		painter.drawText(textRect, Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap, text);
+		painter.restore();
+	}
+
+	void DrawValidAreaSegments(QPainter& painter, const QRectF& imageTargetRect) const
+	{
+		if (globalMapPixmap.isNull() || imageTargetRect.width() <= 0.0 || imageTargetRect.height() <= 0.0)
+		{
+			return;
+		}
+
+		painter.save();
+		painter.setPen(QPen(QColor(255, 0, 0, 160), 1.0));
+		painter.setBrush(QBrush(QColor(255, 0, 0, 80)));
+
+		for (const GeoCrs::LonLatAreaSegment& segment : validAreaSegments)
+		{
+			double west = 0.0;
+			double south = 0.0;
+			double east = 0.0;
+			double north = 0.0;
+			if (!NormalizeSegment(segment, west, south, east, north))
+			{
+				continue;
+			}
+
+			const double leftRatio = (west + 180.0) / 360.0;
+			const double rightRatio = (east + 180.0) / 360.0;
+			const double topRatio = (90.0 - north) / 180.0;
+			const double bottomRatio = (90.0 - south) / 180.0;
+
+			const QRectF areaRect(imageTargetRect.left() + leftRatio * imageTargetRect.width(),
+				imageTargetRect.top() + topRatio * imageTargetRect.height(),
+				(rightRatio - leftRatio) * imageTargetRect.width(),
+				(bottomRatio - topRatio) * imageTargetRect.height());
+			painter.drawRect(areaRect);
+		}
+
+		painter.restore();
+	}
+};
 
 QCrsManagerWidget::QCrsManagerWidget(QWidget* parent) : QDialog(parent)
 {
@@ -971,6 +1347,23 @@ void QCrsManagerWidget::InitializeUi()
 	crsTableWidget->setContextMenuPolicy(Qt::CustomContextMenu);
 	crsTableWidget->setAlternatingRowColors(true);
 	crsTableWidget->setSortingEnabled(true);
+
+	QPalette tablePalette = crsTableWidget->palette();
+	tablePalette.setColor(QPalette::Highlight, QColor(47, 129, 247));
+	tablePalette.setColor(QPalette::HighlightedText, Qt::white);
+	tablePalette.setColor(QPalette::Inactive, QPalette::Highlight, QColor(47, 129, 247));
+	tablePalette.setColor(QPalette::Inactive, QPalette::HighlightedText, Qt::white);
+	crsTableWidget->setPalette(tablePalette);
+	crsTableWidget->setStyleSheet(QStringLiteral(
+		"QTableWidget#crsTableWidget::item:selected {"
+		"  background: #2f81f7;"
+		"  color: white;"
+		"}"
+		"QTableWidget#crsTableWidget::item:selected:!active {"
+		"  background: #2f81f7;"
+		"  color: white;"
+		"}"));
+
 	crsTableWidget->verticalHeader()->setVisible(false);
 	crsTableWidget->verticalHeader()->setDefaultSectionSize(24);
 	QHeaderView* horizontalHeader = crsTableWidget->horizontalHeader();
@@ -1031,11 +1424,12 @@ void QCrsManagerWidget::InitializeUi()
 	crsDetailTextEdit->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
 	rightLayout->addWidget(crsDetailTextEdit, 2);
 
-	previewFrame = new QFrame(rightWidget);
+	previewFrame = new QCrsAreaPreviewFrame(rightWidget);
 	previewFrame->setObjectName(QStringLiteral("previewFrame"));
 	previewFrame->setFrameShape(QFrame::StyledPanel);
 	previewFrame->setFrameShadow(QFrame::Sunken);
 	previewFrame->setMinimumHeight(120);
+	previewFrame->setToolTip(QStringLiteral("鼠标滚轮缩放，按住鼠标左键拖动平移，左键双击恢复初始视图"));
 	previewFrame->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
 	rightLayout->addWidget(previewFrame, 1);
 
@@ -1521,6 +1915,7 @@ void QCrsManagerWidget::ClearTableSelection()
 void QCrsManagerWidget::UpdateDetailsAndButtons()
 {
 	UpdateCrsDetails();
+	UpdateCrsPreview();
 	UpdateActionButtons();
 }
 
@@ -1534,6 +1929,41 @@ void QCrsManagerWidget::UpdateCrsDetails()
 	}
 
 	crsDetailTextEdit->setHtml(BuildDetailHtml(*selectedRecords[0]));
+}
+
+
+void QCrsManagerWidget::UpdateCrsPreview()
+{
+	if (!previewFrame)
+	{
+		return;
+	}
+
+	const std::vector<const CrsRecord*> selectedRecords = GetSelectedCrsRecords();
+	if (selectedRecords.size() != 1 || selectedRecords[0] == nullptr)
+	{
+		previewFrame->ClearPreview();
+		return;
+	}
+
+	const CrsRecord& record = *selectedRecords[0];
+	std::shared_ptr<const GeoCrs> crs = GeoCrsManager::GetFromDefinitionCached(record.definitionUtf8, false, false);
+	if (!crs || !crs->IsValid())
+	{
+		const std::string wktUtf8 = ResolveWktForRecord(record);
+		if (!wktUtf8.empty())
+		{
+			crs = GeoCrsManager::GetFromDefinitionCached(wktUtf8, false, false);
+		}
+	}
+
+	if (!crs || !crs->IsValid())
+	{
+		previewFrame->ClearPreview();
+		return;
+	}
+
+	previewFrame->SetValidAreaSegments(crs->GetValidAreaLonLatSegments());
 }
 
 void QCrsManagerWidget::UpdateActionButtons()

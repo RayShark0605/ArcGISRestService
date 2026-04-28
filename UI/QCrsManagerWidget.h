@@ -17,6 +17,7 @@ class QTextEdit;
 class QTimer;
 class QToolButton;
 class QMainCanvas;
+class QCrsAreaPreviewFrame;
 
 class QCrsManagerWidget : public QDialog
 {
@@ -90,7 +91,7 @@ private:
 	QToolButton* deleteCrsButton = nullptr;
 	QTableWidget* crsTableWidget = nullptr;
 	QTextEdit* crsDetailTextEdit = nullptr;
-	QFrame* previewFrame = nullptr;
+	QCrsAreaPreviewFrame* previewFrame = nullptr;
 	QPushButton* applyToCanvasButton = nullptr;
 	QTimer* systemCrsInitializationPollTimer = nullptr;
 
@@ -123,6 +124,7 @@ private:
 	void ClearTableSelection();
 	void UpdateDetailsAndButtons();
 	void UpdateCrsDetails();
+	void UpdateCrsPreview();
 	void UpdateActionButtons();
 	void OnDeleteSelectedCrsClicked();
 	void OnApplyToCanvasClicked();
