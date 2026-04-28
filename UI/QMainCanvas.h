@@ -67,6 +67,8 @@ public:
 
 	void SetViewExtent(const GB_Rectangle& extent);
 	void ZoomToExtent(const GB_Rectangle& extent, double marginRatio = 0.05);
+	bool TryGetCrsValidAreaPolygonsExtent(GB_Rectangle& outExtent) const;
+	bool ZoomToCrsValidArea(double marginRatio = 0.05);
 	void ZoomFull();
 
 	GB_Point2d WorldToScreen(const GB_Point2d& point) const;

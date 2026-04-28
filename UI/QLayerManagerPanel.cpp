@@ -362,10 +362,23 @@ namespace
 
 	QIcon CreateLayerManagerActionIcon(LayerManagerActionType actionType)
 	{
-		QIcon icon;
-		icon.addPixmap(CreateLayerManagerActionPixmap(actionType, QColor(45, 45, 45)), QIcon::Normal, QIcon::Off);
-		icon.addPixmap(CreateLayerManagerActionPixmap(actionType, QColor(145, 145, 145)), QIcon::Disabled, QIcon::Off);
-		return icon;
+		switch (actionType)
+		{
+		case LayerManagerActionType::ShowAllLayers:
+			return QIcon(":/resources/Resources/ArcGIS_Rest_Service_Show_All_Layers_64.ico");
+		case LayerManagerActionType::HideAllLayers:
+			return QIcon(":/resources/Resources/ArcGIS_Rest_Service_Hide_All_Layers_64.ico");
+		case LayerManagerActionType::ZoomToSelectedLayers:
+			return QIcon(":/resources/Resources/ArcGIS_Rest_Service_Zoom_To_Layer_64.ico");
+		case LayerManagerActionType::ZoomToAllLayers:
+			return QIcon(":/resources/Resources/ArcGIS_Rest_Service_Zoom_To_All_Layers_64.ico");
+		case LayerManagerActionType::RemoveSelectedLayers:
+			return QIcon(":/resources/Resources/ArcGIS_Rest_Service_Delete_Layer_64.ico");
+		case LayerManagerActionType::RemoveAllLayers:
+			return QIcon(":/resources/Resources/ArcGIS_Rest_Service_Delete_All_Layers_64.ico");
+		default:
+			return QIcon();
+		}
 	}
 }
 

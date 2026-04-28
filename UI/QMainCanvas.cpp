@@ -563,6 +563,52 @@ void QMainCanvas::ZoomToExtent(const GB_Rectangle& extent, double marginRatio)
 	SetViewExtentInternal(usableExtent, true);
 }
 
+bool QMainCanvas::TryGetCrsValidAreaPolygonsExtent(GB_Rectangle& outExtent) const
+{
+	outExtent.Reset();
+
+	if (!EnsureCrsValidAreaPolygonsCache() || crsValidAreaPolygonsCache.empty())
+	{
+		return TryGetCrsValidArea(outExtent);
+	}
+
+	for (const std::vector<GB_Point2d>& polygon : crsValidAreaPolygonsCache)
+	{
+		if (polygon.size() < 3)
+		{
+			continue;
+		}
+
+		for (const GB_Point2d& point : polygon)
+		{
+			if (IsPointFinite(point))
+			{
+				outExtent.Expand(point);
+			}
+		}
+	}
+
+	if (!outExtent.IsValid())
+	{
+		return TryGetCrsValidArea(outExtent);
+	}
+
+	outExtent.Normalize();
+	return outExtent.IsValid();
+}
+
+bool QMainCanvas::ZoomToCrsValidArea(double marginRatio)
+{
+	GB_Rectangle crsValidAreaExtent;
+	if (!TryGetCrsValidAreaPolygonsExtent(crsValidAreaExtent))
+	{
+		return false;
+	}
+
+	ZoomToExtent(crsValidAreaExtent, marginRatio);
+	return true;
+}
+
 void QMainCanvas::ZoomFull()
 {
 	GB_Rectangle crsValidArea;

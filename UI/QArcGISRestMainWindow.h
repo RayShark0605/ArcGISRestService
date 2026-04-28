@@ -34,6 +34,7 @@ private:
 	QLabel* viewExtentStatusLabel = nullptr;
 	QPushButton* crsStatusButton = nullptr;
 	QToolButton* crsValidAreaVisibleButton = nullptr;
+	QToolButton* crsZoomValidAreaButton = nullptr;
 	QWidget* leftStatusWidget = nullptr;
 	QWidget* rightStatusWidget = nullptr;
 
@@ -43,11 +44,13 @@ private:
 	void UpdateViewExtentStatus(const GB_Rectangle& extent);
 	void UpdateCrsStatus(const QString& crsDisplayText);
 	void UpdateCrsValidAreaVisibleButtonTooltip();
+	void UpdateCrsZoomValidAreaButtonState();
 	void BalanceStatusSideWidgetWidths();
 
 	void OnLongitudeLatitudeCheckBoxStateChanged(int checkState);
 	void OnCrsStatusButtonClicked();
 	void OnCrsValidAreaVisibleButtonToggled(bool checked);
+	void OnCrsZoomValidAreaButtonClicked();
 };
 
 

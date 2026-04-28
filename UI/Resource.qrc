@@ -13,5 +13,14 @@
         <file>Resources/ArcGIS_Rest_Service_Raster_Layer_64.ico</file>
         <file>Resources/ArcGIS_Rest_Service_Unknown_Layer_64.ico</file>
         <file>Resources/GlobalMap.jpg</file>
+        <file>Resources/ArcGIS_Rest_Service_Hide_All_Layers_64.ico</file>
+        <file>Resources/ArcGIS_Rest_Service_Show_All_Layers_64.ico</file>
+        <file>Resources/ArcGIS_Rest_Service_Zoom_To_All_Layers_64.ico</file>
+        <file>Resources/ArcGIS_Rest_Service_Zoom_To_Layer_64.ico</file>
+        <file>Resources/ArcGIS_Rest_Service_Delete_All_Layers_64.ico</file>
+        <file>Resources/ArcGIS_Rest_Service_Delete_Layer_64.ico</file>
+        <file>Resources/ArcGIS_Rest_Service_Show_Crs_BBOX_64.ico</file>
+        <file>Resources/ArcGIS_Rest_Service_Zoom_To_CRS_64.ico</file>
+        <file>Resources/Main.ico</file>
     </qresource>
 </RCC>

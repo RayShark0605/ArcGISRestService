@@ -13,10 +13,16 @@
 #include "GeoCrsTransform.h"
 
 #include <QCheckBox>
+#include <QColor>
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QIcon>
 #include <QLabel>
+#include <QPainter>
+#include <QPen>
+#include <QPixmap>
+#include <QPointF>
+#include <QRectF>
 #include <QPushButton>
 #include <QSize>
 #include <QSizePolicy>
@@ -190,6 +196,57 @@ namespace
 		button->setCursor(Qt::PointingHandCursor);
 		button->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
 	}
+
+	void InitializeStatusToolButton(QToolButton* button, const QString& accessibleName)
+	{
+		if (!button)
+		{
+			return;
+		}
+
+		button->setAutoRaise(true);
+		button->setCursor(Qt::PointingHandCursor);
+		button->setToolButtonStyle(Qt::ToolButtonIconOnly);
+		button->setIconSize(QSize(18, 18));
+		button->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
+		button->setAccessibleName(accessibleName);
+	}
+
+	QIcon CreateZoomValidAreaIcon()
+	{
+		return QIcon(":/resources/Resources/ArcGIS_Rest_Service_Zoom_To_CRS_64.ico");
+		/*QPixmap pixmap(18, 18);
+		pixmap.fill(Qt::transparent);
+
+		QPainter painter(&pixmap);
+		painter.setRenderHint(QPainter::Antialiasing, true);
+
+		const QColor extentColor(55, 110, 190);
+		const QColor fillColor(55, 110, 190, 35);
+		const QColor arrowColor(45, 45, 45);
+
+		QPen extentPen(extentColor, 1.5);
+		extentPen.setCapStyle(Qt::RoundCap);
+		extentPen.setJoinStyle(Qt::RoundJoin);
+		painter.setPen(extentPen);
+		painter.setBrush(fillColor);
+		painter.drawRoundedRect(QRectF(3.0, 3.0, 12.0, 10.0), 2.0, 2.0);
+
+		QPen arrowPen(arrowColor, 1.5);
+		arrowPen.setCapStyle(Qt::RoundCap);
+		arrowPen.setJoinStyle(Qt::RoundJoin);
+		painter.setPen(arrowPen);
+		painter.setBrush(Qt::NoBrush);
+		painter.drawLine(QPointF(10.0, 14.0), QPointF(15.0, 14.0));
+		painter.drawLine(QPointF(14.0, 10.0), QPointF(14.0, 15.0));
+		painter.drawLine(QPointF(11.0, 11.0), QPointF(14.0, 14.0));
+		painter.drawLine(QPointF(14.0, 14.0), QPointF(11.5, 14.0));
+		painter.drawLine(QPointF(14.0, 14.0), QPointF(14.0, 11.5));
+
+		painter.end();
+		return QIcon(pixmap);*/
+	}
+
 }
 
 QArcGISRestMainWindow::QArcGISRestMainWindow(QWidget* parent) : QMainWindow(parent)
@@ -230,6 +287,9 @@ void QArcGISRestMainWindow::InitializeUi()
 	addDockWidget(QLayerManagerPanel::GetDefaultDockWidgetArea(), layerManagerPanel);
 
 	InitializeStatusBar();
+
+	const QIcon appIcon(":/resources/Resources/Main.ico");
+	setWindowIcon(appIcon);
 }
 
 void QArcGISRestMainWindow::InitializeStatusBar()
@@ -296,11 +356,17 @@ void QArcGISRestMainWindow::InitializeStatusBar()
 	crsValidAreaVisibleButton->setAutoRaise(true);
 	crsValidAreaVisibleButton->setCursor(Qt::PointingHandCursor);
 	crsValidAreaVisibleButton->setToolButtonStyle(Qt::ToolButtonIconOnly);
-	crsValidAreaVisibleButton->setIcon(statusContentWidget->style()->standardIcon(QStyle::SP_DialogHelpButton));
+	crsValidAreaVisibleButton->setIcon(QIcon(":/resources/Resources/ArcGIS_Rest_Service_Show_Crs_BBOX_64.ico"));
 	crsValidAreaVisibleButton->setIconSize(QSize(18, 18));
 	crsValidAreaVisibleButton->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
 	crsValidAreaVisibleButton->setAccessibleName(QStringLiteral("显示坐标系适用区域"));
 	rightStatusLayout->addWidget(crsValidAreaVisibleButton, 0, Qt::AlignRight | Qt::AlignVCenter);
+	crsZoomValidAreaButton = new QToolButton(rightStatusWidget);
+	crsZoomValidAreaButton->setObjectName(QStringLiteral("crsZoomValidAreaButton"));
+	InitializeStatusToolButton(crsZoomValidAreaButton, QStringLiteral("缩放至坐标系适用范围"));
+	crsZoomValidAreaButton->setIcon(CreateZoomValidAreaIcon());
+	rightStatusLayout->addWidget(crsZoomValidAreaButton, 0, Qt::AlignRight | Qt::AlignVCenter);
+
 
 	statusLayout->addWidget(rightStatusWidget, 0, 4, Qt::AlignRight | Qt::AlignVCenter);
 
@@ -312,6 +378,10 @@ void QArcGISRestMainWindow::InitializeStatusBar()
 			OnCrsStatusButtonClicked();
 		});
 	connect(crsValidAreaVisibleButton, &QToolButton::toggled, this, &QArcGISRestMainWindow::OnCrsValidAreaVisibleButtonToggled);
+	connect(crsZoomValidAreaButton, &QToolButton::clicked, this, [this](bool)
+		{
+			OnCrsZoomValidAreaButtonClicked();
+		});
 
 	connect(mainCanvas, &QMainCanvas::MousePositionChanged, this, &QArcGISRestMainWindow::UpdateMousePositionStatus);
 	connect(mainCanvas, &QMainCanvas::ViewExtentDisplayChanged, this, &QArcGISRestMainWindow::UpdateViewExtentStatus);
@@ -322,6 +392,7 @@ void QArcGISRestMainWindow::InitializeStatusBar()
 	UpdateViewExtentStatus(mainCanvas->GetCurrentViewExtent());
 	UpdateCrsStatus(mainCanvas->GetCrsDisplayText());
 	UpdateCrsValidAreaVisibleButtonTooltip();
+	UpdateCrsZoomValidAreaButtonState();
 	BalanceStatusSideWidgetWidths();
 }
 
@@ -391,6 +462,7 @@ void QArcGISRestMainWindow::UpdateCrsStatus(const QString& crsDisplayText)
 	}
 
 	crsStatusButton->setText(FormatCrsStatusText(crsDisplayText));
+	UpdateCrsZoomValidAreaButtonState();
 	BalanceStatusSideWidgetWidths();
 }
 
@@ -408,6 +480,25 @@ void QArcGISRestMainWindow::UpdateCrsValidAreaVisibleButtonTooltip()
 	else
 	{
 		crsValidAreaVisibleButton->setToolTip(QStringLiteral("当前未显示坐标系适用区域。点击后显示坐标系适用区域。"));
+	}
+}
+
+void QArcGISRestMainWindow::UpdateCrsZoomValidAreaButtonState()
+{
+	if (!crsZoomValidAreaButton)
+	{
+		return;
+	}
+
+	const bool hasCrs = mainCanvas && !mainCanvas->GetCrsWkt().empty();
+	crsZoomValidAreaButton->setEnabled(hasCrs);
+	if (hasCrs)
+	{
+		crsZoomValidAreaButton->setToolTip(QStringLiteral("缩放至当前坐标系的最大适用范围。"));
+	}
+	else
+	{
+		crsZoomValidAreaButton->setToolTip(QStringLiteral("当前未设置坐标系，无法缩放至坐标系适用范围。"));
 	}
 }
 
@@ -474,4 +565,17 @@ void QArcGISRestMainWindow::OnCrsValidAreaVisibleButtonToggled(bool checked)
 	}
 
 	UpdateCrsValidAreaVisibleButtonTooltip();
+}
+
+void QArcGISRestMainWindow::OnCrsZoomValidAreaButtonClicked()
+{
+	if (!mainCanvas)
+	{
+		return;
+	}
+
+	if (!mainCanvas->ZoomToCrsValidArea(0.05))
+	{
+		statusBar()->showMessage(QStringLiteral("当前坐标系没有可用的适用范围。"), 3000);
+	}
 }
