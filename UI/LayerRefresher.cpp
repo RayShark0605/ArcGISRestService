@@ -232,130 +232,69 @@ namespace
 	}
 
 
-	std::string EscapeJsonString(const std::string& text)
+	bool IsPositiveFiniteDouble(double value)
 	{
-		std::string result;
-		result.reserve(text.size() + text.size() / 8 + 8);
-
-		static const char hexChars[] = "0123456789ABCDEF";
-		for (unsigned char ch : text)
-		{
-			switch (ch)
-			{
-			case '"':
-				result += "\\\"";
-				break;
-			case '\\':
-				result += "\\\\";
-				break;
-			case '\b':
-				result += "\\b";
-				break;
-			case '\f':
-				result += "\\f";
-				break;
-			case '\n':
-				result += "\\n";
-				break;
-			case '\r':
-				result += "\\r";
-				break;
-			case '\t':
-				result += "\\t";
-				break;
-			default:
-				if (ch < 0x20)
-				{
-					result += "\\u00";
-					result.push_back(hexChars[(ch >> 4) & 0x0F]);
-					result.push_back(hexChars[ch & 0x0F]);
-				}
-				else
-				{
-					result.push_back(static_cast<char>(ch));
-				}
-				break;
-			}
-		}
-
-		return result;
+		return std::isfinite(value) && value > 0.0;
 	}
 
-	std::string ExtractEpsgCodeFromEpsgString(const std::string& epsgStringUtf8)
+	GB_Rectangle AdjustExtentToImageSizeAspectRatio(const GB_Rectangle& extent, int imageWidthInPixels, int imageHeightInPixels)
 	{
-		const std::string trimmed = GB_Utf8Trim(epsgStringUtf8);
-		if (trimmed.empty())
+		if (!extent.IsValid() || imageWidthInPixels <= 0 || imageHeightInPixels <= 0)
 		{
-			return std::string();
+			return extent;
 		}
 
-		const std::string prefix = "EPSG:";
-		if (!StartsWithAsciiNoCase(trimmed, prefix))
+		const double extentWidth = extent.Width();
+		const double extentHeight = extent.Height();
+		if (!IsPositiveFiniteDouble(extentWidth) || !IsPositiveFiniteDouble(extentHeight))
 		{
-			return std::string();
+			return extent;
 		}
 
-		const std::string code = GB_Utf8Trim(trimmed.substr(prefix.size()));
-		if (code.empty())
+		const double imageAspectRatio = static_cast<double>(imageWidthInPixels) / static_cast<double>(imageHeightInPixels);
+		const double extentAspectRatio = extentWidth / extentHeight;
+		if (!IsPositiveFiniteDouble(imageAspectRatio) || !IsPositiveFiniteDouble(extentAspectRatio))
 		{
-			return std::string();
+			return extent;
 		}
 
-		for (char ch : code)
+		const double ratioDifference = std::fabs(extentAspectRatio - imageAspectRatio) / imageAspectRatio;
+		if (ratioDifference <= 1e-12)
 		{
-			if (!std::isdigit(static_cast<unsigned char>(ch)))
+			return extent;
+		}
+
+		const GB_Point2d center = extent.Center();
+		if (!center.IsValid())
+		{
+			return extent;
+		}
+
+		GB_Rectangle adjustedExtent = extent;
+		if (extentAspectRatio < imageAspectRatio)
+		{
+			const double adjustedWidth = extentHeight * imageAspectRatio;
+			if (!IsPositiveFiniteDouble(adjustedWidth))
 			{
-				return std::string();
+				return extent;
 			}
-		}
-		return code;
-	}
 
-	std::string BuildArcGISSpatialReferenceQueryValue(const std::string& wktUtf8)
-	{
-		const std::string trimmedWkt = GB_Utf8Trim(wktUtf8);
-		if (trimmedWkt.empty() || !GeoCrsManager::IsDefinitionValidCached(trimmedWkt))
-		{
-			return std::string();
+			const double halfWidth = adjustedWidth * 0.5;
+			adjustedExtent.Set(center.x - halfWidth, extent.minY, center.x + halfWidth, extent.maxY);
 		}
-
-		const std::string epsgCode = ExtractEpsgCodeFromEpsgString(GeoCrsManager::WktToEpsgCodeUtf8(trimmedWkt));
-		if (!epsgCode.empty())
+		else
 		{
-			return epsgCode;
-		}
-
-		std::string esriWkt = trimmedWkt;
-		const std::shared_ptr<const GeoCrs> crs = GeoCrsManager::GetFromDefinitionCached(trimmedWkt);
-		if (crs && crs->IsValid())
-		{
-			const std::string exportedWkt = crs->ExportToWktUtf8(GeoCrs::WktFormat::Wkt1Esri, false);
-			if (!GB_Utf8Trim(exportedWkt).empty())
+			const double adjustedHeight = extentWidth / imageAspectRatio;
+			if (!IsPositiveFiniteDouble(adjustedHeight))
 			{
-				esriWkt = exportedWkt;
+				return extent;
 			}
+
+			const double halfHeight = adjustedHeight * 0.5;
+			adjustedExtent.Set(extent.minX, center.y - halfHeight, extent.maxX, center.y + halfHeight);
 		}
 
-		return std::string("{\"wkt\":\"") + EscapeJsonString(esriWkt) + "\"}";
-	}
-
-	std::string AddExportSpatialReferenceParameters(const std::string& requestUrl, const std::string& spatialReferenceValue, bool isImageServer)
-	{
-		if (requestUrl.empty() || spatialReferenceValue.empty())
-		{
-			return requestUrl;
-		}
-
-		std::string resultUrl = requestUrl;
-		resultUrl = GB_UrlOperator::SetUrlQueryValue(resultUrl, "bboxSR", spatialReferenceValue);
-		resultUrl = GB_UrlOperator::SetUrlQueryValue(resultUrl, "imageSR", spatialReferenceValue);
-
-		if (isImageServer)
-		{
-			resultUrl = GB_UrlOperator::SetUrlQueryValue(resultUrl, "adjustAspectRatio", "false");
-		}
-
-		return resultUrl;
+		return adjustedExtent.IsValid() ? adjustedExtent : extent;
 	}
 
 	bool TryGetTargetPixelSize(const GB_Rectangle& targetExtent, int targetWidthInPixels, int targetHeightInPixels, double& outPixelSizeX, double& outPixelSizeY)
@@ -859,6 +798,12 @@ namespace
 			return std::vector<ImageRequestItem>();
 		}
 
+		const GB_Rectangle exportViewExtent = AdjustExtentToImageSizeAspectRatio(input.viewExtent, input.viewExtentWidthInPixels, input.viewExtentHeightInPixels);
+		if (!exportViewExtent.IsValid())
+		{
+			return std::vector<ImageRequestItem>();
+		}
+
 		std::vector<ImageRequestItem> requestItems;
 		requestItems.reserve(static_cast<size_t>(numStepsInWidth * numStepsInHeight));
 
@@ -882,10 +827,10 @@ namespace
 					continue;
 				}
 
-				const double imageMinX = input.viewExtent.minX + input.viewExtent.Width() * static_cast<double>(pixelStartX) / static_cast<double>(input.viewExtentWidthInPixels);
-				const double imageMaxX = input.viewExtent.minX + input.viewExtent.Width() * static_cast<double>(pixelEndX) / static_cast<double>(input.viewExtentWidthInPixels);
-				const double imageMinY = input.viewExtent.minY + input.viewExtent.Height() * static_cast<double>(pixelStartY) / static_cast<double>(input.viewExtentHeightInPixels);
-				const double imageMaxY = input.viewExtent.minY + input.viewExtent.Height() * static_cast<double>(pixelEndY) / static_cast<double>(input.viewExtentHeightInPixels);
+				const double imageMinX = exportViewExtent.minX + exportViewExtent.Width() * static_cast<double>(pixelStartX) / static_cast<double>(input.viewExtentWidthInPixels);
+				const double imageMaxX = exportViewExtent.minX + exportViewExtent.Width() * static_cast<double>(pixelEndX) / static_cast<double>(input.viewExtentWidthInPixels);
+				const double imageMinY = exportViewExtent.minY + exportViewExtent.Height() * static_cast<double>(pixelStartY) / static_cast<double>(input.viewExtentHeightInPixels);
+				const double imageMaxY = exportViewExtent.minY + exportViewExtent.Height() * static_cast<double>(pixelEndY) / static_cast<double>(input.viewExtentHeightInPixels);
 
 				const std::string imageSizeInfo = GB_Utf8Format("%d,%d", imageWidth, imageHeight);
 				const std::string imageBBoxInfo = GB_Utf8Format("%.17g,%.17g,%.17g,%.17g", imageMinX, imageMinY, imageMaxX, imageMaxY);
@@ -900,6 +845,10 @@ namespace
 					imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "layers", layerInfo);
 				}
 				imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "transparent", "true");
+				if (input.isImageServer)
+				{
+					imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "adjustAspectRatio", "false");
+				}
 				imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "f", "image");
 				if (input.dpi > 0)
 				{
@@ -1409,19 +1358,14 @@ private:
 				continue;
 			}
 
-			// 对动态 MapServer / ImageServer，优先让 ArcGIS Server 直接按 Canvas CRS 导出。
-			// 这样 bbox 与 size 的宽高比天然一致，并且 f=image 无法返回“服务端实际调整后的 extent”也不会再造成显示偏移。
-			const bool preferServerSideDynamicProjection = !isTiled && !AreCrsEquivalent(serviceRequestWkt, canvasWkt);
-			const std::string serverSideSpatialReferenceValue = preferServerSideDynamicProjection ? BuildArcGISSpatialReferenceQueryValue(canvasWkt) : std::string();
-			const bool useServerSideDynamicProjection = !serverSideSpatialReferenceValue.empty();
-			const std::string requestWkt = useServerSideDynamicProjection ? canvasWkt : serviceRequestWkt;
+			// 统一按服务自身 CRS 组织请求，再在本地重投影到 Canvas CRS。
+			// 原因：ArcGIS REST 虽允许 bboxSR/imageSR 使用 WKID 或 SR JSON，但服务端不保证能正确识别每一个 EPSG/WKT；
+			// 对 EPSG:27705 这类 ArcGIS Server 可能不支持的 CRS，直接让服务端输出该 CRS 会得到空白图。
+			// 本地重投影可以把服务端 CRS 支持范围的不确定性收敛到客户端 PROJ/GDAL，行为更可控。
+			const std::string requestWkt = serviceRequestWkt;
 
 			GB_Rectangle requestViewExtent;
-			if (useServerSideDynamicProjection)
-			{
-				requestViewExtent = currentViewExtent;
-			}
-			else if (!TryTransformRectangleBetweenCrs(canvasWkt, requestWkt, currentViewExtent, requestViewExtent))
+			if (!TryTransformRectangleBetweenCrs(canvasWkt, requestWkt, currentViewExtent, requestViewExtent))
 			{
 				continue;
 			}
@@ -1466,11 +1410,6 @@ private:
 				}
 
 				ImageRequestItem requestItem = rawRequestItem;
-				if (useServerSideDynamicProjection)
-				{
-					requestItem.requestUrl = AddExportSpatialReferenceParameters(requestItem.requestUrl, serverSideSpatialReferenceValue, isImageServer);
-					requestItem.uid = GB_Md5Hash(requestItem.requestUrl);
-				}
 
 				const std::string tileUid = BuildLayerTileUid(layer.layerUid, requestItem, canvasWkt);
 				TargetTileRecord target;
@@ -1791,7 +1730,7 @@ private:
 		return GuessFileExtFromImageFormatForLayerRefresher(task.requestItem.imageFormat);
 	}
 
-	static void DownloadCompleteCallback(const std::string& name, int64_t elapsedNs)
+	static void QDebugCallback(const std::string& name, int64_t elapsedNs)
 	{
 		qDebug() << QString::fromStdString(name) << ":" << elapsedNs / 1000000.0 << "ms";
 	}
@@ -1818,8 +1757,16 @@ private:
 #if 1
 		GB_NetworkResponse response;
 		{
-			GB_ScopeTimer timer("download", &std::cerr, DownloadCompleteCallback);
+			//GB_ScopeTimer timer("download", &std::cerr, QDebugCallback);
+			GB_Timer timer;
+			timer.Start();
 			response = GB_RequestUrlData(downloadUrl, task.networkOptions);
+			const int64_t timeConsuming = timer.ElapsedMilliseconds();
+			if (timeConsuming > 2000)
+			{
+				qDebug() << "Download slow:" << QString::fromStdString(downloadUrl) << timeConsuming << "ms";
+			}
+
 			if (!response.ok || response.body.empty())
 			{
 				return false;
@@ -1832,13 +1779,13 @@ private:
 			return false;
 		}
 #endif
-		
+
 		if (!outImage.LoadFromMemory(response.body.data(), response.body.size(), loadOptions) || outImage.IsEmpty())
 		{
 			outImage.Clear();
 			return false;
 		}
-		
+
 		const std::string preferredFileExt = GB_GuessFileExt(GB_StringToByteBuffer(response.body));
 		TileImageCache::PutEncodedImage(cacheKey, response.body, preferredFileExt);
 		return true;
@@ -1904,11 +1851,23 @@ private:
 				reprojectOptions.clampToCrsValidArea = true;
 
 				GeoImage reprojectedImage;
+#if 1
+				{
+					GB_ScopeTimer timer("reproject", &std::cerr, QDebugCallback);
+					if (!GeoCrsTransform::ReprojectGeoImage(sourceGeoImage, task.targetWktUtf8, reprojectedImage, reprojectOptions) || !reprojectedImage.IsValid())
+					{
+						PostTileTaskFinishedIfCurrent(task.generation);
+						return;
+					}
+				}
+#else
 				if (!GeoCrsTransform::ReprojectGeoImage(sourceGeoImage, task.targetWktUtf8, reprojectedImage, reprojectOptions) || !reprojectedImage.IsValid())
 				{
 					PostTileTaskFinishedIfCurrent(task.generation);
 					return;
 				}
+#endif
+				
 
 				displayImage = std::move(reprojectedImage.image);
 				displayExtent = reprojectedImage.boundingBox.rect;

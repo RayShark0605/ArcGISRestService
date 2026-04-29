@@ -4,6 +4,7 @@
 #include "GeoCrsManager.h"
 
 #include "GeoBase/GB_Logger.h"
+#include "GeoBase/GB_Math.h"
 #include "GeoBase/GB_Utf8String.h"
 
 #include "GeoBase/Geometry/GB_Point2d.h"
@@ -964,6 +965,189 @@ namespace
         return TryScaleOutputSizeToLimits(outWidth, outHeight, options);
     }
 
+    struct ImageReprojectMapPoint
+    {
+        bool isValid = false;
+        double sourcePixelX = 0.0;
+        double sourcePixelY = 0.0;
+    };
+
+    struct ImageReprojectRowApproxContext
+    {
+        TransformItem* inverseItem = nullptr;
+        float* mapXRow = nullptr;
+        float* mapYRow = nullptr;
+
+        size_t row = 0;
+        size_t outputWidth = 0;
+
+        GB_Rectangle targetRect;
+        GB_Rectangle sourceRect;
+        GB_Rectangle sourceWorkingRect;
+
+        double sourcePixelSizeX = 0.0;
+        double sourcePixelSizeY = 0.0;
+        double targetPixelSizeX = 0.0;
+        double targetPixelSizeY = 0.0;
+
+        double approxErrorInSourcePixels = 0.0;
+        size_t maxApproxSegmentLength = 0;
+
+        bool rowHasAnyMappedPixel = false;
+    };
+
+    static ImageReprojectMapPoint ExactMapTargetPixelToSourcePixel(const ImageReprojectRowApproxContext& context, size_t col)
+    {
+        ImageReprojectMapPoint result;
+
+        if (context.inverseItem == nullptr || context.inverseItem->transform == nullptr || context.outputWidth == 0)
+        {
+            return result;
+        }
+
+        const double targetX = context.targetRect.minX + (static_cast<double>(col) + 0.5) * context.targetPixelSizeX;
+        const double targetY = context.targetRect.maxY - (static_cast<double>(context.row) + 0.5) * context.targetPixelSizeY;
+
+        double sourceX = 0.0;
+        double sourceY = 0.0;
+        if (!TryTransformSingleXYInternal(*context.inverseItem, targetX, targetY, sourceX, sourceY))
+        {
+            return result;
+        }
+
+        if (!IsInsideRectangle(context.sourceWorkingRect, sourceX, sourceY))
+        {
+            return result;
+        }
+
+        const double sourcePixelX = (sourceX - context.sourceRect.minX) / context.sourcePixelSizeX - 0.5;
+        const double sourcePixelY = (context.sourceRect.maxY - sourceY) / context.sourcePixelSizeY - 0.5;
+        if (!IsFinite(sourcePixelX) || !IsFinite(sourcePixelY))
+        {
+            return result;
+        }
+
+        result.isValid = true;
+        result.sourcePixelX = sourcePixelX;
+        result.sourcePixelY = sourcePixelY;
+        return result;
+    }
+
+    static void WriteApproxMapPoint(ImageReprojectRowApproxContext& context, size_t col, const ImageReprojectMapPoint& point)
+    {
+        if (!point.isValid || context.mapXRow == nullptr || context.mapYRow == nullptr || col >= context.outputWidth)
+        {
+            return;
+        }
+
+        context.mapXRow[col] = static_cast<float>(point.sourcePixelX);
+        context.mapYRow[col] = static_cast<float>(point.sourcePixelY);
+        context.rowHasAnyMappedPixel = true;
+    }
+
+    static void WriteApproxMapSegment(ImageReprojectRowApproxContext& context, size_t leftCol, size_t rightCol, const ImageReprojectMapPoint& leftPoint, const ImageReprojectMapPoint& rightPoint)
+    {
+        if (leftCol > rightCol || !leftPoint.isValid || !rightPoint.isValid)
+        {
+            return;
+        }
+
+        if (leftCol == rightCol)
+        {
+            WriteApproxMapPoint(context, leftCol, leftPoint);
+            return;
+        }
+
+        const double span = static_cast<double>(rightCol - leftCol);
+        for (size_t col = leftCol; col <= rightCol; col++)
+        {
+            const double t = static_cast<double>(col - leftCol) / span;
+            ImageReprojectMapPoint point;
+            point.isValid = true;
+            point.sourcePixelX = GB_Lerp(leftPoint.sourcePixelX, rightPoint.sourcePixelX, t);
+            point.sourcePixelY = GB_Lerp(leftPoint.sourcePixelY, rightPoint.sourcePixelY, t);
+            WriteApproxMapPoint(context, col, point);
+        }
+    }
+
+    static bool CanAcceptApproxSegment(const ImageReprojectRowApproxContext& context, size_t leftCol, size_t midCol, size_t rightCol, const ImageReprojectMapPoint& leftPoint, const ImageReprojectMapPoint& midPoint, const ImageReprojectMapPoint& rightPoint)
+    {
+        if (!leftPoint.isValid || !midPoint.isValid || !rightPoint.isValid || rightCol <= leftCol)
+        {
+            return false;
+        }
+
+        if (context.maxApproxSegmentLength > 0 && rightCol - leftCol > context.maxApproxSegmentLength)
+        {
+            return false;
+        }
+
+        const double t = static_cast<double>(midCol - leftCol) / static_cast<double>(rightCol - leftCol);
+        const double approxMidX = GB_Lerp(leftPoint.sourcePixelX, rightPoint.sourcePixelX, t);
+        const double approxMidY = GB_Lerp(leftPoint.sourcePixelY, rightPoint.sourcePixelY, t);
+        const double error = std::fabs(approxMidX - midPoint.sourcePixelX) + std::fabs(approxMidY - midPoint.sourcePixelY);
+        return IsFinite(error) && error <= context.approxErrorInSourcePixels;
+    }
+
+    static void BuildApproxMapSegment(ImageReprojectRowApproxContext& context, size_t leftCol, size_t rightCol, const ImageReprojectMapPoint& leftPoint, const ImageReprojectMapPoint& rightPoint)
+    {
+        if (leftCol > rightCol)
+        {
+            return;
+        }
+
+        if (leftCol == rightCol)
+        {
+            WriteApproxMapPoint(context, leftCol, leftPoint);
+            return;
+        }
+
+        if (rightCol == leftCol + 1)
+        {
+            WriteApproxMapPoint(context, leftCol, leftPoint);
+            WriteApproxMapPoint(context, rightCol, rightPoint);
+            return;
+        }
+
+        const size_t midCol = leftCol + (rightCol - leftCol) / 2;
+        const ImageReprojectMapPoint midPoint = ExactMapTargetPixelToSourcePixel(context, midCol);
+
+        if (CanAcceptApproxSegment(context, leftCol, midCol, rightCol, leftPoint, midPoint, rightPoint))
+        {
+            WriteApproxMapSegment(context, leftCol, rightCol, leftPoint, rightPoint);
+            return;
+        }
+
+        if (!leftPoint.isValid && !midPoint.isValid && !rightPoint.isValid && rightCol - leftCol <= 8)
+        {
+            return;
+        }
+
+        BuildApproxMapSegment(context, leftCol, midCol, leftPoint, midPoint);
+        BuildApproxMapSegment(context, midCol, rightCol, midPoint, rightPoint);
+    }
+
+    static void BuildApproxMapRow(ImageReprojectRowApproxContext& context)
+    {
+        if (context.outputWidth == 0 || context.mapXRow == nullptr || context.mapYRow == nullptr)
+        {
+            return;
+        }
+
+        if (context.outputWidth == 1)
+        {
+            const ImageReprojectMapPoint point = ExactMapTargetPixelToSourcePixel(context, 0);
+            WriteApproxMapPoint(context, 0, point);
+            return;
+        }
+
+        const size_t leftCol = 0;
+        const size_t rightCol = context.outputWidth - 1;
+        const ImageReprojectMapPoint leftPoint = ExactMapTargetPixelToSourcePixel(context, leftCol);
+        const ImageReprojectMapPoint rightPoint = ExactMapTargetPixelToSourcePixel(context, rightCol);
+        BuildApproxMapSegment(context, leftCol, rightCol, leftPoint, rightPoint);
+    }
+
 }
 
 GeoImage::GeoImage() = default;
@@ -1374,8 +1558,9 @@ bool GeoCrsTransform::ReprojectGeoImage(const GeoImage& sourceImage, const std::
         std::atomic_bool allOk(true);
         std::atomic_bool hasAnyMappedPixel(false);
         const bool useParallel = options.enableOpenMP && outputHeight <= static_cast<size_t>(std::numeric_limits<int>::max());
+        const bool useApproxTransform = IsPositiveFinite(options.approxTransformErrorInSourcePixels) && outputWidth > 2;
 
-        auto buildRow = [&](size_t row, TransformItem& inverseItem, std::vector<double>& xValues, std::vector<double>& yValues, std::vector<int>& successFlags) {
+        auto buildExactRow = [&](size_t row, TransformItem& inverseItem, std::vector<double>& xValues, std::vector<double>& yValues, std::vector<int>& successFlags) {
             xValues.resize(outputWidth);
             yValues.resize(outputWidth);
 
@@ -1388,11 +1573,12 @@ bool GeoCrsTransform::ReprojectGeoImage(const GeoImage& sourceImage, const std::
 
             TryTransformXYArrayInternal(inverseItem, xValues, yValues, successFlags);
 
+            bool rowHasAnyMappedPixel = false;
             float* mapXRow = mapX.ptr<float>(static_cast<int>(row));
             float* mapYRow = mapY.ptr<float>(static_cast<int>(row));
             for (size_t col = 0; col < outputWidth; col++)
             {
-                if (successFlags[col] == FALSE)
+                if (col >= successFlags.size() || successFlags[col] == FALSE)
                 {
                     continue;
                 }
@@ -1412,8 +1598,37 @@ bool GeoCrsTransform::ReprojectGeoImage(const GeoImage& sourceImage, const std::
                 }
 
                 mapXRow[col] = static_cast<float>(sourcePixelX);
-                hasAnyMappedPixel.store(true, std::memory_order_relaxed);
                 mapYRow[col] = static_cast<float>(sourcePixelY);
+                rowHasAnyMappedPixel = true;
+            }
+
+            if (rowHasAnyMappedPixel)
+            {
+                hasAnyMappedPixel.store(true, std::memory_order_relaxed);
+            }
+            };
+
+        auto buildApproxRow = [&](size_t row, TransformItem& inverseItem) {
+            ImageReprojectRowApproxContext context;
+            context.inverseItem = &inverseItem;
+            context.mapXRow = mapX.ptr<float>(static_cast<int>(row));
+            context.mapYRow = mapY.ptr<float>(static_cast<int>(row));
+            context.row = row;
+            context.outputWidth = outputWidth;
+            context.targetRect = targetBoundingBox.rect;
+            context.sourceRect = workingSourceImage.boundingBox.rect;
+            context.sourceWorkingRect = sourceWorkingRect;
+            context.sourcePixelSizeX = sourcePixelSizeX;
+            context.sourcePixelSizeY = sourcePixelSizeY;
+            context.targetPixelSizeX = targetPixelSizeX;
+            context.targetPixelSizeY = targetPixelSizeY;
+            context.approxErrorInSourcePixels = options.approxTransformErrorInSourcePixels;
+            context.maxApproxSegmentLength = options.maxApproxTransformSegmentLength;
+
+            BuildApproxMapRow(context);
+            if (context.rowHasAnyMappedPixel)
+            {
+                hasAnyMappedPixel.store(true, std::memory_order_relaxed);
             }
             };
 
@@ -1440,7 +1655,14 @@ bool GeoCrsTransform::ReprojectGeoImage(const GeoImage& sourceImage, const std::
                         continue;
                     }
 
-                    buildRow(static_cast<size_t>(row), *inverseItem, xValues, yValues, successFlags);
+                    if (useApproxTransform)
+                    {
+                        buildApproxRow(static_cast<size_t>(row), *inverseItem);
+                    }
+                    else
+                    {
+                        buildExactRow(static_cast<size_t>(row), *inverseItem, xValues, yValues, successFlags);
+                    }
                 }
             }
         }
@@ -1458,7 +1680,14 @@ bool GeoCrsTransform::ReprojectGeoImage(const GeoImage& sourceImage, const std::
 
             for (size_t row = 0; row < outputHeight; row++)
             {
-                buildRow(row, *inverseItem, xValues, yValues, successFlags);
+                if (useApproxTransform)
+                {
+                    buildApproxRow(row, *inverseItem);
+                }
+                else
+                {
+                    buildExactRow(row, *inverseItem, xValues, yValues, successFlags);
+                }
             }
         }
 

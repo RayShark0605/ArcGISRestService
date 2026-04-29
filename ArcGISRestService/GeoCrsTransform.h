@@ -54,6 +54,18 @@ struct ARCGIS_RESTSERVICE_PORT GeoImageReprojectOptions
     size_t maxOutputPixelCount = 0;
     bool enableOpenMP = false;
     bool clampToCrsValidArea = true;
+
+    // 扫描线自适应近似变换误差阈值，单位为“源图像像素”。
+    // - >0：启用近似变换。算法会参考 gdalwarp 的线性近似思路，
+    //       用少量精确控制点约束插值误差，显著减少 PROJ/OGR 调用次数。
+    // - <=0：完全逐像素精确变换，行为更接近旧实现，但速度较慢。
+    // 默认 0.125 与 gdalwarp 常用默认误差阈值一致，适合交互式地图显示。
+    double approxTransformErrorInSourcePixels = 0.125;
+
+    // 单个近似线段允许覆盖的最大输出像素跨度。
+    // 值越小，控制点越密、结果越保守；值越大，速度越快但更依赖误差判定。
+    // 0 表示不限制线段长度，仅由误差阈值决定是否继续拆分。
+    size_t maxApproxTransformSegmentLength = 64;
 };
 
 // GeoCrsTransform
