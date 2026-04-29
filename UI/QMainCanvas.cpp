@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <limits>
 #include <memory>
 #include <unordered_set>
@@ -398,6 +399,8 @@ void QMainCanvas::SetCrsWkt(const std::string& wktUtf8)
 	crsWkt = wktUtf8;
 	UpdateCrsDisplayText();
 	InvalidateCrsValidAreaPolygonsCache();
+	InvalidateCrsValidAreaRectCache();
+	InvalidateCrsMetersPerUnitCache();
 	InvalidateMapContentCache();
 	hasPanPreview = false;
 	panPreviewPixmap = QPixmap();
@@ -712,12 +715,26 @@ void QMainCanvas::AddMapTile(const MapTile& tile)
 
 void QMainCanvas::AddMapTile(const MapTile& tile, double layerNumber)
 {
-	MapTile normalizedTile = tile;
-	normalizedTile.layerNumber = NormalizeLayerNumber(layerNumber);
+	CachedMapTile cachedTile;
+	if (!TryCreateCachedMapTile(tile, layerNumber, cachedTile))
+	{
+		return;
+	}
 
-	std::vector<MapTile> tiles;
-	tiles.push_back(std::move(normalizedTile));
-	AddMapTiles(tiles);
+	const bool shouldZoomToAddedTile = !viewExtent.IsValid();
+	const GB_Rectangle addedExtent = cachedTile.tile.extent;
+
+	InsertCachedMapTile(std::move(cachedTile));
+	InvalidateMapContentCache();
+
+	if (shouldZoomToAddedTile && addedExtent.IsValid())
+	{
+		ZoomToExtent(addedExtent, 0.05);
+	}
+	else
+	{
+		update();
+	}
 }
 
 void QMainCanvas::AddMapTiles(const std::vector<MapTile>& tiles)
@@ -732,28 +749,11 @@ void QMainCanvas::AddMapTiles(const std::vector<MapTile>& tiles)
 
 	for (const MapTile& tile : tiles)
 	{
-		if (!tile.extent.IsValid() || tile.image.IsEmpty())
-		{
-			continue;
-		}
-
 		CachedMapTile cachedTile;
-		cachedTile.tile = tile;
-		cachedTile.tile.layerNumber = NormalizeLayerNumber(tile.layerNumber);
-		if (cachedTile.tile.uid.empty())
+		if (TryCreateCachedMapTile(tile, tile.layerNumber, cachedTile))
 		{
-			cachedTile.tile.uid = cachedTile.tile.CalculateUid();
+			cachedTiles.push_back(std::move(cachedTile));
 		}
-
-		cachedTile.pixmap = CreateQPixmapFromGBImage(cachedTile.tile.image);
-		if (cachedTile.pixmap.isNull())
-		{
-			continue;
-		}
-
-		cachedTile.insertionSequence = nextDrawableInsertionSequence;
-		nextDrawableInsertionSequence++;
-		cachedTiles.push_back(std::move(cachedTile));
 	}
 
 	if (cachedTiles.empty())
@@ -769,13 +769,20 @@ void QMainCanvas::AddMapTiles(const std::vector<MapTile>& tiles)
 		addedExtent.Expand(cachedTile.tile.extent);
 	}
 
+	std::sort(cachedTiles.begin(), cachedTiles.end(), IsCachedMapTilePaintOrderLess);
+
+	const size_t oldMapTileCount = mapTiles.size();
 	mapTiles.reserve(mapTiles.size() + cachedTiles.size());
 	for (CachedMapTile& cachedTile : cachedTiles)
 	{
 		mapTiles.push_back(std::move(cachedTile));
 	}
 
-	std::sort(mapTiles.begin(), mapTiles.end(), IsCachedMapTilePaintOrderLess);
+	if (oldMapTileCount > 0)
+	{
+		std::inplace_merge(mapTiles.begin(), mapTiles.begin() + static_cast<std::ptrdiff_t>(oldMapTileCount), mapTiles.end(), IsCachedMapTilePaintOrderLess);
+	}
+
 	InvalidateMapContentCache();
 
 	if (shouldZoomToAddedTiles && addedExtent.IsValid())
@@ -1215,10 +1222,26 @@ void QMainCanvas::dropEvent(QDropEvent* event)
 		return;
 	}
 
-	const QString nodeUid = QString::fromUtf8(ReadJsonText(event->mimeData(), "uid"));
-	const QString url = QString::fromUtf8(ReadJsonText(event->mimeData(), "url"));
-	const QString text = QString::fromUtf8(ReadJsonText(event->mimeData(), "text"));
-	const int nodeType = ReadJsonInt(event->mimeData(), "nodeType", 0);
+	const QByteArray jsonBytes = event->mimeData()->data(GetServiceNodeMimeType());
+	const QJsonDocument document = QJsonDocument::fromJson(jsonBytes);
+	const QJsonObject object = document.isObject() ? document.object() : QJsonObject();
+
+	const auto ReadStringValue = [&object](const char* key) -> QString
+		{
+			const QJsonValue value = object.value(QString::fromLatin1(key));
+			return value.isString() ? value.toString() : QString();
+		};
+
+	const auto ReadIntValue = [&object](const char* key, int defaultValue) -> int
+		{
+			const QJsonValue value = object.value(QString::fromLatin1(key));
+			return value.isDouble() ? value.toInt(defaultValue) : defaultValue;
+		};
+
+	const QString nodeUid = ReadStringValue("uid");
+	const QString url = ReadStringValue("url");
+	const QString text = ReadStringValue("text");
+	const int nodeType = ReadIntValue("nodeType", 0);
 
 	emit LayerDropRequested(nodeUid, url, text, nodeType);
 	event->acceptProposedAction();
@@ -1330,6 +1353,52 @@ bool QMainCanvas::IsCachedMapTilePaintOrderLess(const CachedMapTile& firstTile, 
 	return firstTile.insertionSequence < secondTile.insertionSequence;
 }
 
+bool QMainCanvas::TryCreateCachedMapTile(const MapTile& tile, double layerNumber, CachedMapTile& outCachedTile)
+{
+	outCachedTile = CachedMapTile();
+
+	if (!tile.extent.IsValid() || tile.image.IsEmpty())
+	{
+		return false;
+	}
+
+	CachedMapTile cachedTile;
+	cachedTile.tile = tile;
+	cachedTile.tile.layerNumber = NormalizeLayerNumber(layerNumber);
+	if (cachedTile.tile.uid.empty())
+	{
+		cachedTile.tile.uid = cachedTile.tile.CalculateUid();
+	}
+
+	cachedTile.tileExtentWidth = cachedTile.tile.extent.Width();
+	cachedTile.tileExtentHeight = cachedTile.tile.extent.Height();
+	if (!IsFinitePositive(cachedTile.tileExtentWidth) || !IsFinitePositive(cachedTile.tileExtentHeight))
+	{
+		return false;
+	}
+
+	cachedTile.pixmap = CreateQPixmapFromGBImage(cachedTile.tile.image);
+	if (cachedTile.pixmap.isNull())
+	{
+		return false;
+	}
+
+	cachedTile.pixmapWidth = static_cast<double>(cachedTile.pixmap.width());
+	cachedTile.pixmapHeight = static_cast<double>(cachedTile.pixmap.height());
+	if (!IsFinitePositive(cachedTile.pixmapWidth) || !IsFinitePositive(cachedTile.pixmapHeight))
+	{
+		return false;
+	}
+
+	cachedTile.inverseTileExtentWidth = 1.0 / cachedTile.tileExtentWidth;
+	cachedTile.inverseTileExtentHeight = 1.0 / cachedTile.tileExtentHeight;
+	cachedTile.insertionSequence = nextDrawableInsertionSequence;
+	nextDrawableInsertionSequence++;
+
+	outCachedTile = std::move(cachedTile);
+	return true;
+}
+
 void QMainCanvas::InsertCachedMapTile(CachedMapTile&& cachedTile)
 {
 	const auto insertIter = std::lower_bound(mapTiles.begin(), mapTiles.end(), cachedTile, IsCachedMapTilePaintOrderLess);
@@ -1344,6 +1413,22 @@ void QMainCanvas::DrawBackground(QPainter& painter) const
 bool QMainCanvas::TryGetCrsValidArea(GB_Rectangle& outValidArea) const
 {
 	outValidArea.Reset();
+
+	if (!crsValidAreaRectCacheDirty && crsValidAreaRectCacheCrsWkt == crsWkt)
+	{
+		if (!crsValidAreaRectCache.IsValid())
+		{
+			return false;
+		}
+
+		outValidArea = crsValidAreaRectCache;
+		return true;
+	}
+
+	crsValidAreaRectCache.Reset();
+	crsValidAreaRectCacheCrsWkt = crsWkt;
+	crsValidAreaRectCacheDirty = false;
+
 	if (crsWkt.empty())
 	{
 		return false;
@@ -1361,9 +1446,16 @@ bool QMainCanvas::TryGetCrsValidArea(GB_Rectangle& outValidArea) const
 		return false;
 	}
 
-	outValidArea = validArea.rect;
-	outValidArea.Normalize();
-	return outValidArea.IsValid();
+	crsValidAreaRectCache = validArea.rect;
+	crsValidAreaRectCache.Normalize();
+	if (!crsValidAreaRectCache.IsValid())
+	{
+		crsValidAreaRectCache.Reset();
+		return false;
+	}
+
+	outValidArea = crsValidAreaRectCache;
+	return true;
 }
 
 bool QMainCanvas::TryGetCachedCrsValidAreaPolygonsExtent(GB_Rectangle& outExtent) const
@@ -1415,6 +1507,30 @@ bool QMainCanvas::TryBuildCrsValidAreaScreenPath(QPainterPath& outPath, GB_Recta
 	outPath.setFillRule(Qt::WindingFill);
 	outWorldExtent.Reset();
 
+	if (!crsValidAreaScreenPathCacheDirty &&
+		!crsValidAreaPolygonsCacheDirty &&
+		crsValidAreaScreenPathCacheCrsWkt == crsWkt &&
+		AreRectanglesNearlyEqual(crsValidAreaScreenPathCacheViewExtent, viewExtent) &&
+		AreNearlyEqual(crsValidAreaScreenPathCachePixelSize, pixelSize))
+	{
+		if (crsValidAreaScreenPathCache.isEmpty() || !crsValidAreaScreenPathWorldExtentCache.IsValid())
+		{
+			return false;
+		}
+
+		outPath = crsValidAreaScreenPathCache;
+		outWorldExtent = crsValidAreaScreenPathWorldExtentCache;
+		return true;
+	}
+
+	crsValidAreaScreenPathCache = QPainterPath();
+	crsValidAreaScreenPathCache.setFillRule(Qt::WindingFill);
+	crsValidAreaScreenPathWorldExtentCache.Reset();
+	crsValidAreaScreenPathCacheViewExtent = viewExtent;
+	crsValidAreaScreenPathCachePixelSize = pixelSize;
+	crsValidAreaScreenPathCacheCrsWkt = crsWkt;
+	crsValidAreaScreenPathCacheDirty = false;
+
 	if (!viewExtent.IsValid() || !IsFinitePositive(pixelSize))
 	{
 		return false;
@@ -1424,6 +1540,14 @@ bool QMainCanvas::TryBuildCrsValidAreaScreenPath(QPainterPath& outPath, GB_Recta
 	{
 		return false;
 	}
+
+	crsValidAreaScreenPathCache = QPainterPath();
+	crsValidAreaScreenPathCache.setFillRule(Qt::WindingFill);
+	crsValidAreaScreenPathWorldExtentCache.Reset();
+	crsValidAreaScreenPathCacheViewExtent = viewExtent;
+	crsValidAreaScreenPathCachePixelSize = pixelSize;
+	crsValidAreaScreenPathCacheCrsWkt = crsWkt;
+	crsValidAreaScreenPathCacheDirty = false;
 
 	const bool canUseCachedExtents = crsValidAreaPolygonExtentsCache.size() == crsValidAreaPolygonsCache.size();
 	for (size_t polygonIndex = 0; polygonIndex < crsValidAreaPolygonsCache.size(); polygonIndex++)
@@ -1469,13 +1593,23 @@ bool QMainCanvas::TryBuildCrsValidAreaScreenPath(QPainterPath& outPath, GB_Recta
 
 		if (screenPolygon.size() >= 3 && clippedPolygonExtent.IsValid())
 		{
-			outPath.addPolygon(screenPolygon);
-			outPath.closeSubpath();
-			outWorldExtent.Expand(clippedPolygonExtent);
+			crsValidAreaScreenPathCache.addPolygon(screenPolygon);
+			crsValidAreaScreenPathCache.closeSubpath();
+			crsValidAreaScreenPathWorldExtentCache.Expand(clippedPolygonExtent);
 		}
 	}
 
-	return !outPath.isEmpty() && outWorldExtent.IsValid();
+	if (crsValidAreaScreenPathCache.isEmpty() || !crsValidAreaScreenPathWorldExtentCache.IsValid())
+	{
+		crsValidAreaScreenPathCache = QPainterPath();
+		crsValidAreaScreenPathCache.setFillRule(Qt::WindingFill);
+		crsValidAreaScreenPathWorldExtentCache.Reset();
+		return false;
+	}
+
+	outPath = crsValidAreaScreenPathCache;
+	outWorldExtent = crsValidAreaScreenPathWorldExtentCache;
+	return true;
 }
 
 bool QMainCanvas::TryIntersectRectangleWithCrsValidAreaPolygons(const GB_Rectangle& rect, GB_Rectangle& outIntersectionExtent) const
@@ -1577,7 +1711,7 @@ bool QMainCanvas::IsRectangleIntersectsCachedCrsValidAreaPolygonExtent(const GB_
 
 void QMainCanvas::DrawMapTiles(QPainter& painter, const QRectF& exposedRect) const
 {
-	if (!viewExtent.IsValid())
+	if (!viewExtent.IsValid() || !IsFinitePositive(pixelSize))
 	{
 		return;
 	}
@@ -1609,6 +1743,10 @@ void QMainCanvas::DrawMapTiles(QPainter& painter, const QRectF& exposedRect) con
 	}
 
 	const QRectF safeExposedRect = exposedRect.isValid() ? exposedRect : QRectF(rect());
+	const double inversePixelSize = 1.0 / pixelSize;
+	const double viewMinX = viewExtent.minX;
+	const double viewMaxY = viewExtent.maxY;
+	const bool canUseCrsPolygonExtents = hasPreciseCrsClip && crsValidAreaPolygonExtentsCache.size() == crsValidAreaPolygonsCache.size();
 
 	if (hasPreciseCrsClip)
 	{
@@ -1621,7 +1759,9 @@ void QMainCanvas::DrawMapTiles(QPainter& painter, const QRectF& exposedRect) con
 
 	for (const CachedMapTile& cachedTile : mapTiles)
 	{
-		if (!cachedTile.tile.visible || !cachedTile.tile.extent.IsValid() || cachedTile.pixmap.isNull())
+		if (!cachedTile.tile.visible || cachedTile.pixmap.isNull() ||
+			!IsFinitePositive(cachedTile.tileExtentWidth) || !IsFinitePositive(cachedTile.tileExtentHeight) ||
+			!IsFinitePositive(cachedTile.pixmapWidth) || !IsFinitePositive(cachedTile.pixmapHeight))
 		{
 			continue;
 		}
@@ -1634,15 +1774,28 @@ void QMainCanvas::DrawMapTiles(QPainter& painter, const QRectF& exposedRect) con
 
 		if (hasPreciseCrsClip)
 		{
-			if (!IsRectangleIntersectsCachedCrsValidAreaPolygonExtent(clippedWorldRect))
-			{
-				continue;
-			}
-
 			clippedWorldRect = clippedWorldRect.Intersected(crsClipWorldExtent);
 			if (!clippedWorldRect.IsValid() || clippedWorldRect.Width() <= 0.0 || clippedWorldRect.Height() <= 0.0)
 			{
 				continue;
+			}
+
+			if (canUseCrsPolygonExtents)
+			{
+				bool mayIntersectCrsPolygon = false;
+				for (const GB_Rectangle& polygonExtent : crsValidAreaPolygonExtentsCache)
+				{
+					if (polygonExtent.IsValid() && polygonExtent.IsIntersects(clippedWorldRect))
+					{
+						mayIntersectCrsPolygon = true;
+						break;
+					}
+				}
+
+				if (!mayIntersectCrsPolygon)
+				{
+					continue;
+				}
 			}
 		}
 		else if (hasRectangularCrsClip)
@@ -1654,31 +1807,23 @@ void QMainCanvas::DrawMapTiles(QPainter& painter, const QRectF& exposedRect) con
 			}
 		}
 
-		const QRectF targetRect = WorldRectangleToScreenRectangle(clippedWorldRect);
+		const QRectF targetRect(
+			(clippedWorldRect.minX - viewMinX) * inversePixelSize,
+			(viewMaxY - clippedWorldRect.maxY) * inversePixelSize,
+			clippedWorldRect.Width() * inversePixelSize,
+			clippedWorldRect.Height() * inversePixelSize);
+
 		if (!targetRect.isValid() || !targetRect.intersects(safeExposedRect))
 		{
 			continue;
 		}
 
-		const double tileWidth = cachedTile.tile.extent.Width();
-		const double tileHeight = cachedTile.tile.extent.Height();
-		if (!IsFinitePositive(tileWidth) || !IsFinitePositive(tileHeight))
-		{
-			continue;
-		}
-
-		const double imageWidth = static_cast<double>(cachedTile.pixmap.width());
-		const double imageHeight = static_cast<double>(cachedTile.pixmap.height());
-		if (!IsFinitePositive(imageWidth) || !IsFinitePositive(imageHeight))
-		{
-			continue;
-		}
-
 		const QRectF sourceRect(
-			(clippedWorldRect.minX - cachedTile.tile.extent.minX) / tileWidth * imageWidth,
-			(cachedTile.tile.extent.maxY - clippedWorldRect.maxY) / tileHeight * imageHeight,
-			clippedWorldRect.Width() / tileWidth * imageWidth,
-			clippedWorldRect.Height() / tileHeight * imageHeight);
+			(clippedWorldRect.minX - cachedTile.tile.extent.minX) * cachedTile.inverseTileExtentWidth * cachedTile.pixmapWidth,
+			(cachedTile.tile.extent.maxY - clippedWorldRect.maxY) * cachedTile.inverseTileExtentHeight * cachedTile.pixmapHeight,
+			clippedWorldRect.Width() * cachedTile.inverseTileExtentWidth * cachedTile.pixmapWidth,
+			clippedWorldRect.Height() * cachedTile.inverseTileExtentHeight * cachedTile.pixmapHeight);
+
 		if (!sourceRect.isValid())
 		{
 			continue;
@@ -2012,6 +2157,7 @@ bool QMainCanvas::EnsureCrsValidAreaPolygonsCache() const
 
 	crsValidAreaPolygonsCache.clear();
 	crsValidAreaPolygonExtentsCache.clear();
+	InvalidateCrsValidAreaScreenPathCache();
 	crsValidAreaPolygonsCacheCrsWkt = crsWkt;
 	crsValidAreaPolygonsCacheDirty = false;
 
@@ -2086,6 +2232,63 @@ void QMainCanvas::InvalidateCrsValidAreaPolygonsCache() const
 	crsValidAreaPolygonsCacheCrsWkt.clear();
 	crsValidAreaPolygonsCache.clear();
 	crsValidAreaPolygonExtentsCache.clear();
+	InvalidateCrsValidAreaScreenPathCache();
+}
+
+void QMainCanvas::InvalidateCrsValidAreaRectCache() const
+{
+	crsValidAreaRectCacheDirty = true;
+	crsValidAreaRectCacheCrsWkt.clear();
+	crsValidAreaRectCache.Reset();
+}
+
+void QMainCanvas::InvalidateCrsValidAreaScreenPathCache() const
+{
+	crsValidAreaScreenPathCacheDirty = true;
+	crsValidAreaScreenPathCacheCrsWkt.clear();
+	crsValidAreaScreenPathCacheViewExtent.Reset();
+	crsValidAreaScreenPathCachePixelSize = 0.0;
+	crsValidAreaScreenPathCache = QPainterPath();
+	crsValidAreaScreenPathCache.setFillRule(Qt::WindingFill);
+	crsValidAreaScreenPathWorldExtentCache.Reset();
+}
+
+double QMainCanvas::GetCrsMetersPerUnitCached() const
+{
+	if (!crsMetersPerUnitCacheDirty && crsMetersPerUnitCacheCrsWkt == crsWkt)
+	{
+		return crsMetersPerUnitCache;
+	}
+
+	crsMetersPerUnitCacheDirty = false;
+	crsMetersPerUnitCacheCrsWkt = crsWkt;
+	crsMetersPerUnitCache = 0.0;
+
+	if (crsWkt.empty())
+	{
+		return 0.0;
+	}
+
+	std::shared_ptr<const GeoCrs> crs = GeoCrsManager::GetFromWktCached(crsWkt);
+	if (!crs || !crs->IsValid())
+	{
+		return 0.0;
+	}
+
+	const double metersPerUnit = crs->GetMetersPerUnit();
+	if (IsFinitePositive(metersPerUnit))
+	{
+		crsMetersPerUnitCache = metersPerUnit;
+	}
+
+	return crsMetersPerUnitCache;
+}
+
+void QMainCanvas::InvalidateCrsMetersPerUnitCache() const
+{
+	crsMetersPerUnitCacheDirty = true;
+	crsMetersPerUnitCacheCrsWkt.clear();
+	crsMetersPerUnitCache = 0.0;
 }
 
 bool QMainCanvas::IsDrawableUidInSet(const std::vector<std::string>& drawablesUids, const std::string& uid) const
@@ -2455,18 +2658,7 @@ double QMainCanvas::CalculateApproximateMetersPerPixel() const
 		return 0.0;
 	}
 
-	if (crsWkt.empty())
-	{
-		return pixelSize;
-	}
-
-	std::shared_ptr<const GeoCrs> crs = GeoCrsManager::GetFromWktCached(crsWkt);
-	if (!crs || !crs->IsValid())
-	{
-		return pixelSize;
-	}
-
-	const double metersPerUnit = crs->GetMetersPerUnit();
+	const double metersPerUnit = GetCrsMetersPerUnitCached();
 	if (!IsFinitePositive(metersPerUnit))
 	{
 		return pixelSize;

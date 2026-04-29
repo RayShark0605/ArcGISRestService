@@ -2,6 +2,7 @@
 
 #include <QImage>
 #include <QPixmap>
+#include <QPainterPath>
 #include <QPoint>
 #include <QRectF>
 #include <QString>
@@ -110,6 +111,12 @@ private:
 	{
 		MapTile tile;
 		QPixmap pixmap;
+		double tileExtentWidth = 0.0;
+		double tileExtentHeight = 0.0;
+		double inverseTileExtentWidth = 0.0;
+		double inverseTileExtentHeight = 0.0;
+		double pixmapWidth = 0.0;
+		double pixmapHeight = 0.0;
 		std::uint64_t insertionSequence = 0;
 	};
 
@@ -125,6 +132,21 @@ private:
 	mutable std::vector<GB_Rectangle> crsValidAreaPolygonExtentsCache;
 	mutable bool crsValidAreaPolygonsCacheDirty = true;
 	mutable std::string crsValidAreaPolygonsCacheCrsWkt;
+
+	mutable GB_Rectangle crsValidAreaRectCache;
+	mutable bool crsValidAreaRectCacheDirty = true;
+	mutable std::string crsValidAreaRectCacheCrsWkt;
+
+	mutable QPainterPath crsValidAreaScreenPathCache;
+	mutable GB_Rectangle crsValidAreaScreenPathWorldExtentCache;
+	mutable bool crsValidAreaScreenPathCacheDirty = true;
+	mutable GB_Rectangle crsValidAreaScreenPathCacheViewExtent;
+	mutable double crsValidAreaScreenPathCachePixelSize = 0.0;
+	mutable std::string crsValidAreaScreenPathCacheCrsWkt;
+
+	mutable bool crsMetersPerUnitCacheDirty = true;
+	mutable std::string crsMetersPerUnitCacheCrsWkt;
+	mutable double crsMetersPerUnitCache = 0.0;
 
 	std::vector<CachedMapTile> mapTiles;
 	std::uint64_t nextDrawableInsertionSequence = 0;
@@ -160,6 +182,7 @@ private:
 	static bool IsBottomLayerNumber(double layerNumber);
 	static int GetLayerPaintOrderGroup(double layerNumber);
 	static bool IsCachedMapTilePaintOrderLess(const CachedMapTile& firstTile, const CachedMapTile& secondTile);
+	bool TryCreateCachedMapTile(const MapTile& tile, double layerNumber, CachedMapTile& outCachedTile);
 	void InsertCachedMapTile(CachedMapTile&& cachedTile);
 	void DrawBackground(QPainter& painter) const;
 	void DrawMapTiles(QPainter& painter, const QRectF& exposedRect) const;
@@ -179,6 +202,10 @@ private:
 	bool IsRectangleIntersectsCachedCrsValidAreaPolygonExtent(const GB_Rectangle& rect) const;
 	bool EnsureCrsValidAreaPolygonsCache() const;
 	void InvalidateCrsValidAreaPolygonsCache() const;
+	void InvalidateCrsValidAreaRectCache() const;
+	void InvalidateCrsValidAreaScreenPathCache() const;
+	double GetCrsMetersPerUnitCached() const;
+	void InvalidateCrsMetersPerUnitCache() const;
 
 	bool IsDrawableUidInSet(const std::vector<std::string>& drawablesUids, const std::string& uid) const;
 	GB_Rectangle CalculateAllDrawableExtent() const;
