@@ -9,6 +9,7 @@
 #include <QTimer>
 #include <QWidget>
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -151,6 +152,11 @@ private:
 	std::vector<CachedMapTile> mapTiles;
 	std::uint64_t nextDrawableInsertionSequence = 0;
 
+	mutable bool mapTileSpatialIndexDirty = true;
+	mutable std::vector<size_t> mapTileMinXOrderCache;
+	mutable std::vector<size_t> mapTileMaxXOrderCache;
+	mutable std::vector<size_t> mapTileVisibleIndexScratch;
+
 	mutable bool allDrawableExtentCacheDirty = true;
 	mutable GB_Rectangle allDrawableExtentCache;
 	bool isPanning = false;
@@ -187,6 +193,9 @@ private:
 	static bool IsCachedMapTilePaintOrderLess(const CachedMapTile& firstTile, const CachedMapTile& secondTile);
 	bool TryCreateCachedMapTile(const MapTile& tile, double layerNumber, CachedMapTile& outCachedTile);
 	void InsertCachedMapTile(CachedMapTile&& cachedTile);
+	void EnsureMapTileSpatialIndex() const;
+	void InvalidateMapTileSpatialIndex() const;
+	void CollectVisibleMapTileIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const;
 	void DrawBackground(QPainter& painter) const;
 	void DrawMapTiles(QPainter& painter, const QRectF& exposedRect) const;
 	void DrawCoordinateAxes(QPainter& painter) const;
@@ -201,6 +210,7 @@ private:
 	bool TryGetCrsValidArea(GB_Rectangle& outValidArea) const;
 	bool TryGetCachedCrsValidAreaPolygonsExtent(GB_Rectangle& outExtent) const;
 	bool TryBuildCrsValidAreaScreenPath(QPainterPath& outPath, GB_Rectangle& outWorldExtent) const;
+	bool TryGetCrsValidAreaScreenPathCache(const QPainterPath*& outPath, GB_Rectangle& outWorldExtent) const;
 	bool TryIntersectRectangleWithCrsValidAreaPolygons(const GB_Rectangle& rect, GB_Rectangle& outIntersectionExtent) const;
 	bool IsRectangleIntersectsCachedCrsValidAreaPolygonExtent(const GB_Rectangle& rect) const;
 	bool EnsureCrsValidAreaPolygonsCache() const;
