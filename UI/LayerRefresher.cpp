@@ -45,6 +45,9 @@ namespace
 	constexpr int ReprojectSampleGridCount = 21;
 	constexpr size_t MaxReprojectOutputSideLength = 4096;
 	constexpr size_t MaxReprojectOutputPixelCount = 16ULL * 1024ULL * 1024ULL;
+	constexpr int DynamicExportVirtualTileSize = 512;
+	constexpr int DynamicExportMaxVirtualLevel = 30;
+	constexpr long long MaxCalculatedRequestItemCount = 200000;
 
 	std::string TrimmedStdString(const std::string& text)
 	{
@@ -165,7 +168,6 @@ namespace
 
 		return std::string();
 	}
-
 
 	std::string GetImageRequestWkt(const ArcGISRestServiceInfo& serviceInfo, bool isTiled)
 	{
@@ -778,9 +780,443 @@ namespace
 		return requestItems;
 	}
 
+	struct DynamicExportVirtualTileGrid
+	{
+		bool isValid = false;
+		int tileSize = DynamicExportVirtualTileSize;
+		int level = 0;
+		double initialResolution = 0.0;
+		double resolution = 0.0;
+		double tileSpan = 0.0;
+		double originX = 0.0;
+		double originY = 0.0;
+		bool hasRequestLimitExtent = false;
+		GB_Rectangle requestLimitExtent;
+		std::string bboxSrParam = "";
+		std::string imageSrParam = "";
+	};
+
+	int ChooseDynamicExportVirtualTileSize(const ArcGISRestServiceInfo& serviceInfo)
+	{
+		int tileSize = DynamicExportVirtualTileSize;
+		if (serviceInfo.maxImageWidth > 0)
+		{
+			tileSize = std::min(tileSize, serviceInfo.maxImageWidth);
+		}
+		if (serviceInfo.maxImageHeight > 0)
+		{
+			tileSize = std::min(tileSize, serviceInfo.maxImageHeight);
+		}
+		return std::max(1, tileSize);
+	}
+
+	int GetPreferredSpatialReferenceCode(const ArcGISRestSpatialReference& spatialReference)
+	{
+		if (spatialReference.latestWkid > 0)
+		{
+			return spatialReference.latestWkid;
+		}
+		if (spatialReference.wkid > 0)
+		{
+			return spatialReference.wkid;
+		}
+		return 0;
+	}
+
+	int GetPreferredServiceSpatialReferenceCode(const ArcGISRestServiceInfo& serviceInfo)
+	{
+		if (serviceInfo.hasSpatialReference)
+		{
+			const int srCode = GetPreferredSpatialReferenceCode(serviceInfo.spatialReference);
+			if (srCode > 0)
+			{
+				return srCode;
+			}
+		}
+
+		if (serviceInfo.hasFullExtent)
+		{
+			const int srCode = GetPreferredSpatialReferenceCode(serviceInfo.fullExtent.spatialReference);
+			if (srCode > 0)
+			{
+				return srCode;
+			}
+		}
+
+		if (serviceInfo.hasInitialExtent)
+		{
+			const int srCode = GetPreferredSpatialReferenceCode(serviceInfo.initialExtent.spatialReference);
+			if (srCode > 0)
+			{
+				return srCode;
+			}
+		}
+
+		if (serviceInfo.layerOrTable.hasExtent)
+		{
+			const int srCode = GetPreferredSpatialReferenceCode(serviceInfo.layerOrTable.extent.spatialReference);
+			if (srCode > 0)
+			{
+				return srCode;
+			}
+		}
+
+		return 0;
+	}
+
+	bool IsWgs84LikeSpatialReferenceCode(int srCode)
+	{
+		return srCode == 4326;
+	}
+
+	bool IsWebMercatorLikeSpatialReferenceCode(int srCode)
+	{
+		return srCode == 3857 || srCode == 102100 || srCode == 102113 || srCode == 900913;
+	}
+
+	bool TryGetEnvelopeRectInTargetCrs(const ArcGISRestEnvelope& envelope, const std::string& targetWktUtf8, const std::string& fallbackWktUtf8, GB_Rectangle& outRect)
+	{
+		outRect = GB_Rectangle::Invalid;
+
+		GeoBoundingBox sourceBox;
+		if (!TryCreateBoundingBoxFromEnvelope(envelope, fallbackWktUtf8, sourceBox))
+		{
+			return false;
+		}
+
+		if (!IsCrsDefinitionValid(targetWktUtf8) || !IsCrsDefinitionValid(sourceBox.wktUtf8) || AreCrsEquivalent(sourceBox.wktUtf8, targetWktUtf8))
+		{
+			outRect = sourceBox.rect;
+			return outRect.IsValid();
+		}
+
+		return TryTransformRectangleBetweenCrs(sourceBox.wktUtf8, targetWktUtf8, sourceBox.rect, outRect);
+	}
+
+	bool TryGetServiceReferenceExtentInRequestCrs(const ArcGISRestServiceInfo& serviceInfo, const std::string& requestWktUtf8, GB_Rectangle& outExtent)
+	{
+		outExtent = GB_Rectangle::Invalid;
+		const std::string fallbackWkt = requestWktUtf8.empty() ? GetServiceFallbackWkt(serviceInfo) : requestWktUtf8;
+
+		if (serviceInfo.hasFullExtent && TryGetEnvelopeRectInTargetCrs(serviceInfo.fullExtent, fallbackWkt, fallbackWkt, outExtent) && outExtent.IsValid())
+		{
+			return true;
+		}
+
+		if (serviceInfo.hasInitialExtent && TryGetEnvelopeRectInTargetCrs(serviceInfo.initialExtent, fallbackWkt, fallbackWkt, outExtent) && outExtent.IsValid())
+		{
+			return true;
+		}
+
+		if (serviceInfo.layerOrTable.hasExtent && TryGetEnvelopeRectInTargetCrs(serviceInfo.layerOrTable.extent, fallbackWkt, fallbackWkt, outExtent) && outExtent.IsValid())
+		{
+			return true;
+		}
+
+		return false;
+	}
+
+	bool TryFloorToLongLong(double value, long long& outValue)
+	{
+		outValue = 0;
+		if (!std::isfinite(value))
+		{
+			return false;
+		}
+
+		const double flooredValue = std::floor(value);
+		if (flooredValue < static_cast<double>(std::numeric_limits<long long>::min()) || flooredValue > static_cast<double>(std::numeric_limits<long long>::max()))
+		{
+			return false;
+		}
+
+		outValue = static_cast<long long>(flooredValue);
+		return true;
+	}
+
+	int ChooseClosestVirtualTileLevel(double initialResolution, double targetResolution)
+	{
+		if (!IsPositiveFiniteDouble(initialResolution) || !IsPositiveFiniteDouble(targetResolution))
+		{
+			return 0;
+		}
+
+		const double levelValue = std::log(initialResolution / targetResolution) / std::log(2.0);
+		if (!std::isfinite(levelValue))
+		{
+			return 0;
+		}
+
+		const int roundedLevel = static_cast<int>(std::floor(levelValue + 0.5));
+		return GB_Clamp(roundedLevel, 0, DynamicExportMaxVirtualLevel);
+	}
+
+	void IntersectRequestLimitExtent(DynamicExportVirtualTileGrid& grid, const GB_Rectangle& extent)
+	{
+		if (!extent.IsValid())
+		{
+			return;
+		}
+
+		if (!grid.hasRequestLimitExtent)
+		{
+			grid.requestLimitExtent = extent;
+			grid.hasRequestLimitExtent = true;
+			return;
+		}
+
+		const GB_Rectangle intersectedExtent = grid.requestLimitExtent.Intersected(extent);
+		grid.requestLimitExtent = intersectedExtent.IsValid() ? intersectedExtent : GB_Rectangle::Invalid;
+	}
+
+	bool TryBuildDynamicExportVirtualTileGrid(const CalculateImageRequestItemsInput& input, DynamicExportVirtualTileGrid& outGrid)
+	{
+		outGrid = DynamicExportVirtualTileGrid();
+
+		const ArcGISRestServiceInfo* serviceInfo = input.serviceInfo;
+		if (!serviceInfo || input.isImageServer || !input.viewExtent.IsValid() || input.viewExtentWidthInPixels <= 0)
+		{
+			return false;
+		}
+
+		const double targetResolution = input.viewExtent.Width() / static_cast<double>(input.viewExtentWidthInPixels);
+		if (!IsPositiveFiniteDouble(targetResolution))
+		{
+			return false;
+		}
+
+		outGrid.tileSize = ChooseDynamicExportVirtualTileSize(*serviceInfo);
+		const int srCode = GetPreferredServiceSpatialReferenceCode(*serviceInfo);
+		if (srCode > 0)
+		{
+			outGrid.bboxSrParam = std::to_string(srCode);
+			outGrid.imageSrParam = outGrid.bboxSrParam;
+		}
+
+		constexpr double webMercatorHalfWorld = 20037508.342789244;
+		if (IsWgs84LikeSpatialReferenceCode(srCode))
+		{
+			outGrid.originX = -180.0;
+			outGrid.originY = 90.0;
+			outGrid.initialResolution = 360.0 / static_cast<double>(outGrid.tileSize);
+			outGrid.requestLimitExtent.Set(-180.0, -90.0, 180.0, 90.0);
+			outGrid.hasRequestLimitExtent = true;
+		}
+		else if (IsWebMercatorLikeSpatialReferenceCode(srCode))
+		{
+			outGrid.originX = -webMercatorHalfWorld;
+			outGrid.originY = webMercatorHalfWorld;
+			outGrid.initialResolution = (webMercatorHalfWorld * 2.0) / static_cast<double>(outGrid.tileSize);
+			outGrid.requestLimitExtent.Set(-webMercatorHalfWorld, -webMercatorHalfWorld, webMercatorHalfWorld, webMercatorHalfWorld);
+			outGrid.hasRequestLimitExtent = true;
+		}
+		else
+		{
+			const std::string requestWkt = GetServiceFallbackWkt(*serviceInfo);
+			GB_Rectangle serviceExtent;
+			if (!TryGetServiceReferenceExtentInRequestCrs(*serviceInfo, requestWkt, serviceExtent) || !serviceExtent.IsValid())
+			{
+				return false;
+			}
+
+			const double serviceWidth = serviceExtent.Width();
+			const double serviceHeight = serviceExtent.Height();
+			const double serviceSpan = std::max(serviceWidth, serviceHeight);
+			if (!IsPositiveFiniteDouble(serviceSpan))
+			{
+				return false;
+			}
+
+			outGrid.originX = serviceExtent.minX;
+			outGrid.originY = serviceExtent.maxY;
+			outGrid.initialResolution = serviceSpan / static_cast<double>(outGrid.tileSize);
+			outGrid.requestLimitExtent = serviceExtent;
+			outGrid.hasRequestLimitExtent = true;
+		}
+
+		const std::string requestWkt = GetServiceFallbackWkt(*serviceInfo);
+		GB_Rectangle serviceReferenceExtent;
+		if (TryGetServiceReferenceExtentInRequestCrs(*serviceInfo, requestWkt, serviceReferenceExtent) && serviceReferenceExtent.IsValid())
+		{
+			IntersectRequestLimitExtent(outGrid, serviceReferenceExtent);
+		}
+
+		outGrid.level = ChooseClosestVirtualTileLevel(outGrid.initialResolution, targetResolution);
+		outGrid.resolution = outGrid.initialResolution / std::pow(2.0, static_cast<double>(outGrid.level));
+		outGrid.tileSpan = static_cast<double>(outGrid.tileSize) * outGrid.resolution;
+		outGrid.isValid = IsPositiveFiniteDouble(outGrid.resolution) && IsPositiveFiniteDouble(outGrid.tileSpan) && std::isfinite(outGrid.originX) && std::isfinite(outGrid.originY);
+		return outGrid.isValid;
+	}
+
+	std::string BuildDynamicExportVirtualTileUid(const CalculateImageRequestItemsInput& input, const DynamicExportVirtualTileGrid& grid, long long row, long long col)
+	{
+		std::string keyText;
+		keyText.reserve(512);
+		keyText += "ArcGISDynamicExportVirtualTileKeyV1\n";
+		keyText += "serviceUrl=";
+		keyText += TrimTrailingSlash(input.serviceUrl);
+		keyText += "\nlayerSet=show:";
+		keyText += input.layerId;
+		keyText += "\nimageSR=";
+		keyText += grid.imageSrParam;
+		keyText += "\nbboxSR=";
+		keyText += grid.bboxSrParam;
+		keyText += "\nlevel=";
+		keyText += std::to_string(grid.level);
+		keyText += "\nrow=";
+		keyText += std::to_string(row);
+		keyText += "\ncol=";
+		keyText += std::to_string(col);
+		keyText += "\ntileSize=";
+		keyText += std::to_string(grid.tileSize);
+		keyText += "\noriginX=";
+		keyText += GB_Utf8Format("%.17g", grid.originX);
+		keyText += "\noriginY=";
+		keyText += GB_Utf8Format("%.17g", grid.originY);
+		keyText += "\ninitialResolution=";
+		keyText += GB_Utf8Format("%.17g", grid.initialResolution);
+		keyText += "\nformat=";
+		keyText += input.imageFormat;
+		keyText += "\ndpi=";
+		keyText += std::to_string(input.dpi);
+		keyText += "\ntransparent=true\n";
+		return GB_Md5Hash(keyText);
+	}
+
+	std::string BuildDynamicExportRequestUrl(const CalculateImageRequestItemsInput& input, const DynamicExportVirtualTileGrid& grid, const GB_Rectangle& tileExtent)
+	{
+		std::string imageUrl = TrimTrailingSlash(input.serviceUrl) + "/export";
+		const std::string imageSizeInfo = GB_Utf8Format("%d,%d", grid.tileSize, grid.tileSize);
+		const std::string imageBBoxInfo = GB_Utf8Format("%.17g,%.17g,%.17g,%.17g", tileExtent.minX, tileExtent.minY, tileExtent.maxX, tileExtent.maxY);
+
+		imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "bbox", imageBBoxInfo);
+		imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "size", imageSizeInfo);
+		imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "format", input.imageFormat);
+		if (!input.layerId.empty())
+		{
+			const std::string layerInfo = GB_Utf8Format("show:%s", input.layerId.c_str());
+			imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "layers", layerInfo);
+		}
+		imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "transparent", "true");
+		imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "f", "image");
+		if (input.dpi > 0)
+		{
+			imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "dpi", std::to_string(input.dpi));
+		}
+		if (!grid.bboxSrParam.empty())
+		{
+			imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "bboxSR", grid.bboxSrParam);
+		}
+		if (!grid.imageSrParam.empty())
+		{
+			imageUrl = GB_UrlOperator::SetUrlQueryValue(imageUrl, "imageSR", grid.imageSrParam);
+		}
+
+		return imageUrl;
+	}
+
+	std::vector<ImageRequestItem> CalculateDynamicMapServerVirtualTileRequestItems(const CalculateImageRequestItemsInput& input, bool& outUsedVirtualTileMode)
+	{
+		outUsedVirtualTileMode = false;
+
+		DynamicExportVirtualTileGrid grid;
+		if (!TryBuildDynamicExportVirtualTileGrid(input, grid))
+		{
+			return std::vector<ImageRequestItem>();
+		}
+		outUsedVirtualTileMode = true;
+
+		GB_Rectangle requestExtent = input.viewExtent;
+		if (grid.hasRequestLimitExtent)
+		{
+			requestExtent = requestExtent.Intersected(grid.requestLimitExtent);
+		}
+		if (!requestExtent.IsValid() || !IsPositiveFiniteDouble(requestExtent.Width()) || !IsPositiveFiniteDouble(requestExtent.Height()))
+		{
+			return std::vector<ImageRequestItem>();
+		}
+
+		const double adjustedMaxX = std::nextafter(requestExtent.maxX, requestExtent.minX);
+		const double adjustedMinY = std::nextafter(requestExtent.minY, requestExtent.maxY);
+
+		long long minCol = 0;
+		long long maxCol = 0;
+		long long minRow = 0;
+		long long maxRow = 0;
+		if (!TryFloorToLongLong((requestExtent.minX - grid.originX) / grid.tileSpan, minCol) ||
+			!TryFloorToLongLong((adjustedMaxX - grid.originX) / grid.tileSpan, maxCol) ||
+			!TryFloorToLongLong((grid.originY - requestExtent.maxY) / grid.tileSpan, minRow) ||
+			!TryFloorToLongLong((grid.originY - adjustedMinY) / grid.tileSpan, maxRow))
+		{
+			return std::vector<ImageRequestItem>();
+		}
+
+		if (maxCol < minCol || maxRow < minRow)
+		{
+			return std::vector<ImageRequestItem>();
+		}
+
+		const long long numCols = maxCol - minCol + 1;
+		const long long numRows = maxRow - minRow + 1;
+		if (numCols <= 0 || numRows <= 0 || numCols > MaxCalculatedRequestItemCount || numRows > MaxCalculatedRequestItemCount)
+		{
+			return std::vector<ImageRequestItem>();
+		}
+
+		const long long tileCount = numCols * numRows;
+		if (tileCount <= 0 || tileCount > MaxCalculatedRequestItemCount)
+		{
+			return std::vector<ImageRequestItem>();
+		}
+
+		std::vector<ImageRequestItem> requestItems;
+		requestItems.reserve(static_cast<size_t>(tileCount));
+
+		for (long long row = minRow; row <= maxRow; row++)
+		{
+			for (long long col = minCol; col <= maxCol; col++)
+			{
+				const double tileMinX = grid.originX + static_cast<double>(col) * grid.tileSpan;
+				const double tileMaxX = tileMinX + grid.tileSpan;
+				const double tileMaxY = grid.originY - static_cast<double>(row) * grid.tileSpan;
+				const double tileMinY = tileMaxY - grid.tileSpan;
+
+				GB_Rectangle tileExtent(tileMinX, tileMinY, tileMaxX, tileMaxY);
+				if (!tileExtent.IsValid())
+				{
+					continue;
+				}
+
+				ImageRequestItem requestItem;
+				requestItem.serviceUrl = input.serviceUrl;
+				requestItem.layerId = input.layerId;
+				requestItem.imageFormat = input.imageFormat;
+				requestItem.requestUrl = BuildDynamicExportRequestUrl(input, grid, tileExtent);
+				requestItem.imageExtent = tileExtent;
+				requestItem.uid = BuildDynamicExportVirtualTileUid(input, grid, row, col);
+				if (!requestItem.requestUrl.empty())
+				{
+					requestItems.push_back(std::move(requestItem));
+				}
+			}
+		}
+
+		return requestItems;
+	}
+
 	std::vector<ImageRequestItem> CalculateDynamicImageRequestItems(const CalculateImageRequestItemsInput& input)
 	{
 		const ArcGISRestServiceInfo* serviceInfo = input.serviceInfo;
+		if (!input.isImageServer)
+		{
+			bool usedVirtualTileMode = false;
+			const std::vector<ImageRequestItem> virtualTileItems = CalculateDynamicMapServerVirtualTileRequestItems(input, usedVirtualTileMode);
+			if (usedVirtualTileMode)
+			{
+				return virtualTileItems;
+			}
+		}
+
 		std::string baseUrl = TrimTrailingSlash(input.serviceUrl);
 		baseUrl += (input.isImageServer ? "/exportImage" : "/export");
 
@@ -1706,7 +2142,7 @@ private:
 	{
 		ImageRequestItem cacheRequestItem = task.requestItem;
 		cacheRequestItem.requestUrl = downloadUrl;
-		cacheRequestItem.uid = GB_Md5Hash(downloadUrl);
+		cacheRequestItem.uid = task.requestItem.uid.empty() ? GB_Md5Hash(downloadUrl) : task.requestItem.uid;
 
 		// 这里缓存的是服务端原始返回影像，而不是重投影后的显示影像。
 		// 因此 targetWktUtf8 留空，使同一原始瓦片可被不同目标 CRS 复用。
@@ -1754,7 +2190,7 @@ private:
 		//std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(sleepingTime)));
 		//outImage.LoadFromFile("0aea755541b65721e72b2d76e9c691942c7431e5e0a8dfee02b537084600d519.jpg");
 
-#if 1
+#if 0
 		GB_NetworkResponse response;
 		{
 			//GB_ScopeTimer timer("download", &std::cerr, QDebugCallback);
@@ -1851,7 +2287,7 @@ private:
 				reprojectOptions.clampToCrsValidArea = true;
 
 				GeoImage reprojectedImage;
-#if 1
+#if 0
 				{
 					GB_ScopeTimer timer("reproject", &std::cerr, QDebugCallback);
 					if (!GeoCrsTransform::ReprojectGeoImage(sourceGeoImage, task.targetWktUtf8, reprojectedImage, reprojectOptions) || !reprojectedImage.IsValid())
@@ -1867,7 +2303,7 @@ private:
 					return;
 				}
 #endif
-				
+
 
 				displayImage = std::move(reprojectedImage.image);
 				displayExtent = reprojectedImage.boundingBox.rect;
