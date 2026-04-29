@@ -345,6 +345,7 @@ QMainCanvas::QMainCanvas(QWidget* parent) : QWidget(parent)
 	setFocusPolicy(Qt::StrongFocus);
 	setAcceptDrops(true);
 	setAutoFillBackground(false);
+	setAttribute(Qt::WA_OpaquePaintEvent, true);
 
 	viewStateChangedDebounceTimer.setSingleShot(true);
 	viewStateChangedDebounceTimer.setTimerType(Qt::PreciseTimer);
@@ -509,6 +510,11 @@ void QMainCanvas::SetViewCenter(const GB_Point2d& center)
 
 	const GB_Rectangle previousExtent = viewExtent;
 	UpdateViewExtentFromCenterAndPixelSize(center);
+	if (AreRectanglesNearlyEqual(viewExtent, previousExtent))
+	{
+		return;
+	}
+
 	InvalidateMapContentCache();
 	EmitViewExtentDisplayChangedIfNeeded(previousExtent);
 	EmitMousePositionChanged();
@@ -725,6 +731,7 @@ void QMainCanvas::AddMapTile(const MapTile& tile, double layerNumber)
 	const GB_Rectangle addedExtent = cachedTile.tile.extent;
 
 	InsertCachedMapTile(std::move(cachedTile));
+	InvalidateAllDrawableExtentCache();
 	InvalidateMapContentCache();
 
 	if (shouldZoomToAddedTile && addedExtent.IsValid())
@@ -783,6 +790,7 @@ void QMainCanvas::AddMapTiles(const std::vector<MapTile>& tiles)
 		std::inplace_merge(mapTiles.begin(), mapTiles.begin() + static_cast<std::ptrdiff_t>(oldMapTileCount), mapTiles.end(), IsCachedMapTilePaintOrderLess);
 	}
 
+	InvalidateAllDrawableExtentCache();
 	InvalidateMapContentCache();
 
 	if (shouldZoomToAddedTiles && addedExtent.IsValid())
@@ -811,6 +819,7 @@ void QMainCanvas::ClearDrawables()
 {
 	const bool hadDrawables = HasDrawables();
 	mapTiles.clear();
+	InvalidateAllDrawableExtentCache();
 	InvalidateMapContentCache();
 	//vectorDrawables.clear();
 	//extentMarkerDrawables.clear();
@@ -837,6 +846,7 @@ void QMainCanvas::RemoveDrawables(const std::vector<std::string>& drawablesUids)
 	hasChanged = hasChanged || oldMapTileCount != mapTiles.size();
 	if (hasChanged)
 	{
+		InvalidateAllDrawableExtentCache();
 		InvalidateMapContentCache();
 	}
 
@@ -896,6 +906,7 @@ void QMainCanvas::SetDrawablesVisible(const std::vector<std::string>& drawablesU
 
 	if (hasChanged)
 	{
+		InvalidateAllDrawableExtentCache();
 		InvalidateMapContentCache();
 		update();
 	}
@@ -1054,7 +1065,10 @@ void QMainCanvas::mouseMoveEvent(QMouseEvent* event)
 		const GB_Rectangle previousExtent = viewExtent;
 		viewExtent = newExtent;
 		pixelSize = safePixelSize;
-		InvalidateMapContentCache();
+		if (!hasPanPreview)
+		{
+			InvalidateMapContentCache();
+		}
 		EmitViewExtentDisplayChangedIfNeeded(previousExtent);
 		EmitMousePositionChanged();
 
@@ -1536,11 +1550,14 @@ bool QMainCanvas::TryBuildCrsValidAreaScreenPath(QPainterPath& outPath, GB_Recta
 		return false;
 	}
 
-	if (!EnsureCrsValidAreaPolygonsCache() || crsValidAreaPolygonsCache.empty())
+	GB_Rectangle crsPolygonsExtent;
+	if (!TryGetCachedCrsValidAreaPolygonsExtent(crsPolygonsExtent) || !crsPolygonsExtent.IsIntersects(viewExtent))
 	{
 		return false;
 	}
 
+	// EnsureCrsValidAreaPolygonsCache() 在重建多边形缓存时可能会顺带清空屏幕路径缓存，
+	// 因此屏幕路径缓存的键值必须在多边形缓存准备完成之后再写入。
 	crsValidAreaScreenPathCache = QPainterPath();
 	crsValidAreaScreenPathCache.setFillRule(Qt::WindingFill);
 	crsValidAreaScreenPathWorldExtentCache.Reset();
@@ -1550,6 +1567,10 @@ bool QMainCanvas::TryBuildCrsValidAreaScreenPath(QPainterPath& outPath, GB_Recta
 	crsValidAreaScreenPathCacheDirty = false;
 
 	const bool canUseCachedExtents = crsValidAreaPolygonExtentsCache.size() == crsValidAreaPolygonsCache.size();
+	const double inversePixelSize = 1.0 / pixelSize;
+	const double viewMinX = viewExtent.minX;
+	const double viewMaxY = viewExtent.maxY;
+
 	for (size_t polygonIndex = 0; polygonIndex < crsValidAreaPolygonsCache.size(); polygonIndex++)
 	{
 		const std::vector<GB_Point2d>& polygon = crsValidAreaPolygonsCache[polygonIndex];
@@ -1577,17 +1598,19 @@ bool QMainCanvas::TryBuildCrsValidAreaScreenPath(QPainterPath& outPath, GB_Recta
 		screenPolygon.reserve(static_cast<int>(clippedPolygon.size()));
 		GB_Rectangle clippedPolygonExtent;
 		clippedPolygonExtent.Reset();
+
 		for (const GB_Point2d& point : clippedPolygon)
 		{
-			const GB_Point2d screenPoint = WorldToScreen(point);
-			if (!IsPointFinite(screenPoint))
+			const double screenX = (point.x - viewMinX) * inversePixelSize;
+			const double screenY = (viewMaxY - point.y) * inversePixelSize;
+			if (!std::isfinite(screenX) || !std::isfinite(screenY))
 			{
 				screenPolygon.clear();
 				clippedPolygonExtent.Reset();
 				break;
 			}
 
-			screenPolygon << QPointF(screenPoint.x, screenPoint.y);
+			screenPolygon << QPointF(screenX, screenY);
 			clippedPolygonExtent.Expand(point);
 		}
 
@@ -1711,7 +1734,34 @@ bool QMainCanvas::IsRectangleIntersectsCachedCrsValidAreaPolygonExtent(const GB_
 
 void QMainCanvas::DrawMapTiles(QPainter& painter, const QRectF& exposedRect) const
 {
-	if (!viewExtent.IsValid() || !IsFinitePositive(pixelSize))
+	if (mapTiles.empty() || !viewExtent.IsValid() || !IsFinitePositive(pixelSize))
+	{
+		return;
+	}
+
+	const QRectF widgetRect = QRectF(rect());
+	QRectF safeExposedRect = exposedRect.isValid() ? exposedRect.intersected(widgetRect) : widgetRect;
+	if (!safeExposedRect.isValid() || safeExposedRect.isEmpty())
+	{
+		return;
+	}
+
+	const double inversePixelSize = 1.0 / pixelSize;
+	const double viewMinX = viewExtent.minX;
+	const double viewMaxY = viewExtent.maxY;
+
+	GB_Rectangle queryWorldExtent;
+	queryWorldExtent.Set(viewMinX + safeExposedRect.left() * pixelSize,
+		viewMaxY - safeExposedRect.bottom() * pixelSize,
+		viewMinX + safeExposedRect.right() * pixelSize,
+		viewMaxY - safeExposedRect.top() * pixelSize);
+	queryWorldExtent = queryWorldExtent.Intersected(viewExtent);
+	if (!queryWorldExtent.IsValid() || queryWorldExtent.Width() <= 0.0 || queryWorldExtent.Height() <= 0.0)
+	{
+		return;
+	}
+
+	if (!HasVisibleMapTileIntersectingExtent(queryWorldExtent))
 	{
 		return;
 	}
@@ -1730,6 +1780,12 @@ void QMainCanvas::DrawMapTiles(QPainter& painter, const QRectF& exposedRect) con
 			{
 				return;
 			}
+
+			queryWorldExtent = queryWorldExtent.Intersected(crsClipWorldExtent);
+			if (!queryWorldExtent.IsValid() || queryWorldExtent.Width() <= 0.0 || queryWorldExtent.Height() <= 0.0)
+			{
+				return;
+			}
 		}
 		else if (TryGetCrsValidArea(crsClipWorldExtent))
 		{
@@ -1739,13 +1795,15 @@ void QMainCanvas::DrawMapTiles(QPainter& painter, const QRectF& exposedRect) con
 			{
 				return;
 			}
+
+			queryWorldExtent = queryWorldExtent.Intersected(crsClipWorldExtent);
+			if (!queryWorldExtent.IsValid() || queryWorldExtent.Width() <= 0.0 || queryWorldExtent.Height() <= 0.0)
+			{
+				return;
+			}
 		}
 	}
 
-	const QRectF safeExposedRect = exposedRect.isValid() ? exposedRect : QRectF(rect());
-	const double inversePixelSize = 1.0 / pixelSize;
-	const double viewMinX = viewExtent.minX;
-	const double viewMaxY = viewExtent.maxY;
 	const bool canUseCrsPolygonExtents = hasPreciseCrsClip && crsValidAreaPolygonExtentsCache.size() == crsValidAreaPolygonsCache.size();
 
 	if (hasPreciseCrsClip)
@@ -1761,47 +1819,31 @@ void QMainCanvas::DrawMapTiles(QPainter& painter, const QRectF& exposedRect) con
 	{
 		if (!cachedTile.tile.visible || cachedTile.pixmap.isNull() ||
 			!IsFinitePositive(cachedTile.tileExtentWidth) || !IsFinitePositive(cachedTile.tileExtentHeight) ||
-			!IsFinitePositive(cachedTile.pixmapWidth) || !IsFinitePositive(cachedTile.pixmapHeight))
+			!IsFinitePositive(cachedTile.pixmapWidth) || !IsFinitePositive(cachedTile.pixmapHeight) ||
+			!cachedTile.tile.extent.IsIntersects(queryWorldExtent))
 		{
 			continue;
 		}
 
-		GB_Rectangle clippedWorldRect = cachedTile.tile.extent.Intersected(viewExtent);
+		GB_Rectangle clippedWorldRect = cachedTile.tile.extent.Intersected(queryWorldExtent);
 		if (!clippedWorldRect.IsValid() || clippedWorldRect.Width() <= 0.0 || clippedWorldRect.Height() <= 0.0)
 		{
 			continue;
 		}
 
-		if (hasPreciseCrsClip)
+		if (canUseCrsPolygonExtents)
 		{
-			clippedWorldRect = clippedWorldRect.Intersected(crsClipWorldExtent);
-			if (!clippedWorldRect.IsValid() || clippedWorldRect.Width() <= 0.0 || clippedWorldRect.Height() <= 0.0)
+			bool mayIntersectCrsPolygon = false;
+			for (const GB_Rectangle& polygonExtent : crsValidAreaPolygonExtentsCache)
 			{
-				continue;
-			}
-
-			if (canUseCrsPolygonExtents)
-			{
-				bool mayIntersectCrsPolygon = false;
-				for (const GB_Rectangle& polygonExtent : crsValidAreaPolygonExtentsCache)
+				if (polygonExtent.IsValid() && polygonExtent.IsIntersects(clippedWorldRect))
 				{
-					if (polygonExtent.IsValid() && polygonExtent.IsIntersects(clippedWorldRect))
-					{
-						mayIntersectCrsPolygon = true;
-						break;
-					}
-				}
-
-				if (!mayIntersectCrsPolygon)
-				{
-					continue;
+					mayIntersectCrsPolygon = true;
+					break;
 				}
 			}
-		}
-		else if (hasRectangularCrsClip)
-		{
-			clippedWorldRect = clippedWorldRect.Intersected(crsClipWorldExtent);
-			if (!clippedWorldRect.IsValid() || clippedWorldRect.Width() <= 0.0 || clippedWorldRect.Height() <= 0.0)
+
+			if (!mayIntersectCrsPolygon)
 			{
 				continue;
 			}
@@ -1813,7 +1855,7 @@ void QMainCanvas::DrawMapTiles(QPainter& painter, const QRectF& exposedRect) con
 			clippedWorldRect.Width() * inversePixelSize,
 			clippedWorldRect.Height() * inversePixelSize);
 
-		if (!targetRect.isValid() || !targetRect.intersects(safeExposedRect))
+		if (!targetRect.isValid() || targetRect.isEmpty() || !targetRect.intersects(safeExposedRect))
 		{
 			continue;
 		}
@@ -1824,7 +1866,7 @@ void QMainCanvas::DrawMapTiles(QPainter& painter, const QRectF& exposedRect) con
 			clippedWorldRect.Width() * cachedTile.inverseTileExtentWidth * cachedTile.pixmapWidth,
 			clippedWorldRect.Height() * cachedTile.inverseTileExtentHeight * cachedTile.pixmapHeight);
 
-		if (!sourceRect.isValid())
+		if (!sourceRect.isValid() || sourceRect.isEmpty())
 		{
 			continue;
 		}
@@ -2301,8 +2343,31 @@ bool QMainCanvas::IsDrawableUidInSet(const std::vector<std::string>& drawablesUi
 	return std::find(drawablesUids.begin(), drawablesUids.end(), uid) != drawablesUids.end();
 }
 
+bool QMainCanvas::HasVisibleMapTileIntersectingExtent(const GB_Rectangle& extent) const
+{
+	if (!extent.IsValid())
+	{
+		return false;
+	}
+
+	for (const CachedMapTile& item : mapTiles)
+	{
+		if (item.tile.visible && item.tile.extent.IsValid() && item.tile.extent.IsIntersects(extent))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
 GB_Rectangle QMainCanvas::CalculateAllDrawableExtent() const
 {
+	if (!allDrawableExtentCacheDirty)
+	{
+		return allDrawableExtentCache;
+	}
+
 	GB_Rectangle result;
 	result.Reset();
 
@@ -2334,7 +2399,15 @@ GB_Rectangle QMainCanvas::CalculateAllDrawableExtent() const
 	//	}
 	//}
 
-	return result;
+	allDrawableExtentCache = result;
+	allDrawableExtentCacheDirty = false;
+	return allDrawableExtentCache;
+}
+
+void QMainCanvas::InvalidateAllDrawableExtentCache() const
+{
+	allDrawableExtentCacheDirty = true;
+	allDrawableExtentCache.Reset();
 }
 
 void QMainCanvas::SetViewExtentInternal(const GB_Rectangle& extent, bool emitSignal)
@@ -2352,6 +2425,11 @@ void QMainCanvas::SetViewExtentInternal(const GB_Rectangle& extent, bool emitSig
 	}
 
 	const GB_Rectangle previousExtent = viewExtent;
+	if (AreRectanglesNearlyEqual(normalizedExtent, previousExtent))
+	{
+		return;
+	}
+
 	viewExtent = normalizedExtent;
 	UpdatePixelSizeFromViewExtent();
 	InvalidateMapContentCache();

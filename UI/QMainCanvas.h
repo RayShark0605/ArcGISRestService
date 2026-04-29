@@ -150,6 +150,9 @@ private:
 
 	std::vector<CachedMapTile> mapTiles;
 	std::uint64_t nextDrawableInsertionSequence = 0;
+
+	mutable bool allDrawableExtentCacheDirty = true;
+	mutable GB_Rectangle allDrawableExtentCache;
 	bool isPanning = false;
 	QPoint lastPanPosition;
 	bool hasMousePosition = false;
@@ -208,7 +211,9 @@ private:
 	void InvalidateCrsMetersPerUnitCache() const;
 
 	bool IsDrawableUidInSet(const std::vector<std::string>& drawablesUids, const std::string& uid) const;
+	bool HasVisibleMapTileIntersectingExtent(const GB_Rectangle& extent) const;
 	GB_Rectangle CalculateAllDrawableExtent() const;
+	void InvalidateAllDrawableExtentCache() const;
 
 	void SetViewExtentInternal(const GB_Rectangle& extent, bool emitSignal);
 	double GetMinimumPixelSizeForCurrentWidget() const;
