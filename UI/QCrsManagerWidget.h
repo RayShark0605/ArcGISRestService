@@ -48,6 +48,7 @@ public:
 
 	void ReloadCoordinateSystems();
 
+
 signals:
 	void CustomCrsDefinitionsChanged();
 
@@ -109,6 +110,9 @@ private:
 	void InitializeConnections();
 	bool LoadSystemCrsRecords();
 	void RebuildCustomCrsRecords();
+	bool LoadCustomCrsDefinitionsFromCache();
+	bool SaveCustomCrsDefinitionsToCache() const;
+	bool EnsureSystemCrsRecordsLoadedForDuplicateCheck();
 	void RefreshTable(bool preserveSelection);
 	void RefreshTableAndKeepSelection();
 	void PollSystemCrsRecordsInitialization();

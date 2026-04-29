@@ -16,6 +16,7 @@
 
 // GDAL
 #include <cpl_conv.h>
+#include <cpl_error.h>
 #include <cpl_string.h>
 #include <gdal.h>
 #include <ogr_srs_api.h>
@@ -1110,6 +1111,108 @@ bool GeoCrsManager::IsWktValidCached(const std::string& wktUtf8)
     }
 
     return valid;
+}
+
+bool GeoCrsManager::ValidateWktUtf8(const std::string& wktUtf8, std::string* errorMessageUtf8)
+{
+    EnsureInitializedInternal();
+
+    if (errorMessageUtf8 != nullptr)
+    {
+        errorMessageUtf8->clear();
+    }
+
+    const std::string trimmed = GB_Utf8Trim(wktUtf8);
+    if (trimmed.empty())
+    {
+        if (errorMessageUtf8 != nullptr)
+        {
+            *errorMessageUtf8 = GB_STR("WKT 内容为空。");
+        }
+        return false;
+    }
+
+    // 若调用方不需要详细错误信息，可以直接复用有效性缓存。
+    // 若需要错误信息，则即使命中 false 缓存，也重新做一次轻量解析以尽量返回原因。
+    {
+        GB_ReadLockGuard readGuard(g_wktValidityCacheLock);
+        const auto it = g_wktValidityCache.find(trimmed);
+        if (it != g_wktValidityCache.end() && (it->second || errorMessageUtf8 == nullptr))
+        {
+            if (!it->second && errorMessageUtf8 != nullptr)
+            {
+                *errorMessageUtf8 = GB_STR("输入的 WKT 不是合法的坐标系定义。");
+            }
+            return it->second;
+        }
+    }
+
+    OGRSpatialReferenceH spatialReference = OSRNewSpatialReference(nullptr);
+    if (spatialReference == nullptr)
+    {
+        if (errorMessageUtf8 != nullptr)
+        {
+            *errorMessageUtf8 = GB_STR("创建坐标系解析对象失败。");
+        }
+        return false;
+    }
+
+    char* wktPointer = const_cast<char*>(trimmed.c_str());
+
+    CPLPushErrorHandler(CPLQuietErrorHandler);
+    CPLErrorReset();
+    const OGRErr importError = OSRImportFromWkt(spatialReference, &wktPointer);
+    const std::string importErrorMessage = SafeCString(CPLGetLastErrorMsg());
+    CPLPopErrorHandler();
+
+    if (importError != OGRERR_NONE)
+    {
+        OSRDestroySpatialReference(spatialReference);
+
+        {
+            GB_WriteLockGuard writeGuard(g_wktValidityCacheLock);
+            g_wktValidityCache[trimmed] = false;
+        }
+
+        if (errorMessageUtf8 != nullptr)
+        {
+            *errorMessageUtf8 = GB_STR("输入的 WKT 不是合法的坐标系定义。");
+            if (!importErrorMessage.empty())
+            {
+                *errorMessageUtf8 += GB_STR("\n\n底层坐标系解析库返回信息：") + importErrorMessage;
+            }
+        }
+        return false;
+    }
+
+    CPLPushErrorHandler(CPLQuietErrorHandler);
+    CPLErrorReset();
+    const OGRErr validateError = OSRValidate(spatialReference);
+    const std::string validateErrorMessage = SafeCString(CPLGetLastErrorMsg());
+    CPLPopErrorHandler();
+
+    OSRDestroySpatialReference(spatialReference);
+
+    const bool valid = (validateError == OGRERR_NONE);
+    {
+        GB_WriteLockGuard writeGuard(g_wktValidityCacheLock);
+        g_wktValidityCache[trimmed] = valid;
+    }
+
+    if (!valid)
+    {
+        if (errorMessageUtf8 != nullptr)
+        {
+            *errorMessageUtf8 = GB_STR("输入的 WKT 可以被解析，但未通过坐标系结构校验。");
+            if (!validateErrorMessage.empty())
+            {
+                *errorMessageUtf8 += GB_STR("\n\n底层坐标系解析库返回信息：") + validateErrorMessage;
+            }
+        }
+        return false;
+    }
+
+    return true;
 }
 
 bool GeoCrsManager::IsDefinitionValidCached(const std::string& definitionUtf8, bool allowNetworkAccess, bool allowFileAccess)

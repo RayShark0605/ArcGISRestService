@@ -1,5 +1,7 @@
 ﻿#include "QCrsManagerWidget.h"
 
+#include "QAddCustomCrsDialog.h"
+
 #include "GeoCrs.h"
 #include "GeoCrsManager.h"
 #include "QMainCanvas.h"
@@ -53,6 +55,7 @@
 #include <QVariant>
 #include <QWheelEvent>
 
+
 #include <algorithm>
 #include <cmath>
 #include <condition_variable>
@@ -84,6 +87,8 @@ namespace
 
 	constexpr const char* CrsCacheMagic = "MWCRSCACHE";
 	constexpr std::uint32_t CrsCacheVersion = 1;
+	constexpr const char* CustomCrsCacheMagic = "MWCUSTOMCRS";
+	constexpr std::uint32_t CustomCrsCacheVersion = 1;
 	constexpr std::uint64_t MaxCachedCrsRecordCount = 1000000ULL;
 	constexpr std::uint32_t MaxCachedStringLength = 64U * 1024U * 1024U;
 
@@ -492,6 +497,280 @@ namespace
 		}
 
 		return GB_WriteBinaryToFile(cacheData, cacheFilePathUtf8);
+	}
+
+
+	std::string GetCustomCrsCacheFilePathUtf8()
+	{
+		const std::string homeDirectory = GB_GetHomeDirectory();
+		if (homeDirectory.empty())
+		{
+			return "";
+		}
+
+		return GB_JoinPath(homeDirectory, "AppData/Local/MapWeaver/CustomCrs.bin");
+	}
+
+	bool AppendCustomCrsDefinition(GB_ByteBuffer& buffer, const QCrsManagerWidget::CustomCrsDefinition& definition)
+	{
+		return AppendUtf8String(buffer, definition.idUtf8)
+			&& AppendUtf8String(buffer, definition.nameUtf8)
+			&& AppendUtf8String(buffer, definition.sourceUtf8)
+			&& AppendUtf8String(buffer, definition.codeUtf8)
+			&& AppendUtf8String(buffer, definition.wktUtf8);
+	}
+
+	bool ReadCustomCrsDefinition(const GB_ByteBuffer& buffer, size_t& offset, QCrsManagerWidget::CustomCrsDefinition& definition)
+	{
+		if (!ReadUtf8String(buffer, offset, definition.idUtf8)
+			|| !ReadUtf8String(buffer, offset, definition.nameUtf8)
+			|| !ReadUtf8String(buffer, offset, definition.sourceUtf8)
+			|| !ReadUtf8String(buffer, offset, definition.codeUtf8)
+			|| !ReadUtf8String(buffer, offset, definition.wktUtf8))
+		{
+			return false;
+		}
+
+		definition.idUtf8 = GB_Utf8Trim(definition.idUtf8);
+		definition.nameUtf8 = GB_Utf8Trim(definition.nameUtf8);
+		definition.sourceUtf8 = GB_Utf8Trim(definition.sourceUtf8);
+		definition.codeUtf8 = GB_Utf8Trim(definition.codeUtf8);
+		definition.wktUtf8 = GB_Utf8Trim(definition.wktUtf8);
+
+		if (definition.sourceUtf8.empty())
+		{
+			definition.sourceUtf8 = "自定义";
+		}
+
+		return !definition.nameUtf8.empty() && !definition.wktUtf8.empty();
+	}
+
+	bool BuildCustomCrsDefinitionsCacheData(const std::vector<QCrsManagerWidget::CustomCrsDefinition>& definitions, GB_ByteBuffer& outData)
+	{
+		outData.clear();
+
+		AppendAsciiBytes(outData, CustomCrsCacheMagic);
+		GB_ByteBufferIO::AppendUInt32LE(outData, CustomCrsCacheVersion);
+		GB_ByteBufferIO::AppendUInt64LE(outData, static_cast<std::uint64_t>(definitions.size()));
+
+		for (const QCrsManagerWidget::CustomCrsDefinition& definition : definitions)
+		{
+			if (!AppendCustomCrsDefinition(outData, definition))
+			{
+				outData.clear();
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	bool TryReadCustomCrsDefinitionsCache(std::vector<QCrsManagerWidget::CustomCrsDefinition>& outDefinitions)
+	{
+		outDefinitions.clear();
+
+		const std::string cacheFilePathUtf8 = GetCustomCrsCacheFilePathUtf8();
+		if (cacheFilePathUtf8.empty() || !GB_IsFileExists(cacheFilePathUtf8))
+		{
+			return false;
+		}
+
+		const GB_ByteBuffer cacheData = GB_ReadBinaryFromFile(cacheFilePathUtf8);
+		if (cacheData.empty())
+		{
+			return false;
+		}
+
+		size_t offset = 0;
+		std::uint32_t version = 0;
+		std::uint64_t definitionCount = 0;
+		if (!ReadAndCheckAsciiBytes(cacheData, offset, CustomCrsCacheMagic)
+			|| !GB_ByteBufferIO::ReadUInt32LE(cacheData, offset, version)
+			|| version != CustomCrsCacheVersion
+			|| !GB_ByteBufferIO::ReadUInt64LE(cacheData, offset, definitionCount)
+			|| definitionCount > MaxCachedCrsRecordCount)
+		{
+			return false;
+		}
+
+		std::vector<QCrsManagerWidget::CustomCrsDefinition> definitions;
+		definitions.reserve(static_cast<size_t>(definitionCount));
+		for (std::uint64_t definitionIndex = 0; definitionIndex < definitionCount; definitionIndex++)
+		{
+			QCrsManagerWidget::CustomCrsDefinition definition;
+			if (!ReadCustomCrsDefinition(cacheData, offset, definition))
+			{
+				return false;
+			}
+
+			definitions.push_back(std::move(definition));
+		}
+
+		if (offset != cacheData.size())
+		{
+			return false;
+		}
+
+		outDefinitions = std::move(definitions);
+		return true;
+	}
+
+	bool TryWriteCustomCrsDefinitionsCache(const std::vector<QCrsManagerWidget::CustomCrsDefinition>& definitions)
+	{
+		const std::string cacheFilePathUtf8 = GetCustomCrsCacheFilePathUtf8();
+		if (cacheFilePathUtf8.empty())
+		{
+			return false;
+		}
+
+		GB_ByteBuffer cacheData;
+		if (!BuildCustomCrsDefinitionsCacheData(definitions, cacheData))
+		{
+			return false;
+		}
+
+		return GB_WriteBinaryToFile(cacheData, cacheFilePathUtf8);
+	}
+
+	bool IsWktNameRootKeyword(const std::string& keyword)
+	{
+		const std::string upperKeyword = GB_Utf8ToUpper(keyword);
+		return upperKeyword == "GEOGCS"
+			|| upperKeyword == "PROJCS"
+			|| upperKeyword == "GEOCCS"
+			|| upperKeyword == "LOCAL_CS"
+			|| upperKeyword == "VERT_CS"
+			|| upperKeyword == "COMPD_CS"
+			|| upperKeyword == "GEODCRS"
+			|| upperKeyword == "GEOGCRS"
+			|| upperKeyword == "PROJCRS"
+			|| upperKeyword == "VERTCRS"
+			|| upperKeyword == "ENGCRS"
+			|| upperKeyword == "PARAMETRICCRS"
+			|| upperKeyword == "TIMECRS"
+			|| upperKeyword == "COMPOUNDCRS";
+	}
+
+	bool IsWktKeywordChar(char ch)
+	{
+		return (ch >= 'A' && ch <= 'Z')
+			|| (ch >= 'a' && ch <= 'z')
+			|| (ch >= '0' && ch <= '9')
+			|| ch == '_';
+	}
+
+	void SkipAsciiWhitespace(const std::string& text, size_t& offset)
+	{
+		while (offset < text.size())
+		{
+			const unsigned char ch = static_cast<unsigned char>(text[offset]);
+			if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n' && ch != '\f' && ch != '\v')
+			{
+				break;
+			}
+
+			offset++;
+		}
+	}
+
+	bool ReadWktQuotedString(const std::string& text, size_t& offset, std::string& outValue)
+	{
+		outValue.clear();
+		if (offset >= text.size() || text[offset] != '"')
+		{
+			return false;
+		}
+
+		offset++;
+		while (offset < text.size())
+		{
+			const char ch = text[offset];
+			if (ch == '"')
+			{
+				if (offset + 1 < text.size() && text[offset + 1] == '"')
+				{
+					outValue.push_back('"');
+					offset += 2;
+					continue;
+				}
+
+				offset++;
+				return true;
+			}
+
+			outValue.push_back(ch);
+			offset++;
+		}
+
+		outValue.clear();
+		return false;
+	}
+
+	bool TryExtractCrsNameFromWktText(const std::string& wktUtf8, std::string& outNameUtf8)
+	{
+		outNameUtf8.clear();
+
+		const std::string text = GB_Utf8Trim(wktUtf8);
+		if (text.empty())
+		{
+			return false;
+		}
+
+		size_t offset = 0;
+		if (text.size() >= 3
+			&& static_cast<unsigned char>(text[0]) == 0xEF
+			&& static_cast<unsigned char>(text[1]) == 0xBB
+			&& static_cast<unsigned char>(text[2]) == 0xBF)
+		{
+			offset = 3;
+		}
+
+		SkipAsciiWhitespace(text, offset);
+		const size_t keywordBegin = offset;
+		while (offset < text.size() && IsWktKeywordChar(text[offset]))
+		{
+			offset++;
+		}
+
+		const std::string keyword = text.substr(keywordBegin, offset - keywordBegin);
+		if (keyword.empty() || !IsWktNameRootKeyword(keyword))
+		{
+			return false;
+		}
+
+		SkipAsciiWhitespace(text, offset);
+		if (offset >= text.size() || (text[offset] != '[' && text[offset] != '('))
+		{
+			return false;
+		}
+		offset++;
+
+		SkipAsciiWhitespace(text, offset);
+		std::string nameUtf8;
+		if (!ReadWktQuotedString(text, offset, nameUtf8))
+		{
+			return false;
+		}
+
+		nameUtf8 = GB_Utf8Trim(nameUtf8);
+		if (nameUtf8.empty())
+		{
+			return false;
+		}
+
+		outNameUtf8 = nameUtf8;
+		return true;
+	}
+
+	bool TryValidateCrsWkt(const std::string& wktUtf8, std::string& outErrorMessageUtf8)
+	{
+		outErrorMessageUtf8.clear();
+		const bool valid = GeoCrsManager::ValidateWktUtf8(wktUtf8, &outErrorMessageUtf8);
+		if (!valid && outErrorMessageUtf8.empty())
+		{
+			outErrorMessageUtf8 = "输入的 WKT 不合法。";
+		}
+		return valid;
 	}
 
 	class CrsTableWidgetItem : public QTableWidgetItem
@@ -1229,6 +1508,7 @@ QMainCanvas* QCrsManagerWidget::GetMainCanvas() const
 void QCrsManagerWidget::SetCustomCrsDefinitions(const std::vector<CustomCrsDefinition>& customDefinitionsValue)
 {
 	customDefinitions = customDefinitionsValue;
+	SaveCustomCrsDefinitionsToCache();
 	RebuildCustomCrsRecords();
 	RefreshTable(true);
 	emit CustomCrsDefinitionsChanged();
@@ -1239,9 +1519,34 @@ std::vector<QCrsManagerWidget::CustomCrsDefinition> QCrsManagerWidget::GetCustom
 	return customDefinitions;
 }
 
+bool QCrsManagerWidget::LoadCustomCrsDefinitionsFromCache()
+{
+	std::vector<CustomCrsDefinition> loadedDefinitions;
+	const bool readOk = TryReadCustomCrsDefinitionsCache(loadedDefinitions);
+	if (readOk)
+	{
+		customDefinitions = std::move(loadedDefinitions);
+		return true;
+	}
+
+	const std::string cacheFilePathUtf8 = GetCustomCrsCacheFilePathUtf8();
+	if (cacheFilePathUtf8.empty() || !GB_IsFileExists(cacheFilePathUtf8))
+	{
+		customDefinitions.clear();
+	}
+
+	return false;
+}
+
+bool QCrsManagerWidget::SaveCustomCrsDefinitionsToCache() const
+{
+	return TryWriteCustomCrsDefinitionsCache(customDefinitions);
+}
+
 void QCrsManagerWidget::ReloadCoordinateSystems()
 {
 	LoadSystemCrsRecords();
+	LoadCustomCrsDefinitionsFromCache();
 	RebuildCustomCrsRecords();
 	RefreshTable(false);
 	hasSelectedInitialCanvasCrs = false;
@@ -1252,6 +1557,9 @@ void QCrsManagerWidget::showEvent(QShowEvent* event)
 {
 	QDialog::showEvent(event);
 	LoadSystemCrsRecords();
+	LoadCustomCrsDefinitionsFromCache();
+	RebuildCustomCrsRecords();
+	RefreshTable(true);
 
 	// 每次窗口从隐藏状态重新显示时，都重新按当前画布坐标系执行一次初始定位。
 	// 这样可以避免在对话框尚未显示前已完成选中，但视口滚动位置未生效的问题。
@@ -1616,6 +1924,53 @@ void QCrsManagerWidget::RebuildCustomCrsRecords()
 
 		customCrsRecords.push_back(std::move(record));
 	}
+}
+
+
+bool QCrsManagerWidget::EnsureSystemCrsRecordsLoadedForDuplicateCheck()
+{
+	if (isSystemCrsInitializationFinished && !systemCrsRecords.empty())
+	{
+		return true;
+	}
+
+	std::vector<CrsRecord> recordsSnapshot;
+	bool isFinished = false;
+	bool isSucceeded = false;
+	std::string errorMessageUtf8;
+	std::uint64_t revision = loadedSystemCrsRecordsRevision;
+	const bool hasNewSnapshot = CopySystemCrsRecordsSnapshotIfChanged(loadedSystemCrsRecordsRevision,
+		recordsSnapshot,
+		isFinished,
+		isSucceeded,
+		errorMessageUtf8,
+		revision);
+
+	if (hasNewSnapshot)
+	{
+		systemCrsRecords = std::move(recordsSnapshot);
+		loadedSystemCrsRecordsRevision = revision;
+	}
+
+	isSystemCrsInitializationFinished = isFinished;
+	if (isSystemCrsInitializationFinished && !systemCrsRecords.empty())
+	{
+		UpdateInitializationUiState();
+		return true;
+	}
+
+	OverrideCursorGuard cursorGuard(Qt::WaitCursor);
+	std::vector<CrsRecord> records = BuildSystemCrsRecordsInternal();
+	if (!records.empty())
+	{
+		systemCrsRecords = std::move(records);
+		isSystemCrsInitializationFinished = true;
+		UpdateInitializationUiState();
+		StartWriteSystemCrsRecordsCacheAsync(systemCrsRecords);
+		return true;
+	}
+
+	return !systemCrsRecords.empty();
 }
 
 void QCrsManagerWidget::RefreshTableAndKeepSelection()
@@ -2026,7 +2381,17 @@ void QCrsManagerWidget::OnDeleteSelectedCrsClicked()
 		}
 	}
 
+	const std::vector<CustomCrsDefinition> oldDefinitions = customDefinitions;
 	customDefinitions.swap(remainingDefinitions);
+	if (!SaveCustomCrsDefinitionsToCache())
+	{
+		customDefinitions = oldDefinitions;
+		QMessageBox::warning(this,
+			QStringLiteral("删除自定义坐标系失败"),
+			QStringLiteral("写入缓存文件失败。请检查目录权限：\n%1").arg(ToQString(GetCustomCrsCacheFilePathUtf8())));
+		return;
+	}
+
 	RebuildCustomCrsRecords();
 	RefreshTable(false);
 	emit CustomCrsDefinitionsChanged();
@@ -2063,7 +2428,91 @@ bool QCrsManagerWidget::ApplySelectedCrsToCanvas(bool closeDialogAfterApply)
 
 void QCrsManagerWidget::OnAddCustomCrsClicked()
 {
-	// TODO: 后续在这里接入“添加自定义坐标系”的编辑对话框。
+	if (!EnsureSystemCrsRecordsLoadedForDuplicateCheck())
+	{
+		QMessageBox::warning(this,
+			QStringLiteral("添加自定义坐标系失败"),
+			QStringLiteral("当前无法加载完整的内置坐标系列表，因此无法完成同名坐标系校验。"));
+		return;
+	}
+
+	CustomCrsDefinition newDefinition;
+	std::string newUniqueIdUtf8;
+
+	QAddCustomCrsDialog dialog(this);
+	dialog.SetAcceptValidator([this, &newDefinition, &newUniqueIdUtf8](const std::string& inputWktUtf8, std::string& outErrorMessageUtf8) -> bool
+		{
+			outErrorMessageUtf8.clear();
+			newDefinition = CustomCrsDefinition();
+			newUniqueIdUtf8.clear();
+
+			const std::string wktUtf8 = GB_Utf8Trim(inputWktUtf8);
+			if (wktUtf8.empty())
+			{
+				outErrorMessageUtf8 = "请输入自定义坐标系的 WKT。";
+				return false;
+			}
+
+			std::string crsNameUtf8;
+			if (!TryExtractCrsNameFromWktText(wktUtf8, crsNameUtf8))
+			{
+				outErrorMessageUtf8 = "未能从输入的 WKT 中提取坐标系名称。请确认 WKT 根节点形如 GEOGCS[\"名称\", ...]、PROJCS[\"名称\", ...]、GEOGCRS[\"名称\", ...] 或 PROJCRS[\"名称\", ...]。";
+				return false;
+			}
+
+			for (const CrsRecord& record : systemCrsRecords)
+			{
+				if (GB_Utf8Equals(record.nameUtf8, crsNameUtf8, false))
+				{
+					outErrorMessageUtf8 = "已存在同名坐标系：" + crsNameUtf8 + "。";
+					return false;
+				}
+			}
+
+			for (const CustomCrsDefinition& definition : customDefinitions)
+			{
+				if (GB_Utf8Equals(GB_Utf8Trim(definition.nameUtf8), crsNameUtf8, false))
+				{
+					outErrorMessageUtf8 = "已存在同名自定义坐标系：" + crsNameUtf8 + "。";
+					return false;
+				}
+			}
+
+			std::string validateErrorMessageUtf8;
+			if (!TryValidateCrsWkt(wktUtf8, validateErrorMessageUtf8))
+			{
+				outErrorMessageUtf8 = validateErrorMessageUtf8.empty() ? "输入的 WKT 不合法。" : validateErrorMessageUtf8;
+				return false;
+			}
+
+			newDefinition.idUtf8 = "WKT_HASH:" + ToHexString(CalculateFnv1a64(crsNameUtf8 + "\n" + wktUtf8));
+			newDefinition.nameUtf8 = crsNameUtf8;
+			newDefinition.sourceUtf8 = "自定义";
+			newDefinition.codeUtf8.clear();
+			newDefinition.wktUtf8 = wktUtf8;
+			newUniqueIdUtf8 = BuildCustomUniqueId(newDefinition);
+			return true;
+		});
+
+	if (dialog.exec() != QDialog::Accepted || newDefinition.wktUtf8.empty() || newUniqueIdUtf8.empty())
+	{
+		return;
+	}
+
+	customDefinitions.push_back(newDefinition);
+	if (!SaveCustomCrsDefinitionsToCache())
+	{
+		customDefinitions.pop_back();
+		QMessageBox::warning(this,
+			QStringLiteral("添加自定义坐标系失败"),
+			QStringLiteral("自定义坐标系校验已通过，但写入缓存文件失败。请检查目录权限：\n%1").arg(ToQString(GetCustomCrsCacheFilePathUtf8())));
+		return;
+	}
+
+	RebuildCustomCrsRecords();
+	RefreshTable(false);
+	emit CustomCrsDefinitionsChanged();
+	SelectCrsByUniqueId(newUniqueIdUtf8);
 }
 
 void QCrsManagerWidget::ShowTableContextMenu(const QPoint& pos)

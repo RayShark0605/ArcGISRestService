@@ -121,6 +121,12 @@ public:
 	// 带缓存地判断 WKT 是否有效。
 	static bool IsWktValidCached(const std::string& wktUtf8);
 
+	// 校验输入的 WKT 是否是可用的 CRS 定义，并在失败时尽量返回底层解析/校验错误信息。
+	// - 支持 WKT1 / WKT2 等 OGRSpatialReference 可识别的 WKT CRS 定义；
+	// - 调用方无需包含或直接依赖 GDAL/OGR 头文件；
+	// - errorMessageUtf8 可为空。失败时若能获得原因，会写入 UTF-8 错误文本。
+	static bool ValidateWktUtf8(const std::string& wktUtf8, std::string* errorMessageUtf8 = nullptr);
+
 	// 带缓存地判断 CRS 定义（用户输入）是否有效。definitionUtf8 支持 OGRSpatialReference::SetFromUserInput() 可识别的各种输入：
 	// 例如 "EPSG:3857"、"urn:ogc:def:crs:EPSG::3857"、"CRS:84"、WKT、PROJJSON、PROJ.4 等。
 	// allowNetworkAccess / allowFileAccess 的语义与 GeoCrs::CreateFromUserInput 一致。

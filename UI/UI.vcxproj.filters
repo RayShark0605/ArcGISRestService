@@ -53,6 +53,9 @@
     <ClCompile Include="QCrsManagerWidget.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="QAddCustomCrsDialog.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <QtMoc Include="QMainCanvas.h">
@@ -74,6 +77,9 @@
       <Filter>Header Files</Filter>
     </QtMoc>
     <QtMoc Include="QCrsManagerWidget.h">
+      <Filter>Header Files</Filter>
+    </QtMoc>
+    <QtMoc Include="QAddCustomCrsDialog.h">
       <Filter>Header Files</Filter>
     </QtMoc>
   </ItemGroup>
