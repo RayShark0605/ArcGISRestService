@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <unordered_set>
@@ -147,15 +148,23 @@ namespace
 		points.push_back(point);
 	}
 
-	std::vector<GB_Point2d> ClipPolygonByBoundary(const std::vector<GB_Point2d>& sourcePolygon, const GB_Rectangle& clipRect, ClipBoundary boundary)
+	void RemoveClosingDuplicatePoint(std::vector<GB_Point2d>& points)
 	{
-		std::vector<GB_Point2d> result;
+		if (points.size() > 1 && points.front().IsNearEqual(points.back(), GB_Epsilon))
+		{
+			points.pop_back();
+		}
+	}
+
+	void ClipPolygonByBoundary(const std::vector<GB_Point2d>& sourcePolygon, const GB_Rectangle& clipRect, ClipBoundary boundary, std::vector<GB_Point2d>& outPolygon)
+	{
+		outPolygon.clear();
 		if (sourcePolygon.empty())
 		{
-			return result;
+			return;
 		}
 
-		result.reserve(sourcePolygon.size() + 4);
+		outPolygon.reserve(sourcePolygon.size() + 4);
 		GB_Point2d previousPoint = sourcePolygon.back();
 		bool previousInside = IsPointInsideClipBoundary(previousPoint, clipRect, boundary);
 
@@ -167,67 +176,81 @@ namespace
 				GB_Point2d intersectionPoint;
 				if (TryGetClipBoundaryIntersection(previousPoint, currentPoint, clipRect, boundary, intersectionPoint))
 				{
-					AppendPointIfUseful(result, intersectionPoint);
+					AppendPointIfUseful(outPolygon, intersectionPoint);
 				}
 			}
 
 			if (currentInside)
 			{
-				AppendPointIfUseful(result, currentPoint);
+				AppendPointIfUseful(outPolygon, currentPoint);
 			}
 
 			previousPoint = currentPoint;
 			previousInside = currentInside;
 		}
 
-		if (result.size() > 1 && result.front().IsNearEqual(result.back(), GB_Epsilon))
-		{
-			result.pop_back();
-		}
-
-		return result;
+		RemoveClosingDuplicatePoint(outPolygon);
 	}
 
-	std::vector<GB_Point2d> ClipPolygonToRectangle(const std::vector<GB_Point2d>& sourcePolygon, const GB_Rectangle& clipRect)
+	bool ClipPolygonToRectangle(const std::vector<GB_Point2d>& sourcePolygon, const GB_Rectangle& clipRect, std::vector<GB_Point2d>& outPolygon, std::vector<GB_Point2d>& scratchPolygon)
 	{
-		std::vector<GB_Point2d> workingPolygon;
-		workingPolygon.reserve(sourcePolygon.size());
+		outPolygon.clear();
+		scratchPolygon.clear();
+		outPolygon.reserve(sourcePolygon.size());
+
 		for (const GB_Point2d& point : sourcePolygon)
 		{
 			if (!IsPointFinite(point))
 			{
-				return std::vector<GB_Point2d>();
+				outPolygon.clear();
+				return false;
 			}
 
-			AppendPointIfUseful(workingPolygon, point);
+			AppendPointIfUseful(outPolygon, point);
 		}
 
-		if (workingPolygon.size() > 1 && workingPolygon.front().IsNearEqual(workingPolygon.back(), GB_Epsilon))
+		RemoveClosingDuplicatePoint(outPolygon);
+		if (outPolygon.size() < 3)
 		{
-			workingPolygon.pop_back();
+			outPolygon.clear();
+			return false;
 		}
 
-		if (workingPolygon.size() < 3)
+		ClipPolygonByBoundary(outPolygon, clipRect, ClipBoundary::Left, scratchPolygon);
+		outPolygon.swap(scratchPolygon);
+		if (outPolygon.size() < 3)
 		{
-			return std::vector<GB_Point2d>();
+			outPolygon.clear();
+			return false;
 		}
 
-		workingPolygon = ClipPolygonByBoundary(workingPolygon, clipRect, ClipBoundary::Left);
-		workingPolygon = ClipPolygonByBoundary(workingPolygon, clipRect, ClipBoundary::Right);
-		workingPolygon = ClipPolygonByBoundary(workingPolygon, clipRect, ClipBoundary::Bottom);
-		workingPolygon = ClipPolygonByBoundary(workingPolygon, clipRect, ClipBoundary::Top);
-
-		if (workingPolygon.size() > 1 && workingPolygon.front().IsNearEqual(workingPolygon.back(), GB_Epsilon))
+		ClipPolygonByBoundary(outPolygon, clipRect, ClipBoundary::Right, scratchPolygon);
+		outPolygon.swap(scratchPolygon);
+		if (outPolygon.size() < 3)
 		{
-			workingPolygon.pop_back();
+			outPolygon.clear();
+			return false;
 		}
 
-		if (workingPolygon.size() < 3)
+		ClipPolygonByBoundary(outPolygon, clipRect, ClipBoundary::Bottom, scratchPolygon);
+		outPolygon.swap(scratchPolygon);
+		if (outPolygon.size() < 3)
 		{
-			return std::vector<GB_Point2d>();
+			outPolygon.clear();
+			return false;
 		}
 
-		return workingPolygon;
+		ClipPolygonByBoundary(outPolygon, clipRect, ClipBoundary::Top, scratchPolygon);
+		outPolygon.swap(scratchPolygon);
+		RemoveClosingDuplicatePoint(outPolygon);
+
+		if (outPolygon.size() < 3)
+		{
+			outPolygon.clear();
+			return false;
+		}
+
+		return true;
 	}
 
 	bool IsFinitePositive(double value)
@@ -1268,13 +1291,50 @@ QImage QMainCanvas::CreateQImageFromGBImage(const GB_Image& image) const
 		return QImage();
 	}
 
-	if (image.GetDepth() != GB_ImageDepth::UInt8 || (image.GetChannels() != 1 && image.GetChannels() != 3 && image.GetChannels() != 4))
+	const int channels = image.GetChannels();
+	if (image.GetDepth() != GB_ImageDepth::UInt8 || (channels != 1 && channels != 3 && channels != 4))
+	{
+		return QImage();
+	}
+
+	if (image.GetWidth() > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+		image.GetHeight() > static_cast<size_t>(std::numeric_limits<int>::max()))
 	{
 		return QImage();
 	}
 
 	const int imageWidth = static_cast<int>(image.GetWidth());
 	const int imageHeight = static_cast<int>(image.GetHeight());
+
+	if (channels == 1)
+	{
+		QImage result(imageWidth, imageHeight, QImage::Format_Grayscale8);
+		if (result.isNull())
+		{
+			return QImage();
+		}
+
+		const size_t sourceRowStrideBytes = image.GetRowStrideBytes();
+		if (sourceRowStrideBytes < static_cast<size_t>(imageWidth))
+		{
+			return QImage();
+		}
+
+		for (int row = 0; row < imageHeight; row++)
+		{
+			const unsigned char* sourceRow = image.GetRowData(static_cast<size_t>(row));
+			unsigned char* targetRow = result.scanLine(row);
+			if (sourceRow == nullptr || targetRow == nullptr)
+			{
+				return QImage();
+			}
+
+			std::memcpy(targetRow, sourceRow, static_cast<size_t>(imageWidth));
+		}
+
+		return result;
+	}
+
 	QImage result(imageWidth, imageHeight, QImage::Format_ARGB32);
 	if (result.isNull())
 	{
@@ -1284,6 +1344,11 @@ QImage QMainCanvas::CreateQImageFromGBImage(const GB_Image& image) const
 	for (int row = 0; row < imageHeight; row++)
 	{
 		QRgb* scanLine = reinterpret_cast<QRgb*>(result.scanLine(row));
+		if (scanLine == nullptr)
+		{
+			return QImage();
+		}
+
 		for (int col = 0; col < imageWidth; col++)
 		{
 			GB_ColorRGBA color;
@@ -1403,6 +1468,11 @@ bool QMainCanvas::TryCreateCachedMapTile(const MapTile& tile, double layerNumber
 	{
 		return false;
 	}
+
+	// 绘制阶段只依赖已经上传到 GUI 侧的 QPixmap。
+	// 清理 CachedMapTile 中的 GB_Image 句柄，避免每个瓦片同时长期持有 CPU 侧原始图像与 QPixmap。
+	// 对大瓦片/多瓦片场景，这可以显著降低内存压力。
+	cachedTile.tile.image.Clear();
 
 	cachedTile.inverseTileExtentWidth = 1.0 / cachedTile.tileExtentWidth;
 	cachedTile.inverseTileExtentHeight = 1.0 / cachedTile.tileExtentHeight;
@@ -1571,6 +1641,9 @@ bool QMainCanvas::TryBuildCrsValidAreaScreenPath(QPainterPath& outPath, GB_Recta
 	const double viewMinX = viewExtent.minX;
 	const double viewMaxY = viewExtent.maxY;
 
+	std::vector<GB_Point2d> clippedPolygon;
+	std::vector<GB_Point2d> clippedPolygonScratch;
+
 	for (size_t polygonIndex = 0; polygonIndex < crsValidAreaPolygonsCache.size(); polygonIndex++)
 	{
 		const std::vector<GB_Point2d>& polygon = crsValidAreaPolygonsCache[polygonIndex];
@@ -1588,8 +1661,7 @@ bool QMainCanvas::TryBuildCrsValidAreaScreenPath(QPainterPath& outPath, GB_Recta
 			}
 		}
 
-		const std::vector<GB_Point2d> clippedPolygon = ClipPolygonToRectangle(polygon, viewExtent);
-		if (clippedPolygon.size() < 3)
+		if (!ClipPolygonToRectangle(polygon, viewExtent, clippedPolygon, clippedPolygonScratch))
 		{
 			continue;
 		}
@@ -1650,6 +1722,9 @@ bool QMainCanvas::TryIntersectRectangleWithCrsValidAreaPolygons(const GB_Rectang
 	}
 
 	const bool canUseCachedExtents = crsValidAreaPolygonExtentsCache.size() == crsValidAreaPolygonsCache.size();
+	std::vector<GB_Point2d> clippedPolygon;
+	std::vector<GB_Point2d> clippedPolygonScratch;
+
 	for (size_t polygonIndex = 0; polygonIndex < crsValidAreaPolygonsCache.size(); polygonIndex++)
 	{
 		if (canUseCachedExtents)
@@ -1661,8 +1736,7 @@ bool QMainCanvas::TryIntersectRectangleWithCrsValidAreaPolygons(const GB_Rectang
 			}
 		}
 
-		const std::vector<GB_Point2d> clippedPolygon = ClipPolygonToRectangle(crsValidAreaPolygonsCache[polygonIndex], rect);
-		if (clippedPolygon.size() < 3)
+		if (!ClipPolygonToRectangle(crsValidAreaPolygonsCache[polygonIndex], rect, clippedPolygon, clippedPolygonScratch))
 		{
 			continue;
 		}
