@@ -1179,7 +1179,7 @@ bool GeoCrsManager::ValidateWktUtf8(const std::string& wktUtf8, std::string* err
             *errorMessageUtf8 = GB_STR("输入的 WKT 不是合法的坐标系定义。");
             if (!importErrorMessage.empty())
             {
-                *errorMessageUtf8 += GB_STR("\n\n底层坐标系解析库返回信息：") + importErrorMessage;
+                *errorMessageUtf8 += GB_STR("\n\n") + importErrorMessage;
             }
         }
         return false;
@@ -1206,7 +1206,7 @@ bool GeoCrsManager::ValidateWktUtf8(const std::string& wktUtf8, std::string* err
             *errorMessageUtf8 = GB_STR("输入的 WKT 可以被解析，但未通过坐标系结构校验。");
             if (!validateErrorMessage.empty())
             {
-                *errorMessageUtf8 += GB_STR("\n\n底层坐标系解析库返回信息：") + validateErrorMessage;
+                *errorMessageUtf8 += GB_STR("\n\n") + validateErrorMessage;
             }
         }
         return false;

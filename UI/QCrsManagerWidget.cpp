@@ -108,6 +108,32 @@ namespace
 		return std::string(text.toUtf8().constData());
 	}
 
+	QString FromUtf8Literal(const char* textUtf8)
+	{
+		return QString::fromUtf8(textUtf8);
+	}
+
+	std::string NormalizeCustomSourceUtf8(const std::string& sourceUtf8)
+	{
+		const std::string trimmedSourceUtf8 = GB_Utf8Trim(sourceUtf8);
+		if (trimmedSourceUtf8.empty())
+		{
+			return "";
+		}
+
+		if (!GB_IsUtf8(trimmedSourceUtf8))
+		{
+			return "";
+		}
+
+		if (GB_Utf8Equals(trimmedSourceUtf8, GB_STR("自定义"), false))
+		{
+			return "";
+		}
+
+		return trimmedSourceUtf8;
+	}
+
 	bool IsSupportedMapCrsType(GeoCrsDatabaseType type)
 	{
 		return type == GeoCrsDatabaseType::Geographic || type == GeoCrsDatabaseType::Projected;
@@ -127,7 +153,7 @@ namespace
 	{
 		if (isCustom)
 		{
-			return QStringLiteral("自定义");
+			return QStringLiteral("自定义坐标系");
 		}
 
 		switch (category)
@@ -537,10 +563,7 @@ namespace
 		definition.codeUtf8 = GB_Utf8Trim(definition.codeUtf8);
 		definition.wktUtf8 = GB_Utf8Trim(definition.wktUtf8);
 
-		if (definition.sourceUtf8.empty())
-		{
-			definition.sourceUtf8 = "自定义";
-		}
+		definition.sourceUtf8 = NormalizeCustomSourceUtf8(definition.sourceUtf8);
 
 		return !definition.nameUtf8.empty() && !definition.wktUtf8.empty();
 	}
@@ -768,7 +791,7 @@ namespace
 		const bool valid = GeoCrsManager::ValidateWktUtf8(wktUtf8, &outErrorMessageUtf8);
 		if (!valid && outErrorMessageUtf8.empty())
 		{
-			outErrorMessageUtf8 = "输入的 WKT 不合法。";
+			outErrorMessageUtf8 = GB_STR("输入的 WKT 不合法。");
 		}
 		return valid;
 	}
@@ -1585,7 +1608,7 @@ void QCrsManagerWidget::InitializeUi()
 	setObjectName(QStringLiteral("QCrsManagerWidget"));
 	setWindowTitle(BaseWindowTitle);
 	setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint);
-	resize(900, 600);
+	resize(1200, 600);
 
 	QVBoxLayout* mainLayout = new QVBoxLayout(this);
 	mainLayout->setContentsMargins(6, 6, 6, 6);
@@ -1910,14 +1933,10 @@ void QCrsManagerWidget::RebuildCustomCrsRecords()
 		}
 		if (record.nameUtf8.empty())
 		{
-			record.nameUtf8 = "自定义坐标系";
+			record.nameUtf8 = GB_STR("自定义坐标系");
 		}
 
-		record.sourceUtf8 = GB_Utf8Trim(definition.sourceUtf8);
-		if (record.sourceUtf8.empty())
-		{
-			record.sourceUtf8 = "自定义";
-		}
+		record.sourceUtf8 = NormalizeCustomSourceUtf8(definition.sourceUtf8);
 		record.codeUtf8 = GB_Utf8Trim(definition.codeUtf8);
 		record.ellipsoidUtf8 = crs->GetReferenceEllipsoidNameUtf8();
 		record.category = crs->IsProjected() ? CrsCategory::Projected : CrsCategory::Geographic;
@@ -2325,17 +2344,26 @@ void QCrsManagerWidget::UpdateActionButtons()
 {
 	const std::vector<const CrsRecord*> selectedRecords = GetSelectedCrsRecords();
 	applyToCanvasButton->setEnabled(mainCanvas != nullptr && selectedRecords.size() == 1 && selectedRecords[0] != nullptr);
+	deleteCrsButton->setEnabled(CanDeleteSelectedCrs());
+}
 
-	bool canDelete = !selectedRecords.empty();
+bool QCrsManagerWidget::CanDeleteSelectedCrs() const
+{
+	const std::vector<const CrsRecord*> selectedRecords = GetSelectedCrsRecords();
+	if (selectedRecords.empty())
+	{
+		return false;
+	}
+
 	for (const CrsRecord* record : selectedRecords)
 	{
 		if (record == nullptr || !record->isCustom)
 		{
-			canDelete = false;
-			break;
+			return false;
 		}
 	}
-	deleteCrsButton->setEnabled(canDelete);
+
+	return true;
 }
 
 void QCrsManagerWidget::OnDeleteSelectedCrsClicked()
@@ -2355,8 +2383,8 @@ void QCrsManagerWidget::OnDeleteSelectedCrsClicked()
 	}
 
 	const int answer = QMessageBox::question(this,
-		QStringLiteral("确认删除"),
-		QStringLiteral("确定要删除当前选中的 %1 个自定义坐标系吗？").arg(static_cast<int>(selectedRecords.size())),
+		FromUtf8Literal(u8"确认删除"),
+		FromUtf8Literal(u8"确定要删除当前选中的 %1 个自定义坐标系吗？").arg(static_cast<int>(selectedRecords.size())),
 		QMessageBox::Yes | QMessageBox::No,
 		QMessageBox::No);
 	if (answer != QMessageBox::Yes)
@@ -2387,8 +2415,8 @@ void QCrsManagerWidget::OnDeleteSelectedCrsClicked()
 	{
 		customDefinitions = oldDefinitions;
 		QMessageBox::warning(this,
-			QStringLiteral("删除自定义坐标系失败"),
-			QStringLiteral("写入缓存文件失败。请检查目录权限：\n%1").arg(ToQString(GetCustomCrsCacheFilePathUtf8())));
+			FromUtf8Literal(u8"删除自定义坐标系失败"),
+			FromUtf8Literal(u8"写入缓存文件失败。请检查目录权限：\n%1").arg(ToQString(GetCustomCrsCacheFilePathUtf8())));
 		return;
 	}
 
@@ -2413,7 +2441,7 @@ bool QCrsManagerWidget::ApplySelectedCrsToCanvas(bool closeDialogAfterApply)
 	const std::string wktUtf8 = ResolveWktForRecord(*selectedRecords[0]);
 	if (wktUtf8.empty())
 	{
-		QMessageBox::warning(this, QStringLiteral("设置坐标系失败"), QStringLiteral("未能生成当前坐标系的 WKT。"));
+		QMessageBox::warning(this, FromUtf8Literal(u8"设置坐标系失败"), FromUtf8Literal(u8"未能生成当前坐标系的 WKT。"));
 		return false;
 	}
 
@@ -2431,8 +2459,8 @@ void QCrsManagerWidget::OnAddCustomCrsClicked()
 	if (!EnsureSystemCrsRecordsLoadedForDuplicateCheck())
 	{
 		QMessageBox::warning(this,
-			QStringLiteral("添加自定义坐标系失败"),
-			QStringLiteral("当前无法加载完整的内置坐标系列表，因此无法完成同名坐标系校验。"));
+			FromUtf8Literal(u8"添加自定义坐标系失败"),
+			FromUtf8Literal(u8"当前无法加载完整的内置坐标系列表，因此无法完成同名坐标系校验。"));
 		return;
 	}
 
@@ -2449,14 +2477,14 @@ void QCrsManagerWidget::OnAddCustomCrsClicked()
 			const std::string wktUtf8 = GB_Utf8Trim(inputWktUtf8);
 			if (wktUtf8.empty())
 			{
-				outErrorMessageUtf8 = "请输入自定义坐标系的 WKT。";
+				outErrorMessageUtf8 = GB_STR("请输入自定义坐标系的 WKT。");
 				return false;
 			}
 
 			std::string crsNameUtf8;
 			if (!TryExtractCrsNameFromWktText(wktUtf8, crsNameUtf8))
 			{
-				outErrorMessageUtf8 = "未能从输入的 WKT 中提取坐标系名称。请确认 WKT 根节点形如 GEOGCS[\"名称\", ...]、PROJCS[\"名称\", ...]、GEOGCRS[\"名称\", ...] 或 PROJCRS[\"名称\", ...]。";
+				outErrorMessageUtf8 = GB_STR("未能从输入的 WKT 中提取坐标系名称。请确认 WKT 根节点形如 GEOGCS[\"名称\", ...]、PROJCS[\"名称\", ...]、GEOGCRS[\"名称\", ...] 或 PROJCRS[\"名称\", ...]。");
 				return false;
 			}
 
@@ -2464,7 +2492,7 @@ void QCrsManagerWidget::OnAddCustomCrsClicked()
 			{
 				if (GB_Utf8Equals(record.nameUtf8, crsNameUtf8, false))
 				{
-					outErrorMessageUtf8 = "已存在同名坐标系：" + crsNameUtf8 + "。";
+					outErrorMessageUtf8 = GB_STR("已存在同名坐标系：") + crsNameUtf8 + GB_STR("。");
 					return false;
 				}
 			}
@@ -2473,7 +2501,7 @@ void QCrsManagerWidget::OnAddCustomCrsClicked()
 			{
 				if (GB_Utf8Equals(GB_Utf8Trim(definition.nameUtf8), crsNameUtf8, false))
 				{
-					outErrorMessageUtf8 = "已存在同名自定义坐标系：" + crsNameUtf8 + "。";
+					outErrorMessageUtf8 = GB_STR("已存在同名自定义坐标系：") + crsNameUtf8 + GB_STR("。");
 					return false;
 				}
 			}
@@ -2481,13 +2509,13 @@ void QCrsManagerWidget::OnAddCustomCrsClicked()
 			std::string validateErrorMessageUtf8;
 			if (!TryValidateCrsWkt(wktUtf8, validateErrorMessageUtf8))
 			{
-				outErrorMessageUtf8 = validateErrorMessageUtf8.empty() ? "输入的 WKT 不合法。" : validateErrorMessageUtf8;
+				outErrorMessageUtf8 = validateErrorMessageUtf8.empty() ? GB_STR("输入的 WKT 不合法。") : validateErrorMessageUtf8;
 				return false;
 			}
 
 			newDefinition.idUtf8 = "WKT_HASH:" + ToHexString(CalculateFnv1a64(crsNameUtf8 + "\n" + wktUtf8));
 			newDefinition.nameUtf8 = crsNameUtf8;
-			newDefinition.sourceUtf8 = "自定义";
+			newDefinition.sourceUtf8.clear();
 			newDefinition.codeUtf8.clear();
 			newDefinition.wktUtf8 = wktUtf8;
 			newUniqueIdUtf8 = BuildCustomUniqueId(newDefinition);
@@ -2504,8 +2532,8 @@ void QCrsManagerWidget::OnAddCustomCrsClicked()
 	{
 		customDefinitions.pop_back();
 		QMessageBox::warning(this,
-			QStringLiteral("添加自定义坐标系失败"),
-			QStringLiteral("自定义坐标系校验已通过，但写入缓存文件失败。请检查目录权限：\n%1").arg(ToQString(GetCustomCrsCacheFilePathUtf8())));
+			FromUtf8Literal(u8"添加自定义坐标系失败"),
+			FromUtf8Literal(u8"自定义坐标系校验已通过，但写入缓存文件失败。请检查目录权限：\n%1").arg(ToQString(GetCustomCrsCacheFilePathUtf8())));
 		return;
 	}
 
@@ -2524,6 +2552,11 @@ void QCrsManagerWidget::ShowTableContextMenu(const QPoint& pos)
 	}
 
 	QItemSelectionModel* selectionModel = crsTableWidget->selectionModel();
+	if (!selectionModel)
+	{
+		return;
+	}
+
 	if (!selectionModel->isRowSelected(index.row(), QModelIndex()))
 	{
 		selectionModel->clearSelection();
@@ -2531,18 +2564,27 @@ void QCrsManagerWidget::ShowTableContextMenu(const QPoint& pos)
 	}
 
 	const std::vector<const CrsRecord*> selectedRecords = GetSelectedCrsRecords();
-	if (selectedRecords.size() != 1 || selectedRecords[0] == nullptr)
+	if (selectedRecords.empty())
 	{
 		return;
 	}
 
 	QMenu menu(this);
-	QAction* applyAction = menu.addAction(style()->standardIcon(QStyle::SP_DialogApplyButton), QStringLiteral("应用到画布"));
-	applyAction->setEnabled(mainCanvas != nullptr);
+	QAction* applyAction = menu.addAction(style()->standardIcon(QStyle::SP_DialogApplyButton), FromUtf8Literal(u8"应用到画布"));
+	applyAction->setEnabled(mainCanvas != nullptr && selectedRecords.size() == 1 && selectedRecords[0] != nullptr);
 	connect(applyAction, &QAction::triggered, this, [this]()
 		{
 			ApplySelectedCrsToCanvas(false);
 		});
+
+	if (CanDeleteSelectedCrs())
+	{
+		QAction* deleteAction = menu.addAction(style()->standardIcon(QStyle::SP_TrashIcon), FromUtf8Literal(u8"删除坐标系"));
+		connect(deleteAction, &QAction::triggered, this, [this]()
+			{
+				OnDeleteSelectedCrsClicked();
+			});
+	}
 
 	menu.exec(crsTableWidget->viewport()->mapToGlobal(pos));
 }

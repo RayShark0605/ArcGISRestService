@@ -28,7 +28,7 @@ public:
 	{
 		std::string idUtf8 = "";
 		std::string nameUtf8 = "";
-		std::string sourceUtf8 = u8"自定义";
+		std::string sourceUtf8 = "";
 		std::string codeUtf8 = "";
 		std::string wktUtf8 = "";
 	};
@@ -130,6 +130,7 @@ private:
 	void UpdateCrsDetails();
 	void UpdateCrsPreview();
 	void UpdateActionButtons();
+	bool CanDeleteSelectedCrs() const;
 	void OnDeleteSelectedCrsClicked();
 	void OnApplyToCanvasClicked();
 	bool ApplySelectedCrsToCanvas(bool closeDialogAfterApply);
