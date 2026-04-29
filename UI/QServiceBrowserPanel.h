@@ -78,6 +78,7 @@ public:
 	virtual ~QServiceBrowserPanel() override;
 
 	static QString GetArcGISRestCategoryUid();
+	static QString GetDefaultArcGISRestServicesMemoryFilePath();
 	static Qt::DockWidgetArea GetDefaultDockWidgetArea();
 
 	QTreeWidget* GetTreeWidget() const;
@@ -180,6 +181,10 @@ private:
 	bool IsArcGISRestConnectionLoadCurrent(const QString& uid, quint64 loadToken) const;
 	void EndArcGISRestConnectionLoad(const QString& uid, quint64 loadToken);
 	void CancelArcGISRestConnectionLoadsRecursively(const QTreeWidgetItem* item);
+
+	bool LoadArcGISRestServicesFromMemoryFile();
+	bool SaveArcGISRestServicesToMemoryFile() const;
+	std::vector<ArcGISRestConnectionSettings> CollectArcGISRestConnectionSettingsForMemoryFile() const;
 
 	void RefreshArcGISRestConnection(QTreeWidgetItem* item);
 	void RefreshArcGISRestChildNode(QTreeWidgetItem* item);

@@ -3,11 +3,15 @@
 
 #include "QMainCanvas.h"
 
+#include "GeoBase/GB_FileSystem.h"
+#include "GeoBase/GB_IO.h"
+
 #include <QAction>
 #include <QApplication>
 #include <QClipboard>
 #include <QColor>
 #include <QDialog>
+#include <QDir>
 #include <QGroupBox>
 #include <QMetaObject>
 #include <QHash>
@@ -35,6 +39,8 @@
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <utility>
 #include <cmath>
 
@@ -57,6 +63,230 @@ namespace
 	};
 
 	const char* ArcGISRestCategoryUidText = "arcgis_rest_services_category";
+
+	const char* ArcGISRestServicesMemoryFileName = "CustomArcGISRestServices.bin";
+	const char ArcGISRestServicesMemoryFileMagic[] = { 'M', 'W', 'A', 'R', 'S', 'V', 'C', '1' };
+	const uint32_t ArcGISRestServicesMemoryFileVersion = 1;
+	const uint32_t ArcGISRestServicesMemoryFileMaxConnectionCount = 100000;
+	const uint32_t ArcGISRestServicesMemoryFileMaxHeaderCount = 10000;
+	const uint32_t ArcGISRestServicesMemoryFileMaxStringByteCount = 64u * 1024u * 1024u;
+
+	QString NormalizeFilePathText(QString filePath)
+	{
+		return filePath.replace(QLatin1Char('\\'), QLatin1Char('/'));
+	}
+
+	void AppendRawBytes(GB_ByteBuffer& buffer, const void* data, size_t byteCount)
+	{
+		if (!data || byteCount == 0)
+		{
+			return;
+		}
+
+		const char* const begin = static_cast<const char*>(data);
+		buffer.insert(buffer.end(), begin, begin + byteCount);
+	}
+
+	bool ReadRawBytes(const GB_ByteBuffer& buffer, size_t& offset, size_t byteCount, std::string& outBytes)
+	{
+		outBytes.clear();
+		if (byteCount == 0)
+		{
+			return true;
+		}
+
+		if (offset > buffer.size() || byteCount > buffer.size() - offset)
+		{
+			return false;
+		}
+
+		const char* const begin = reinterpret_cast<const char*>(buffer.data()) + offset;
+		outBytes.assign(begin, byteCount);
+		offset += byteCount;
+		return true;
+	}
+
+	bool AppendMemoryFileString(GB_ByteBuffer& buffer, const std::string& text)
+	{
+		if (text.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
+		{
+			return false;
+		}
+
+		GB_ByteBufferIO::AppendUInt32LE(buffer, static_cast<uint32_t>(text.size()));
+		AppendRawBytes(buffer, text.data(), text.size());
+		return true;
+	}
+
+	bool ReadMemoryFileString(const GB_ByteBuffer& buffer, size_t& offset, std::string& outText)
+	{
+		outText.clear();
+
+		uint32_t textSize = 0;
+		if (!GB_ByteBufferIO::ReadUInt32LE(buffer, offset, textSize))
+		{
+			return false;
+		}
+
+		if (textSize > ArcGISRestServicesMemoryFileMaxStringByteCount)
+		{
+			return false;
+		}
+
+		return ReadRawBytes(buffer, offset, static_cast<size_t>(textSize), outText);
+	}
+
+	bool AppendArcGISRestConnectionSettings(GB_ByteBuffer& buffer, const ArcGISRestConnectionSettings& settings)
+	{
+		if (!AppendMemoryFileString(buffer, settings.displayName) ||
+			!AppendMemoryFileString(buffer, settings.serviceUrl) ||
+			!AppendMemoryFileString(buffer, settings.urlPrefix) ||
+			!AppendMemoryFileString(buffer, settings.portalCommunityEndpoint) ||
+			!AppendMemoryFileString(buffer, settings.portalContentEndpoint) ||
+			!AppendMemoryFileString(buffer, settings.username) ||
+			!AppendMemoryFileString(buffer, settings.password) ||
+			!AppendMemoryFileString(buffer, settings.httpReferer))
+		{
+			return false;
+		}
+
+		if (settings.httpCustomHeaders.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
+		{
+			return false;
+		}
+
+		GB_ByteBufferIO::AppendUInt32LE(buffer, static_cast<uint32_t>(settings.httpCustomHeaders.size()));
+		for (const std::pair<std::string, std::string>& header : settings.httpCustomHeaders)
+		{
+			if (!AppendMemoryFileString(buffer, header.first) || !AppendMemoryFileString(buffer, header.second))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool ReadArcGISRestConnectionSettings(const GB_ByteBuffer& buffer, size_t& offset, ArcGISRestConnectionSettings& outSettings)
+	{
+		ArcGISRestConnectionSettings settings;
+		if (!ReadMemoryFileString(buffer, offset, settings.displayName) ||
+			!ReadMemoryFileString(buffer, offset, settings.serviceUrl) ||
+			!ReadMemoryFileString(buffer, offset, settings.urlPrefix) ||
+			!ReadMemoryFileString(buffer, offset, settings.portalCommunityEndpoint) ||
+			!ReadMemoryFileString(buffer, offset, settings.portalContentEndpoint) ||
+			!ReadMemoryFileString(buffer, offset, settings.username) ||
+			!ReadMemoryFileString(buffer, offset, settings.password) ||
+			!ReadMemoryFileString(buffer, offset, settings.httpReferer))
+		{
+			return false;
+		}
+
+		uint32_t headerCount = 0;
+		if (!GB_ByteBufferIO::ReadUInt32LE(buffer, offset, headerCount) || headerCount > ArcGISRestServicesMemoryFileMaxHeaderCount)
+		{
+			return false;
+		}
+
+		settings.httpCustomHeaders.reserve(headerCount);
+		for (uint32_t headerIndex = 0; headerIndex < headerCount; headerIndex++)
+		{
+			std::string headerName;
+			std::string headerValue;
+			if (!ReadMemoryFileString(buffer, offset, headerName) || !ReadMemoryFileString(buffer, offset, headerValue))
+			{
+				return false;
+			}
+			settings.httpCustomHeaders.push_back(std::make_pair(headerName, headerValue));
+		}
+
+		outSettings = std::move(settings);
+		return true;
+	}
+
+	bool SerializeArcGISRestConnectionSettingsList(const std::vector<ArcGISRestConnectionSettings>& settingsList, GB_ByteBuffer& outBuffer)
+	{
+		outBuffer.clear();
+		if (settingsList.size() > static_cast<size_t>(ArcGISRestServicesMemoryFileMaxConnectionCount))
+		{
+			return false;
+		}
+
+		AppendRawBytes(outBuffer, ArcGISRestServicesMemoryFileMagic, sizeof(ArcGISRestServicesMemoryFileMagic));
+		GB_ByteBufferIO::AppendUInt32LE(outBuffer, ArcGISRestServicesMemoryFileVersion);
+		GB_ByteBufferIO::AppendUInt32LE(outBuffer, static_cast<uint32_t>(settingsList.size()));
+		for (const ArcGISRestConnectionSettings& settings : settingsList)
+		{
+			if (!AppendArcGISRestConnectionSettings(outBuffer, settings))
+			{
+				outBuffer.clear();
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool DeserializeArcGISRestConnectionSettingsList(const GB_ByteBuffer& buffer, std::vector<ArcGISRestConnectionSettings>& outSettingsList)
+	{
+		outSettingsList.clear();
+		if (buffer.empty())
+		{
+			return false;
+		}
+
+		size_t offset = 0;
+		std::string magic;
+		if (!ReadRawBytes(buffer, offset, sizeof(ArcGISRestServicesMemoryFileMagic), magic) ||
+			magic != std::string(ArcGISRestServicesMemoryFileMagic, sizeof(ArcGISRestServicesMemoryFileMagic)))
+		{
+			return false;
+		}
+
+		uint32_t version = 0;
+		if (!GB_ByteBufferIO::ReadUInt32LE(buffer, offset, version) || version != ArcGISRestServicesMemoryFileVersion)
+		{
+			return false;
+		}
+
+		uint32_t connectionCount = 0;
+		if (!GB_ByteBufferIO::ReadUInt32LE(buffer, offset, connectionCount) || connectionCount > ArcGISRestServicesMemoryFileMaxConnectionCount)
+		{
+			return false;
+		}
+
+		std::vector<ArcGISRestConnectionSettings> settingsList;
+		settingsList.reserve(connectionCount);
+		for (uint32_t connectionIndex = 0; connectionIndex < connectionCount; connectionIndex++)
+		{
+			ArcGISRestConnectionSettings settings;
+			if (!ReadArcGISRestConnectionSettings(buffer, offset, settings))
+			{
+				return false;
+			}
+			settingsList.push_back(std::move(settings));
+		}
+
+		if (offset != buffer.size())
+		{
+			return false;
+		}
+
+		outSettingsList.swap(settingsList);
+		return true;
+	}
+
+	void ShowArcGISRestServicesMemoryFileError(QWidget* parent, const QString& mainText, const QString& detailText)
+	{
+		QMessageBox messageBox(parent);
+		messageBox.setIcon(QMessageBox::Warning);
+		messageBox.setWindowTitle(QStringLiteral("ArcGIS REST 服务记忆文件错误"));
+		messageBox.setText(mainText);
+		if (!detailText.isEmpty())
+		{
+			messageBox.setDetailedText(detailText);
+		}
+		messageBox.setStandardButtons(QMessageBox::Ok);
+		messageBox.exec();
+	}
 
 	bool IsPlaceholderItem(const QTreeWidgetItem* item)
 	{
@@ -848,6 +1078,12 @@ QServiceBrowserPanel::QServiceBrowserPanel(QWidget* parent) : QDockWidget(QStrin
 	connect(loadingAnimationTimer, &QTimer::timeout, this, &QServiceBrowserPanel::OnLoadingAnimationTimerTimeout);
 
 	EnsureArcGISRestCategoryItem();
+	if (!LoadArcGISRestServicesFromMemoryFile())
+	{
+		ShowArcGISRestServicesMemoryFileError(this,
+			QStringLiteral("读取 ArcGIS REST 服务记忆文件失败。"),
+			GetDefaultArcGISRestServicesMemoryFilePath());
+	}
 
 	connect(treeWidget, &QTreeWidget::currentItemChanged, this, &QServiceBrowserPanel::OnCurrentItemChanged);
 	connect(treeWidget, &QTreeWidget::itemActivated, this, &QServiceBrowserPanel::OnItemActivated);
@@ -867,6 +1103,31 @@ QServiceBrowserPanel::~QServiceBrowserPanel()
 QString QServiceBrowserPanel::GetArcGISRestCategoryUid()
 {
 	return QString::fromLatin1(ArcGISRestCategoryUidText);
+}
+
+QString QServiceBrowserPanel::GetDefaultArcGISRestServicesMemoryFilePath()
+{
+	QString localAppDataPath = qEnvironmentVariable("LOCALAPPDATA").trimmed();
+	if (localAppDataPath.isEmpty())
+	{
+		const QString userProfilePath = qEnvironmentVariable("USERPROFILE").trimmed();
+		if (!userProfilePath.isEmpty())
+		{
+			localAppDataPath = userProfilePath + QStringLiteral("/AppData/Local");
+		}
+	}
+	if (localAppDataPath.isEmpty())
+	{
+		localAppDataPath = QDir::homePath() + QStringLiteral("/AppData/Local");
+	}
+
+	QString filePath = localAppDataPath;
+	while (filePath.endsWith(QLatin1Char('/')) || filePath.endsWith(QLatin1Char('\\')))
+	{
+		filePath.chop(1);
+	}
+	filePath += QStringLiteral("/MapWeaver/") + QString::fromLatin1(ArcGISRestServicesMemoryFileName);
+	return NormalizeFilePathText(filePath);
 }
 
 Qt::DockWidgetArea QServiceBrowserPanel::GetDefaultDockWidgetArea()
@@ -1305,6 +1566,12 @@ void QServiceBrowserPanel::OnNewArcGISRestConnectionRequested()
 	}
 
 	SetArcGISRestConnectionSettings(provisionalUid, settings);
+	if (!SaveArcGISRestServicesToMemoryFile())
+	{
+		ShowArcGISRestServicesMemoryFileError(this,
+			QStringLiteral("保存 ArcGIS REST 服务记忆文件失败。"),
+			GetDefaultArcGISRestServicesMemoryFilePath());
+	}
 
 	QTreeWidgetItem* connectionItem = FindItemByUid(provisionalUid);
 	SetItemLoadingState(connectionItem, true);
@@ -2252,6 +2519,132 @@ void QServiceBrowserPanel::CancelArcGISRestConnectionLoadsRecursively(const QTre
 	}
 }
 
+bool QServiceBrowserPanel::LoadArcGISRestServicesFromMemoryFile()
+{
+	EnsureArcGISRestCategoryItem();
+	const QString filePath = GetDefaultArcGISRestServicesMemoryFilePath();
+	const std::string filePathUtf8 = ToStdString(filePath);
+	if (filePathUtf8.empty() || !GB_IsFileExists(filePathUtf8))
+	{
+		return true;
+	}
+
+	const GB_ByteBuffer fileData = GB_ReadBinaryFromFile(filePathUtf8);
+	std::vector<ArcGISRestConnectionSettings> settingsList;
+	if (!DeserializeArcGISRestConnectionSettingsList(fileData, settingsList))
+	{
+		return false;
+	}
+
+	if (treeWidget)
+	{
+		treeWidget->setUpdatesEnabled(false);
+	}
+
+	bool allSucceeded = true;
+	for (ArcGISRestConnectionSettings settings : settingsList)
+	{
+		settings = NormalizeArcGISRestConnectionSettings(settings);
+		if (settings.displayName.empty())
+		{
+			settings.displayName = ToStdString(GuessArcGISRestDisplayName(settings));
+		}
+
+		const std::string serviceBaseUrl = NormalizeArcGISRestServiceUrl(settings.serviceUrl);
+		if (settings.serviceUrl.empty() || serviceBaseUrl.empty())
+		{
+			allSucceeded = false;
+			continue;
+		}
+
+		ArcGISRestServiceTreeNode connectionNode = CreateArcGISRestConnectionNodeFromSettings(settings, serviceBaseUrl);
+		if (!AddArcGISRestServiceNodeInternal(connectionNode, arcGISRestCategoryItem, false))
+		{
+			allSucceeded = false;
+			continue;
+		}
+		SetArcGISRestConnectionSettings(ToQString(connectionNode.uid), settings);
+	}
+
+	if (arcGISRestCategoryItem)
+	{
+		arcGISRestCategoryItem->setExpanded(true);
+	}
+
+	if (treeWidget)
+	{
+		treeWidget->setUpdatesEnabled(true);
+	}
+
+	UpdateLoadingAnimationTimerState();
+	UpdateDetailsForItem(treeWidget ? treeWidget->currentItem() : nullptr);
+	return allSucceeded;
+}
+
+bool QServiceBrowserPanel::SaveArcGISRestServicesToMemoryFile() const
+{
+	GB_ByteBuffer fileData;
+	const std::vector<ArcGISRestConnectionSettings> settingsList = CollectArcGISRestConnectionSettingsForMemoryFile();
+	if (!SerializeArcGISRestConnectionSettingsList(settingsList, fileData))
+	{
+		return false;
+	}
+
+	const QString filePath = GetDefaultArcGISRestServicesMemoryFilePath();
+	const std::string filePathUtf8 = ToStdString(filePath);
+	if (filePathUtf8.empty())
+	{
+		return false;
+	}
+
+	const std::string directoryPathUtf8 = GB_GetDirectoryPath(filePathUtf8);
+	if (!directoryPathUtf8.empty() && !GB_CreateDirectory(directoryPathUtf8))
+	{
+		return false;
+	}
+
+	return GB_WriteBinaryToFile(fileData, filePathUtf8);
+}
+
+std::vector<ArcGISRestConnectionSettings> QServiceBrowserPanel::CollectArcGISRestConnectionSettingsForMemoryFile() const
+{
+	std::vector<ArcGISRestConnectionSettings> settingsList;
+	if (!arcGISRestCategoryItem)
+	{
+		return settingsList;
+	}
+
+	settingsList.reserve(static_cast<size_t>(arcGISRestCategoryItem->childCount()));
+	for (int childIndex = 0; childIndex < arcGISRestCategoryItem->childCount(); childIndex++)
+	{
+		const QTreeWidgetItem* childItem = arcGISRestCategoryItem->child(childIndex);
+		if (!childItem || !IsArcGISRestConnectionRootItem(childItem))
+		{
+			continue;
+		}
+
+		ArcGISRestConnectionSettings settings;
+		if (!GetArcGISRestConnectionSettingsForItem(childItem, settings))
+		{
+			continue;
+		}
+
+		settings = NormalizeArcGISRestConnectionSettings(settings);
+		settings.displayName = ToStdString(childItem->data(0, RoleText).toString());
+		if (settings.displayName.empty())
+		{
+			settings.displayName = ToStdString(GuessArcGISRestDisplayName(settings));
+		}
+		if (settings.serviceUrl.empty())
+		{
+			settings.serviceUrl = NormalizeArcGISRestRequestUrl(ToStdString(childItem->data(0, RoleUrl).toString()));
+		}
+
+		settingsList.push_back(std::move(settings));
+	}
+	return settingsList;
+}
+
 void QServiceBrowserPanel::RefreshArcGISRestConnection(QTreeWidgetItem* item)
 {
 	if (!item || !IsArcGISRestConnectionRootItem(item) || item->data(0, RoleIsLoading).toBool())
@@ -2585,6 +2978,12 @@ void QServiceBrowserPanel::EditArcGISRestConnection(QTreeWidgetItem* item)
 	item->setData(0, RoleDetails, CreateDetailTextForArcGISRestNode(connectionNode, false, false));
 
 	SetArcGISRestConnectionSettings(sourceUid, newSettings);
+	if (!SaveArcGISRestServicesToMemoryFile())
+	{
+		ShowArcGISRestServicesMemoryFileError(this,
+			QStringLiteral("保存 ArcGIS REST 服务记忆文件失败。"),
+			GetDefaultArcGISRestServicesMemoryFilePath());
+	}
 	SetItemLoadingState(item, true);
 	SelectNode(sourceUid);
 	ExpandNodeByUid(sourceUid);
@@ -2610,7 +3009,12 @@ void QServiceBrowserPanel::DeleteArcGISRestConnection(QTreeWidgetItem* item)
 		return;
 	}
 
-	RemoveNode(item->data(0, RoleUid).toString());
+	if (RemoveNode(item->data(0, RoleUid).toString()) && !SaveArcGISRestServicesToMemoryFile())
+	{
+		ShowArcGISRestServicesMemoryFileError(this,
+			QStringLiteral("保存 ArcGIS REST 服务记忆文件失败。"),
+			GetDefaultArcGISRestServicesMemoryFilePath());
+	}
 }
 
 void QServiceBrowserPanel::StartArcGISRestConnectionLoad(const QString& sourceUid, const ArcGISRestConnectionSettings& settings,
@@ -2674,6 +3078,12 @@ bool QServiceBrowserPanel::UpdateArcGISRestConnectionDisplayNameOnly(QTreeWidget
 	ArcGISRestConnectionSettings normalizedSettings = NormalizeArcGISRestConnectionSettings(settings);
 	normalizedSettings.displayName = ToStdString(displayName);
 	SetArcGISRestConnectionSettings(uid, normalizedSettings);
+	if (!SaveArcGISRestServicesToMemoryFile())
+	{
+		ShowArcGISRestServicesMemoryFileError(this,
+			QStringLiteral("保存 ArcGIS REST 服务记忆文件失败。"),
+			GetDefaultArcGISRestServicesMemoryFilePath());
+	}
 
 	UpdateDetailsForItem(treeWidget ? treeWidget->currentItem() : nullptr);
 	if (treeWidget && treeWidget->currentItem() == item)

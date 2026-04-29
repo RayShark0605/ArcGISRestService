@@ -88,6 +88,7 @@
       <AdditionalDependencies>ArcGISRestService.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <UseDynamicDebugging>
       </UseDynamicDebugging>
+      <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
     </Link>
     <ClCompile>
       <Optimization>MaxSpeed</Optimization>
@@ -148,6 +149,7 @@
     <ClInclude Include="DataDef.h" />
     <QtMoc Include="QCrsManagerWidget.h" />
     <QtMoc Include="QAddCustomCrsDialog.h" />
+    <ClInclude Include="resource.h" />
     <ClInclude Include="TileImageCache.h" />
     <QtMoc Include="QLayerManagerPanel.h" />
     <QtMoc Include="LayerRefresher.h" />
@@ -157,6 +159,9 @@
   </ItemGroup>
   <ItemGroup>
     <QtRcc Include="Resource.qrc" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="UI.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Condition="Exists('$(QtMsBuild)\qt.targets')">
