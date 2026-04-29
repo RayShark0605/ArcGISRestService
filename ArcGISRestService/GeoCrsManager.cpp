@@ -966,7 +966,7 @@ std::string GeoCrsManager::UserInputToWktUtf8(const std::string& definitionUtf8,
 }
 
 
-std::string GeoCrsManager::WktToEpsgCodeUtf8(const std::string& wktUtf8)
+std::string GeoCrsManager::WktToAuthorityCodeUtf8(const std::string& wktUtf8)
 {
     EnsureInitializedInternal();
 
@@ -982,7 +982,12 @@ std::string GeoCrsManager::WktToEpsgCodeUtf8(const std::string& wktUtf8)
         return "";
     }
 
-    return crs->ToEpsgStringUtf8();
+    return crs->ToAuthorityStringUtf8(true, true, 90);
+}
+
+std::string GeoCrsManager::WktToEpsgCodeUtf8(const std::string& wktUtf8)
+{
+    return WktToAuthorityCodeUtf8(wktUtf8);
 }
 
 std::shared_ptr<const GeoCrs> GeoCrsManager::GetFromEpsgCached(int epsgCode)

@@ -132,6 +132,43 @@ namespace
 		return ParsePositiveInt(authorityCode);
 	}
 
+	static std::string NormalizeAuthorityNameUtf8(const char* authorityName)
+	{
+		if (authorityName == nullptr || authorityName[0] == '\0')
+		{
+			return "";
+		}
+
+		std::string result = GB_Utf8Trim(std::string(authorityName));
+		for (size_t i = 0; i < result.size(); i++)
+		{
+			if (result[i] >= 'a' && result[i] <= 'z')
+			{
+				result[i] = static_cast<char>(result[i] - 'a' + 'A');
+			}
+		}
+		return result;
+	}
+
+	static std::string ExtractRootAuthorityCodeFromSrs(const OGRSpatialReference& srs)
+	{
+		const char* authorityName = srs.GetAuthorityName(nullptr);
+		const char* authorityCode = srs.GetAuthorityCode(nullptr);
+		if (authorityName == nullptr || authorityCode == nullptr || authorityName[0] == '\0' || authorityCode[0] == '\0')
+		{
+			return "";
+		}
+
+		const std::string normalizedAuthorityName = NormalizeAuthorityNameUtf8(authorityName);
+		const std::string trimmedAuthorityCode = GB_Utf8Trim(std::string(authorityCode));
+		if (normalizedAuthorityName.empty() || trimmedAuthorityCode.empty())
+		{
+			return "";
+		}
+
+		return normalizedAuthorityName + ":" + trimmedAuthorityCode;
+	}
+
 	static bool IsFinite(double value)
 	{
 		return std::isfinite(value);
@@ -724,6 +761,62 @@ int GeoCrs::TryGetEpsgCodeNoLock(bool tryAutoIdentify, bool tryFindBestMatch, in
 	}
 
 	return 0;
+}
+
+std::string GeoCrs::ToAuthorityStringUtf8NoLock(bool tryAutoIdentify, bool tryFindBestMatch, int minMatchConfidence) const
+{
+	if (IsEmptyNoLock())
+	{
+		GBLOG_WARNING(GB_STR("【GeoCrs::ToAuthorityStringUtf8】变量为空。"));
+		return "";
+	}
+
+	minMatchConfidence = std::max(0, std::min(100, minMatchConfidence));
+
+	std::string authorityCode = ExtractRootAuthorityCodeFromSrs(*spatialReference);
+	if (!authorityCode.empty())
+	{
+		return authorityCode;
+	}
+
+	if (tryAutoIdentify)
+	{
+		std::unique_ptr<OGRSpatialReference, GeoCrsOgrSrsDeleter> cloned(spatialReference->Clone());
+		if (cloned)
+		{
+			const OGRErr err = cloned->AutoIdentifyEPSG();
+			if (err == OGRERR_NONE)
+			{
+				authorityCode = ExtractRootAuthorityCodeFromSrs(*cloned);
+				if (!authorityCode.empty())
+				{
+					return authorityCode;
+				}
+			}
+		}
+	}
+
+	if (tryFindBestMatch)
+	{
+		static const char* const preferredAuthorities[] = { "EPSG", "ESRI" };
+		for (size_t i = 0; i < sizeof(preferredAuthorities) / sizeof(preferredAuthorities[0]); i++)
+		{
+			OGRSpatialReference* bestMatch = spatialReference->FindBestMatch(minMatchConfidence, preferredAuthorities[i], nullptr);
+			std::unique_ptr<OGRSpatialReference, GeoCrsOgrSrsDeleter> bestMatchHolder(bestMatch);
+			if (!bestMatchHolder)
+			{
+				continue;
+			}
+
+			authorityCode = ExtractRootAuthorityCodeFromSrs(*bestMatchHolder);
+			if (!authorityCode.empty())
+			{
+				return authorityCode;
+			}
+		}
+	}
+
+	return "";
 }
 
 std::string GeoCrs::ExportToWktUtf8NoLock(WktFormat format, bool multiline) const
@@ -1692,6 +1785,12 @@ std::string GeoCrs::ToEpsgStringUtf8() const
 		return "";
 	}
 	return "EPSG:" + std::to_string(epsgCode);
+}
+
+std::string GeoCrs::ToAuthorityStringUtf8(bool tryAutoIdentify, bool tryFindBestMatch, int minMatchConfidence) const
+{
+	std::lock_guard<std::recursive_mutex> lock(mutex);
+	return ToAuthorityStringUtf8NoLock(tryAutoIdentify, tryFindBestMatch, minMatchConfidence);
 }
 
 std::string GeoCrs::ToOgcUrnStringUtf8() const

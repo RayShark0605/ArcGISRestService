@@ -80,6 +80,7 @@ public:
 		std::string bboxTextUtf8 = "";
 		CrsCategory category = CrsCategory::Geographic;
 		bool isCustom = false;
+		bool isTemporary = false;
 		bool isDeprecated = false;
 	};
 
@@ -98,6 +99,7 @@ private:
 
 	std::vector<CrsRecord> systemCrsRecords;
 	std::vector<CrsRecord> customCrsRecords;
+	std::vector<CrsRecord> temporaryCrsRecords;
 	std::vector<CustomCrsDefinition> customDefinitions;
 
 	bool isRefreshingTable = false;
@@ -110,6 +112,9 @@ private:
 	void InitializeConnections();
 	bool LoadSystemCrsRecords();
 	void RebuildCustomCrsRecords();
+	void ClearTemporaryCanvasCrsRecords();
+	bool TryFindExistingCrsByWkt(const std::string& wktUtf8, std::string& outUniqueIdUtf8) const;
+	bool EnsureTemporaryCanvasCrsRecord(const std::string& wktUtf8, std::string& outUniqueIdUtf8);
 	bool LoadCustomCrsDefinitionsFromCache();
 	bool SaveCustomCrsDefinitionsToCache() const;
 	bool EnsureSystemCrsRecordsLoadedForDuplicateCheck();

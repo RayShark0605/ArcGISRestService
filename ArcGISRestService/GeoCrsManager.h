@@ -104,11 +104,16 @@ public:
 	// - allowNetworkAccess / allowFileAccess 的语义与 GeoCrs::CreateFromUserInput 一致。
 	static std::string UserInputToWktUtf8(const std::string& definitionUtf8, bool allowNetworkAccess = true, bool allowFileAccess = true);
 
-	// 输入 UTF-8 编码的 WKT，尝试返回对应的 UTF-8 编码 EPSG Code（例如 "EPSG:4326"）。
+	// 输入 UTF-8 编码的 WKT，尝试返回对应的 UTF-8 编码“权威:代号”字符串。
 	// 说明：
-	//  - 若 WKT 根节点已包含 EPSG 权威码，则直接返回；
-	//  - 否则会尝试使用 GDAL 的 AutoIdentifyEPSG() 做安全的推断（依赖 proj.db）。
+	//  - 若 WKT 根节点已包含权威码，则直接返回，例如 "EPSG:4326"、"ESRI:102100"；
+	//  - 否则会先尝试 AutoIdentifyEPSG()，再按 EPSG、ESRI 的顺序尝试 FindBestMatch()。
 	// 若输入非法或无法推断，则返回空串。
+	static std::string WktToAuthorityCodeUtf8(const std::string& wktUtf8);
+
+	// 历史兼容接口：旧代码可能仍调用本函数来显示 CRS 编码。
+	// 为避免 ESRI 坐标系继续被误判为“自定义坐标系”，本函数会转调 WktToAuthorityCodeUtf8()，
+	// 因此返回值不再严格限定为 EPSG，也可能是 ESRI 等其它权威码。新代码建议直接调用 WktToAuthorityCodeUtf8()。
 	static std::string WktToEpsgCodeUtf8(const std::string& wktUtf8);
 
 	// 按 EPSG code 获取（带缓存）。
@@ -174,9 +179,5 @@ private:
 };
 
 #define GB_ToWkt(str) GeoCrsManager::UserInputToWktUtf8(str, true, true)
-
-#ifdef _MSC_VER
-#  pragma warning(pop)
-#endif
 
 #endif

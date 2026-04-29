@@ -110,6 +110,13 @@ public:
 
     std::string ToEpsgStringUtf8() const;
 
+    // 尝试获取根节点坐标系权威码字符串。
+    // - 优先读取 WKT/对象自身的根节点 AUTHORITY/ID；
+    // - tryAutoIdentify=true 时，会额外尝试 AutoIdentifyEPSG() 补识别 EPSG；
+    // - tryFindBestMatch=true 时，会按 EPSG、ESRI 的顺序尝试 FindBestMatch()。
+    // 返回示例："EPSG:4326"、"ESRI:102100"；失败返回空串。
+    std::string ToAuthorityStringUtf8(bool tryAutoIdentify = true, bool tryFindBestMatch = true, int minMatchConfidence = 90) const;
+
     std::string ToOgcUrnStringUtf8() const;
 
     struct UnitsInfo
@@ -186,6 +193,8 @@ private:
     OGRSpatialReference* EnsureSpatialReferenceNoLock();
 
     int TryGetEpsgCodeNoLock(bool tryAutoIdentify, bool tryFindBestMatch, int minMatchConfidence) const;
+
+    std::string ToAuthorityStringUtf8NoLock(bool tryAutoIdentify, bool tryFindBestMatch, int minMatchConfidence) const;
 
     std::string ExportToWktUtf8NoLock(WktFormat format, bool multiline) const;
 

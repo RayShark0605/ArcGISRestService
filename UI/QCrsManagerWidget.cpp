@@ -79,6 +79,8 @@ namespace
 	constexpr int ColumnEllipsoid = 1;
 	constexpr int ColumnSource = 2;
 	constexpr int ColumnCode = 3;
+	constexpr const char* CanvasTemporaryCrsNameSuffixUtf8 = u8"（画布临时坐标系）";
+	constexpr const char* CanvasTemporaryCrsUniqueIdPrefix = "TEMP_CANVAS:WKT_HASH:";
 	constexpr int ColumnType = 4;
 	constexpr int ColumnCount = 5;
 
@@ -1946,6 +1948,124 @@ void QCrsManagerWidget::RebuildCustomCrsRecords()
 }
 
 
+void QCrsManagerWidget::ClearTemporaryCanvasCrsRecords()
+{
+	temporaryCrsRecords.clear();
+}
+
+bool QCrsManagerWidget::TryFindExistingCrsByWkt(const std::string& wktUtf8, std::string& outUniqueIdUtf8) const
+{
+	outUniqueIdUtf8.clear();
+
+	const std::string trimmedWkt = GB_Utf8Trim(wktUtf8);
+	if (trimmedWkt.empty())
+	{
+		return false;
+	}
+
+	const std::string authorityCode = GeoCrsManager::WktToAuthorityCodeUtf8(trimmedWkt);
+	if (!authorityCode.empty() && FindCrsRecordByUniqueId(authorityCode) != nullptr)
+	{
+		outUniqueIdUtf8 = authorityCode;
+		return true;
+	}
+
+	std::shared_ptr<const GeoCrs> canvasCrs = GeoCrsManager::GetFromWktCached(trimmedWkt);
+	if (!canvasCrs || !canvasCrs->IsValid())
+	{
+		return false;
+	}
+
+	for (const CrsRecord& record : customCrsRecords)
+	{
+		const std::string recordWkt = GB_Utf8Trim(record.wktUtf8);
+		if (recordWkt.empty())
+		{
+			continue;
+		}
+
+		if (recordWkt == trimmedWkt)
+		{
+			outUniqueIdUtf8 = record.uniqueIdUtf8;
+			return true;
+		}
+
+		std::shared_ptr<const GeoCrs> recordCrs = GeoCrsManager::GetFromWktCached(recordWkt);
+		if (recordCrs && recordCrs->IsValid() && *canvasCrs == *recordCrs)
+		{
+			outUniqueIdUtf8 = record.uniqueIdUtf8;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool QCrsManagerWidget::EnsureTemporaryCanvasCrsRecord(const std::string& wktUtf8, std::string& outUniqueIdUtf8)
+{
+	outUniqueIdUtf8.clear();
+
+	const std::string trimmedWkt = GB_Utf8Trim(wktUtf8);
+	if (trimmedWkt.empty())
+	{
+		ClearTemporaryCanvasCrsRecords();
+		return false;
+	}
+
+	std::string existingUniqueIdUtf8;
+	if (TryFindExistingCrsByWkt(trimmedWkt, existingUniqueIdUtf8))
+	{
+		ClearTemporaryCanvasCrsRecords();
+		outUniqueIdUtf8 = existingUniqueIdUtf8;
+		return true;
+	}
+
+	if (!isSystemCrsInitializationFinished)
+	{
+		return false;
+	}
+
+	std::shared_ptr<const GeoCrs> crs = GeoCrsManager::GetFromWktCached(trimmedWkt);
+	if (!crs || !crs->IsValid())
+	{
+		ClearTemporaryCanvasCrsRecords();
+		return false;
+	}
+
+	const std::string canonicalWkt = crs->ExportToWktUtf8(GeoCrs::WktFormat::Wkt2_2018, false);
+	const std::string hashSource = canonicalWkt.empty() ? trimmedWkt : canonicalWkt;
+
+	CrsRecord record;
+	record.isCustom = true;
+	record.isTemporary = true;
+	record.uniqueIdUtf8 = std::string(CanvasTemporaryCrsUniqueIdPrefix) + ToHexString(CalculateFnv1a64(hashSource));
+	record.wktUtf8 = trimmedWkt;
+	record.definitionUtf8 = trimmedWkt;
+	record.nameUtf8 = crs->GetNameUtf8();
+	if (record.nameUtf8.empty())
+	{
+		TryExtractCrsNameFromWktText(trimmedWkt, record.nameUtf8);
+	}
+	if (record.nameUtf8.empty())
+	{
+		record.nameUtf8 = GB_STR("自定义坐标系");
+	}
+	if (!GB_Utf8EndsWith(record.nameUtf8, std::string(CanvasTemporaryCrsNameSuffixUtf8), true))
+	{
+		record.nameUtf8 += std::string(CanvasTemporaryCrsNameSuffixUtf8);
+	}
+
+	record.sourceUtf8 = GB_STR("画布临时");
+	record.codeUtf8.clear();
+	record.ellipsoidUtf8 = crs->GetReferenceEllipsoidNameUtf8();
+	record.category = crs->IsProjected() ? CrsCategory::Projected : CrsCategory::Geographic;
+
+	temporaryCrsRecords.clear();
+	temporaryCrsRecords.push_back(std::move(record));
+	outUniqueIdUtf8 = temporaryCrsRecords.front().uniqueIdUtf8;
+	return true;
+}
+
 bool QCrsManagerWidget::EnsureSystemCrsRecordsLoadedForDuplicateCheck()
 {
 	if (isSystemCrsInitializationFinished && !systemCrsRecords.empty())
@@ -2025,7 +2145,7 @@ void QCrsManagerWidget::RefreshTable(bool preserveSelection)
 	const QString searchText = searchLineEdit->text();
 
 	std::vector<const CrsRecord*> visibleRecords;
-	visibleRecords.reserve(systemCrsRecords.size() + customCrsRecords.size());
+	visibleRecords.reserve(systemCrsRecords.size() + customCrsRecords.size() + temporaryCrsRecords.size());
 
 	const auto AppendVisibleRecord = [this, category, searchText, &visibleRecords](const CrsRecord& record)
 		{
@@ -2040,6 +2160,10 @@ void QCrsManagerWidget::RefreshTable(bool preserveSelection)
 		AppendVisibleRecord(record);
 	}
 	for (const CrsRecord& record : customCrsRecords)
+	{
+		AppendVisibleRecord(record);
+	}
+	for (const CrsRecord& record : temporaryCrsRecords)
 	{
 		AppendVisibleRecord(record);
 	}
@@ -2091,27 +2215,46 @@ void QCrsManagerWidget::SelectCanvasCrsIfAvailable()
 	if (!mainCanvas)
 	{
 		hasSelectedInitialCanvasCrs = true;
+		ClearTemporaryCanvasCrsRecords();
+		RefreshTable(false);
 		ClearTableSelection();
 		return;
 	}
 
 	const std::string& canvasWkt = mainCanvas->GetCrsWkt();
-	if (canvasWkt.empty())
+	if (GB_Utf8Trim(canvasWkt).empty())
 	{
 		hasSelectedInitialCanvasCrs = true;
+		ClearTemporaryCanvasCrsRecords();
+		RefreshTable(false);
 		ClearTableSelection();
 		return;
 	}
 
-	const std::string authorityCode = GeoCrsManager::WktToEpsgCodeUtf8(canvasWkt);
-	if (authorityCode.empty())
+	const size_t oldTemporaryCount = temporaryCrsRecords.size();
+	const std::string oldTemporaryUniqueIdUtf8 = oldTemporaryCount == 1 ? temporaryCrsRecords.front().uniqueIdUtf8 : "";
+
+	std::string targetUniqueIdUtf8;
+	if (!EnsureTemporaryCanvasCrsRecord(canvasWkt, targetUniqueIdUtf8) || targetUniqueIdUtf8.empty())
 	{
-		hasSelectedInitialCanvasCrs = true;
-		ClearTableSelection();
+		if (isSystemCrsInitializationFinished)
+		{
+			hasSelectedInitialCanvasCrs = true;
+			ClearTableSelection();
+		}
 		return;
 	}
 
-	if (SelectCrsByUniqueId(authorityCode))
+	const bool temporaryRecordsChanged = oldTemporaryCount != temporaryCrsRecords.size() ||
+		(oldTemporaryCount == 1 && temporaryCrsRecords.size() == 1 && oldTemporaryUniqueIdUtf8 != temporaryCrsRecords.front().uniqueIdUtf8) ||
+		(oldTemporaryCount == 1 && temporaryCrsRecords.empty()) ||
+		(oldTemporaryCount == 0 && !temporaryCrsRecords.empty());
+	if (temporaryRecordsChanged)
+	{
+		RefreshTable(false);
+	}
+
+	if (SelectCrsByUniqueId(targetUniqueIdUtf8))
 	{
 		hasSelectedInitialCanvasCrs = true;
 		return;
@@ -2148,6 +2291,26 @@ bool QCrsManagerWidget::SelectCrsByUniqueId(const std::string& uniqueIdUtf8)
 		ScheduleScrollSelectedCrsToCenterIfAvailable();
 		UpdateDetailsAndButtons();
 		return true;
+	}
+
+	if (FindCrsRecordByUniqueId(uniqueIdUtf8) != nullptr && categoryComboBox != nullptr && searchLineEdit != nullptr)
+	{
+		{
+			QSignalBlocker categoryBlocker(categoryComboBox);
+			QSignalBlocker searchBlocker(searchLineEdit);
+			categoryComboBox->setCurrentIndex(0);
+			searchLineEdit->clear();
+		}
+
+		RefreshTable(false);
+		if (SelectVisibleCrsRowByUniqueId(uniqueIdUtf8, &targetRow))
+		{
+			pendingCenteredCrsUniqueIdUtf8 = uniqueIdUtf8;
+			ScrollCrsRowToCenter(targetRow);
+			ScheduleScrollSelectedCrsToCenterIfAvailable();
+			UpdateDetailsAndButtons();
+			return true;
+		}
 	}
 
 	pendingCenteredCrsUniqueIdUtf8.clear();
@@ -2357,7 +2520,7 @@ bool QCrsManagerWidget::CanDeleteSelectedCrs() const
 
 	for (const CrsRecord* record : selectedRecords)
 	{
-		if (record == nullptr || !record->isCustom)
+		if (record == nullptr || !record->isCustom || record->isTemporary)
 		{
 			return false;
 		}
@@ -2376,7 +2539,7 @@ void QCrsManagerWidget::OnDeleteSelectedCrsClicked()
 
 	for (const CrsRecord* record : selectedRecords)
 	{
-		if (record == nullptr || !record->isCustom)
+		if (record == nullptr || !record->isCustom || record->isTemporary)
 		{
 			return;
 		}
@@ -2568,6 +2731,14 @@ void QCrsManagerWidget::ShowTableContextMenu(const QPoint& pos)
 	{
 		return;
 	}
+	for (const CrsRecord* record : selectedRecords)
+	{
+		if (record == nullptr || record->isTemporary)
+		{
+			return;
+		}
+	}
+
 
 	QMenu menu(this);
 	QAction* applyAction = menu.addAction(style()->standardIcon(QStyle::SP_DialogApplyButton), FromUtf8Literal(u8"应用到画布"));
@@ -2648,6 +2819,14 @@ const QCrsManagerWidget::CrsRecord* QCrsManagerWidget::FindCrsRecordByUniqueId(c
 			return &record;
 		}
 	}
+	for (const CrsRecord& record : temporaryCrsRecords)
+	{
+		if (IsSameAuthorityCode(record.uniqueIdUtf8, uniqueIdUtf8))
+		{
+			return &record;
+		}
+	}
+
 
 	return nullptr;
 }
@@ -2696,6 +2875,10 @@ QString QCrsManagerWidget::BuildDetailHtml(const CrsRecord& record) const
 		html += BuildDetailRowHtmlUtf8(QStringLiteral("经纬度范围"), record.bboxTextUtf8);
 	}
 
+	if (record.isTemporary)
+	{
+		html += BuildDetailRowHtml(QStringLiteral("画布临时坐标系"), QStringLiteral("是"));
+	}
 	html += BuildDetailRowHtml(QStringLiteral("是否废弃"), record.isDeprecated ? QStringLiteral("是") : QStringLiteral("否"));
 	html += BuildDetailRowHtmlUtf8(QStringLiteral("唯一标识"), record.uniqueIdUtf8);
 
