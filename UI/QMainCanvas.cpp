@@ -567,34 +567,12 @@ bool QMainCanvas::TryGetCrsValidAreaPolygonsExtent(GB_Rectangle& outExtent) cons
 {
 	outExtent.Reset();
 
-	if (!EnsureCrsValidAreaPolygonsCache() || crsValidAreaPolygonsCache.empty())
+	if (TryGetCachedCrsValidAreaPolygonsExtent(outExtent))
 	{
-		return TryGetCrsValidArea(outExtent);
+		return true;
 	}
 
-	for (const std::vector<GB_Point2d>& polygon : crsValidAreaPolygonsCache)
-	{
-		if (polygon.size() < 3)
-		{
-			continue;
-		}
-
-		for (const GB_Point2d& point : polygon)
-		{
-			if (IsPointFinite(point))
-			{
-				outExtent.Expand(point);
-			}
-		}
-	}
-
-	if (!outExtent.IsValid())
-	{
-		return TryGetCrsValidArea(outExtent);
-	}
-
-	outExtent.Normalize();
-	return outExtent.IsValid();
+	return TryGetCrsValidArea(outExtent);
 }
 
 bool QMainCanvas::ZoomToCrsValidArea(double marginRatio)
@@ -611,38 +589,75 @@ bool QMainCanvas::ZoomToCrsValidArea(double marginRatio)
 
 void QMainCanvas::ZoomFull()
 {
-	GB_Rectangle crsValidArea;
-	const bool shouldClipToCrsValidArea = clipMapTilesToCrsValidArea && TryGetCrsValidArea(crsValidArea);
-
 	GB_Rectangle allExtent;
 	allExtent.Reset();
-	if (shouldClipToCrsValidArea)
+
+	bool hasAppliedCrsClipForZoom = false;
+	if (clipMapTilesToCrsValidArea)
 	{
-		for (const CachedMapTile& item : mapTiles)
+		GB_Rectangle crsValidAreaPolygonsExtent;
+		const bool hasCrsValidAreaPolygons = TryGetCachedCrsValidAreaPolygonsExtent(crsValidAreaPolygonsExtent);
+		if (hasCrsValidAreaPolygons)
 		{
-			if (!item.tile.visible || !item.tile.extent.IsValid())
+			hasAppliedCrsClipForZoom = true;
+			for (const CachedMapTile& item : mapTiles)
 			{
-				continue;
+				if (!item.tile.visible || !item.tile.extent.IsValid())
+				{
+					continue;
+				}
+
+				GB_Rectangle clippedTileExtent;
+				if (TryIntersectRectangleWithCrsValidAreaPolygons(item.tile.extent, clippedTileExtent))
+				{
+					allExtent.Expand(clippedTileExtent);
+				}
 			}
 
-			const GB_Rectangle clippedTileExtent = item.tile.extent.Intersected(crsValidArea);
-			if (clippedTileExtent.IsValid())
+			if (!allExtent.IsValid())
 			{
-				allExtent.Expand(clippedTileExtent);
+				allExtent = crsValidAreaPolygonsExtent;
 			}
 		}
-
-		if (!allExtent.IsValid())
+		else
 		{
-			allExtent = crsValidArea;
+			GB_Rectangle crsValidArea;
+			const bool hasCrsValidArea = TryGetCrsValidArea(crsValidArea);
+			if (hasCrsValidArea)
+			{
+				hasAppliedCrsClipForZoom = true;
+				for (const CachedMapTile& item : mapTiles)
+				{
+					if (!item.tile.visible || !item.tile.extent.IsValid())
+					{
+						continue;
+					}
+
+					const GB_Rectangle clippedTileExtent = item.tile.extent.Intersected(crsValidArea);
+					if (clippedTileExtent.IsValid())
+					{
+						allExtent.Expand(clippedTileExtent);
+					}
+				}
+
+				if (!allExtent.IsValid())
+				{
+					allExtent = crsValidArea;
+				}
+			}
 		}
 	}
-	else
+
+	if (!hasAppliedCrsClipForZoom)
 	{
 		allExtent = CalculateAllDrawableExtent();
-		if (!allExtent.IsValid() && TryGetCrsValidArea(crsValidArea))
+		if (!allExtent.IsValid())
 		{
-			allExtent = crsValidArea;
+			GB_Rectangle crsValidAreaPolygonsExtent;
+			if (TryGetCrsValidAreaPolygonsExtent(crsValidAreaPolygonsExtent))
+			{
+				allExtent = crsValidAreaPolygonsExtent;
+			}
 		}
 	}
 
@@ -1351,6 +1366,215 @@ bool QMainCanvas::TryGetCrsValidArea(GB_Rectangle& outValidArea) const
 	return outValidArea.IsValid();
 }
 
+bool QMainCanvas::TryGetCachedCrsValidAreaPolygonsExtent(GB_Rectangle& outExtent) const
+{
+	outExtent.Reset();
+
+	if (!EnsureCrsValidAreaPolygonsCache() || crsValidAreaPolygonsCache.empty())
+	{
+		return false;
+	}
+
+	const bool canUseCachedExtents = crsValidAreaPolygonExtentsCache.size() == crsValidAreaPolygonsCache.size();
+	if (canUseCachedExtents)
+	{
+		for (const GB_Rectangle& polygonExtent : crsValidAreaPolygonExtentsCache)
+		{
+			if (polygonExtent.IsValid())
+			{
+				outExtent.Expand(polygonExtent);
+			}
+		}
+	}
+	else
+	{
+		for (const std::vector<GB_Point2d>& polygon : crsValidAreaPolygonsCache)
+		{
+			for (const GB_Point2d& point : polygon)
+			{
+				if (IsPointFinite(point))
+				{
+					outExtent.Expand(point);
+				}
+			}
+		}
+	}
+
+	if (!outExtent.IsValid())
+	{
+		return false;
+	}
+
+	outExtent.Normalize();
+	return outExtent.IsValid();
+}
+
+bool QMainCanvas::TryBuildCrsValidAreaScreenPath(QPainterPath& outPath, GB_Rectangle& outWorldExtent) const
+{
+	outPath = QPainterPath();
+	outPath.setFillRule(Qt::WindingFill);
+	outWorldExtent.Reset();
+
+	if (!viewExtent.IsValid() || !IsFinitePositive(pixelSize))
+	{
+		return false;
+	}
+
+	if (!EnsureCrsValidAreaPolygonsCache() || crsValidAreaPolygonsCache.empty())
+	{
+		return false;
+	}
+
+	const bool canUseCachedExtents = crsValidAreaPolygonExtentsCache.size() == crsValidAreaPolygonsCache.size();
+	for (size_t polygonIndex = 0; polygonIndex < crsValidAreaPolygonsCache.size(); polygonIndex++)
+	{
+		const std::vector<GB_Point2d>& polygon = crsValidAreaPolygonsCache[polygonIndex];
+		if (polygon.size() < 3)
+		{
+			continue;
+		}
+
+		if (canUseCachedExtents)
+		{
+			const GB_Rectangle& polygonExtent = crsValidAreaPolygonExtentsCache[polygonIndex];
+			if (!polygonExtent.IsValid() || !polygonExtent.IsIntersects(viewExtent))
+			{
+				continue;
+			}
+		}
+
+		const std::vector<GB_Point2d> clippedPolygon = ClipPolygonToRectangle(polygon, viewExtent);
+		if (clippedPolygon.size() < 3)
+		{
+			continue;
+		}
+
+		QPolygonF screenPolygon;
+		screenPolygon.reserve(static_cast<int>(clippedPolygon.size()));
+		GB_Rectangle clippedPolygonExtent;
+		clippedPolygonExtent.Reset();
+		for (const GB_Point2d& point : clippedPolygon)
+		{
+			const GB_Point2d screenPoint = WorldToScreen(point);
+			if (!IsPointFinite(screenPoint))
+			{
+				screenPolygon.clear();
+				clippedPolygonExtent.Reset();
+				break;
+			}
+
+			screenPolygon << QPointF(screenPoint.x, screenPoint.y);
+			clippedPolygonExtent.Expand(point);
+		}
+
+		if (screenPolygon.size() >= 3 && clippedPolygonExtent.IsValid())
+		{
+			outPath.addPolygon(screenPolygon);
+			outPath.closeSubpath();
+			outWorldExtent.Expand(clippedPolygonExtent);
+		}
+	}
+
+	return !outPath.isEmpty() && outWorldExtent.IsValid();
+}
+
+bool QMainCanvas::TryIntersectRectangleWithCrsValidAreaPolygons(const GB_Rectangle& rect, GB_Rectangle& outIntersectionExtent) const
+{
+	outIntersectionExtent.Reset();
+
+	if (!rect.IsValid() || rect.Width() <= 0.0 || rect.Height() <= 0.0)
+	{
+		return false;
+	}
+
+	if (!EnsureCrsValidAreaPolygonsCache() || crsValidAreaPolygonsCache.empty())
+	{
+		return false;
+	}
+
+	const bool canUseCachedExtents = crsValidAreaPolygonExtentsCache.size() == crsValidAreaPolygonsCache.size();
+	for (size_t polygonIndex = 0; polygonIndex < crsValidAreaPolygonsCache.size(); polygonIndex++)
+	{
+		if (canUseCachedExtents)
+		{
+			const GB_Rectangle& polygonExtent = crsValidAreaPolygonExtentsCache[polygonIndex];
+			if (!polygonExtent.IsValid() || !polygonExtent.IsIntersects(rect))
+			{
+				continue;
+			}
+		}
+
+		const std::vector<GB_Point2d> clippedPolygon = ClipPolygonToRectangle(crsValidAreaPolygonsCache[polygonIndex], rect);
+		if (clippedPolygon.size() < 3)
+		{
+			continue;
+		}
+
+		for (const GB_Point2d& point : clippedPolygon)
+		{
+			if (IsPointFinite(point))
+			{
+				outIntersectionExtent.Expand(point);
+			}
+		}
+	}
+
+	if (!outIntersectionExtent.IsValid())
+	{
+		return false;
+	}
+
+	outIntersectionExtent.Normalize();
+	return outIntersectionExtent.IsValid();
+}
+
+bool QMainCanvas::IsRectangleIntersectsCachedCrsValidAreaPolygonExtent(const GB_Rectangle& rect) const
+{
+	if (!rect.IsValid())
+	{
+		return false;
+	}
+
+	if (!EnsureCrsValidAreaPolygonsCache() || crsValidAreaPolygonsCache.empty())
+	{
+		return false;
+	}
+
+	const bool canUseCachedExtents = crsValidAreaPolygonExtentsCache.size() == crsValidAreaPolygonsCache.size();
+	if (canUseCachedExtents)
+	{
+		for (const GB_Rectangle& polygonExtent : crsValidAreaPolygonExtentsCache)
+		{
+			if (polygonExtent.IsValid() && polygonExtent.IsIntersects(rect))
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	for (const std::vector<GB_Point2d>& polygon : crsValidAreaPolygonsCache)
+	{
+		GB_Rectangle polygonExtent;
+		polygonExtent.Reset();
+		for (const GB_Point2d& point : polygon)
+		{
+			if (IsPointFinite(point))
+			{
+				polygonExtent.Expand(point);
+			}
+		}
+
+		if (polygonExtent.IsValid() && polygonExtent.IsIntersects(rect))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
 void QMainCanvas::DrawMapTiles(QPainter& painter, const QRectF& exposedRect) const
 {
 	if (!viewExtent.IsValid())
@@ -1358,9 +1582,39 @@ void QMainCanvas::DrawMapTiles(QPainter& painter, const QRectF& exposedRect) con
 		return;
 	}
 
-	GB_Rectangle crsValidArea;
-	const bool shouldClipToCrsValidArea = clipMapTilesToCrsValidArea && TryGetCrsValidArea(crsValidArea);
+	GB_Rectangle crsClipWorldExtent;
+	QPainterPath crsClipPath;
+	bool hasPreciseCrsClip = false;
+	bool hasRectangularCrsClip = false;
+
+	if (clipMapTilesToCrsValidArea)
+	{
+		if (EnsureCrsValidAreaPolygonsCache() && !crsValidAreaPolygonsCache.empty())
+		{
+			hasPreciseCrsClip = TryBuildCrsValidAreaScreenPath(crsClipPath, crsClipWorldExtent);
+			if (!hasPreciseCrsClip)
+			{
+				return;
+			}
+		}
+		else if (TryGetCrsValidArea(crsClipWorldExtent))
+		{
+			crsClipWorldExtent = crsClipWorldExtent.Intersected(viewExtent);
+			hasRectangularCrsClip = crsClipWorldExtent.IsValid() && crsClipWorldExtent.Width() > 0.0 && crsClipWorldExtent.Height() > 0.0;
+			if (!hasRectangularCrsClip)
+			{
+				return;
+			}
+		}
+	}
+
 	const QRectF safeExposedRect = exposedRect.isValid() ? exposedRect : QRectF(rect());
+
+	if (hasPreciseCrsClip)
+	{
+		painter.save();
+		painter.setClipPath(crsClipPath, Qt::IntersectClip);
+	}
 
 	bool lastSmoothPixmapTransform = false;
 	painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
@@ -1378,9 +1632,22 @@ void QMainCanvas::DrawMapTiles(QPainter& painter, const QRectF& exposedRect) con
 			continue;
 		}
 
-		if (shouldClipToCrsValidArea)
+		if (hasPreciseCrsClip)
 		{
-			clippedWorldRect = clippedWorldRect.Intersected(crsValidArea);
+			if (!IsRectangleIntersectsCachedCrsValidAreaPolygonExtent(clippedWorldRect))
+			{
+				continue;
+			}
+
+			clippedWorldRect = clippedWorldRect.Intersected(crsClipWorldExtent);
+			if (!clippedWorldRect.IsValid() || clippedWorldRect.Width() <= 0.0 || clippedWorldRect.Height() <= 0.0)
+			{
+				continue;
+			}
+		}
+		else if (hasRectangularCrsClip)
+		{
+			clippedWorldRect = clippedWorldRect.Intersected(crsClipWorldExtent);
 			if (!clippedWorldRect.IsValid() || clippedWorldRect.Width() <= 0.0 || clippedWorldRect.Height() <= 0.0)
 			{
 				continue;
@@ -1431,6 +1698,11 @@ void QMainCanvas::DrawMapTiles(QPainter& painter, const QRectF& exposedRect) con
 	if (lastSmoothPixmapTransform)
 	{
 		painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
+	}
+
+	if (hasPreciseCrsClip)
+	{
+		painter.restore();
 	}
 }
 
@@ -1526,66 +1798,9 @@ void QMainCanvas::DrawCrsValidArea(QPainter& painter) const
 		return;
 	}
 
-	if (!EnsureCrsValidAreaPolygonsCache() || crsValidAreaPolygonsCache.empty())
-	{
-		return;
-	}
-
 	QPainterPath fillPath;
-	for (const std::vector<GB_Point2d>& polygon : crsValidAreaPolygonsCache)
-	{
-		if (polygon.size() < 3)
-		{
-			continue;
-		}
-
-		GB_Rectangle polygonExtent;
-		polygonExtent.Reset();
-		bool hasInvalidPoint = false;
-		for (const GB_Point2d& point : polygon)
-		{
-			if (!IsPointFinite(point))
-			{
-				hasInvalidPoint = true;
-				break;
-			}
-
-			polygonExtent.Expand(point);
-		}
-
-		if (hasInvalidPoint || !polygonExtent.IsValid() || !polygonExtent.IsIntersects(viewExtent))
-		{
-			continue;
-		}
-
-		const std::vector<GB_Point2d> clippedPolygon = ClipPolygonToRectangle(polygon, viewExtent);
-		if (clippedPolygon.size() < 3)
-		{
-			continue;
-		}
-
-		QPolygonF screenPolygon;
-		screenPolygon.reserve(static_cast<int>(clippedPolygon.size()));
-		for (const GB_Point2d& point : clippedPolygon)
-		{
-			const GB_Point2d screenPoint = WorldToScreen(point);
-			if (!IsPointFinite(screenPoint))
-			{
-				screenPolygon.clear();
-				break;
-			}
-
-			screenPolygon << QPointF(screenPoint.x, screenPoint.y);
-		}
-
-		if (screenPolygon.size() >= 3)
-		{
-			fillPath.addPolygon(screenPolygon);
-			fillPath.closeSubpath();
-		}
-	}
-
-	if (fillPath.isEmpty())
+	GB_Rectangle fillWorldExtent;
+	if (!TryBuildCrsValidAreaScreenPath(fillPath, fillWorldExtent))
 	{
 		return;
 	}
@@ -1796,6 +2011,7 @@ bool QMainCanvas::EnsureCrsValidAreaPolygonsCache() const
 	}
 
 	crsValidAreaPolygonsCache.clear();
+	crsValidAreaPolygonExtentsCache.clear();
 	crsValidAreaPolygonsCacheCrsWkt = crsWkt;
 	crsValidAreaPolygonsCacheDirty = false;
 
@@ -1812,6 +2028,7 @@ bool QMainCanvas::EnsureCrsValidAreaPolygonsCache() const
 
 	const std::vector<std::vector<GB_Point2d>> polygons = crs->GetValidAreaPolygons(CrsValidAreaPolygonEdgeSampleCount);
 	crsValidAreaPolygonsCache.reserve(polygons.size());
+	crsValidAreaPolygonExtentsCache.reserve(polygons.size());
 	for (const std::vector<GB_Point2d>& polygon : polygons)
 	{
 		if (polygon.size() < 3)
@@ -1821,6 +2038,8 @@ bool QMainCanvas::EnsureCrsValidAreaPolygonsCache() const
 
 		std::vector<GB_Point2d> filteredPolygon;
 		filteredPolygon.reserve(polygon.size());
+		GB_Rectangle filteredPolygonExtent;
+		filteredPolygonExtent.Reset();
 		bool hasInvalidPoint = false;
 		for (const GB_Point2d& point : polygon)
 		{
@@ -1845,7 +2064,16 @@ bool QMainCanvas::EnsureCrsValidAreaPolygonsCache() const
 
 		if (filteredPolygon.size() >= 3)
 		{
-			crsValidAreaPolygonsCache.push_back(std::move(filteredPolygon));
+			for (const GB_Point2d& point : filteredPolygon)
+			{
+				filteredPolygonExtent.Expand(point);
+			}
+
+			if (filteredPolygonExtent.IsValid())
+			{
+				crsValidAreaPolygonExtentsCache.push_back(filteredPolygonExtent);
+				crsValidAreaPolygonsCache.push_back(std::move(filteredPolygon));
+			}
 		}
 	}
 
@@ -1857,6 +2085,7 @@ void QMainCanvas::InvalidateCrsValidAreaPolygonsCache() const
 	crsValidAreaPolygonsCacheDirty = true;
 	crsValidAreaPolygonsCacheCrsWkt.clear();
 	crsValidAreaPolygonsCache.clear();
+	crsValidAreaPolygonExtentsCache.clear();
 }
 
 bool QMainCanvas::IsDrawableUidInSet(const std::vector<std::string>& drawablesUids, const std::string& uid) const

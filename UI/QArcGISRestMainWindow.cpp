@@ -271,6 +271,7 @@ void QArcGISRestMainWindow::InitializeUi()
 
 	mainCanvas = new QMainCanvas(this);
 	mainCanvas->setObjectName(QStringLiteral("mainCanvas"));
+	mainCanvas->SetClipMapTilesToCrsValidArea(true);
 	setCentralWidget(mainCanvas);
 
 	serviceBrowserPanel = new QServiceBrowserPanel(this);

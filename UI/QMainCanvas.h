@@ -26,6 +26,7 @@ class QEvent;
 class QMouseEvent;
 class QPaintEvent;
 class QPainter;
+class QPainterPath;
 class QResizeEvent;
 class QWheelEvent;
 
@@ -121,6 +122,7 @@ private:
 	GB_ColorRGBA crsValidAreaColor = GB_ColorRGBA(255, 0, 0, 80);
 
 	mutable std::vector<std::vector<GB_Point2d>> crsValidAreaPolygonsCache;
+	mutable std::vector<GB_Rectangle> crsValidAreaPolygonExtentsCache;
 	mutable bool crsValidAreaPolygonsCacheDirty = true;
 	mutable std::string crsValidAreaPolygonsCacheCrsWkt;
 
@@ -171,6 +173,10 @@ private:
 	//void DrawExtentMarkers(QPainter& painter) const;
 	void UpdateCrsDisplayText();
 	bool TryGetCrsValidArea(GB_Rectangle& outValidArea) const;
+	bool TryGetCachedCrsValidAreaPolygonsExtent(GB_Rectangle& outExtent) const;
+	bool TryBuildCrsValidAreaScreenPath(QPainterPath& outPath, GB_Rectangle& outWorldExtent) const;
+	bool TryIntersectRectangleWithCrsValidAreaPolygons(const GB_Rectangle& rect, GB_Rectangle& outIntersectionExtent) const;
+	bool IsRectangleIntersectsCachedCrsValidAreaPolygonExtent(const GB_Rectangle& rect) const;
 	bool EnsureCrsValidAreaPolygonsCache() const;
 	void InvalidateCrsValidAreaPolygonsCache() const;
 
