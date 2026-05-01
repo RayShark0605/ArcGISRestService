@@ -83,6 +83,9 @@ public:
 
     bool IsLocal() const;
 
+    // 当前是否使用传统 GIS 坐标轴顺序。
+    bool IsTraditionalGisAxisOrderEnabled() const;
+
     // 设置坐标轴顺序：
     //  - enable=true：传统 GIS 顺序 (X=经度/Easting, Y=纬度/Northing)
     //  - enable=false：遵循 CRS 权威机构定义的轴顺序（GDAL 3.0+ 默认行为）
@@ -171,6 +174,12 @@ public:
     // 更安全的只读访问：返回内部对象的引用。
     const OGRSpatialReference& GetConstRef() const;
 
+    // 克隆一份 OGRSpatialReference。
+    // - 返回对象由 GeoCrsOgrSrsDeleter 负责释放；
+    // - 克隆会保留当前 GeoCrs 的轴顺序策略；
+    // - 适合需要跨锁、跨线程或长期持有 OGRSpatialReference 的内部调用方使用。
+    std::unique_ptr<OGRSpatialReference, GeoCrsOgrSrsDeleter> CloneOgrSpatialReference() const;
+
     // 注意：返回的引用为内部对象，修改会直接影响 GeoCrs。
     // 本类对 const 接口提供内部互斥保护，允许并发只读；但通过 GetRef()/Get() 取得的可写引用/指针
     // 不提供跨线程安全保证，且不应在多个线程中长期持有并同时读写。
@@ -189,6 +198,8 @@ private:
     bool IsEmptyNoLock() const;
 
     bool IsValidNoLock() const;
+
+    bool IsAxisOrderReversedByAuthorityNoLock() const;
 
     OGRSpatialReference* EnsureSpatialReferenceNoLock();
 
@@ -216,7 +227,11 @@ private:
     // 互斥：保护 spatialReference 与所有缓存字段，使 const 接口在并发读场景下安全。
     mutable std::recursive_mutex mutex;
 
-    // ---- 缓存：避免重复进行 AutoIdentifyEPSG / FindBestMatch 等可能较重的逻辑 ----
+    // ---- 缓存：避免重复进行 Validate / AutoIdentifyEPSG / FindBestMatch 等可能较重的逻辑 ----
+    // IsValid() 的结果缓存
+    mutable bool hasCachedIsValid = false;
+    mutable bool cachedIsValid = false;
+
     // 默认参数（tryAutoIdentify=true, tryFindBestMatch=false, minMatchConfidence=90）下的 EPSG 结果缓存
     mutable bool hasCachedDefaultEpsgCode = false;
     mutable int cachedDefaultEpsgCode = 0; // 0 表示未能得到 EPSG code 或者为空

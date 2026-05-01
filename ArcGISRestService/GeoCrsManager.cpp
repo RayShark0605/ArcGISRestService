@@ -5,8 +5,11 @@
 #include "GeoBase/GB_ReadWriteLock.h"
 #include "GeoBase/GB_Utf8String.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cctype>
+#include <cstdlib>
 #include <deque>
 #include <limits>
 #include <string>
@@ -643,15 +646,15 @@ namespace
             return false;
         }
 
-        const OGRSpatialReference* srsPtr = crs.GetConst();
-        if (srsPtr == nullptr)
+        std::unique_ptr<OGRSpatialReference, GeoCrsOgrSrsDeleter> srs = crs.CloneOgrSpatialReference();
+        if (!srs)
         {
             return false;
         }
 
         // 注意：OSREPSGTreatsAsLatLong/OSREPSGTreatsAsNorthingEasting 判断的是“权威/规范轴序”是否为 Y/X。
         // 这与 srs 当前的 axis mapping strategy（例如传统 GIS 顺序）无关。
-        const OGRSpatialReferenceH srsHandle = reinterpret_cast<OGRSpatialReferenceH>(const_cast<OGRSpatialReference*>(srsPtr));
+        const OGRSpatialReferenceH srsHandle = reinterpret_cast<OGRSpatialReferenceH>(srs.get());
         if (srsHandle == nullptr)
         {
             return false;
@@ -703,7 +706,8 @@ namespace
             codePart = GB_Utf8Trim(trimmed.substr(colonPos + 1));
         }
         // 2) urn:ogc:def:crs:EPSG::xxxx (或带版本号)
-        else if (StartsWithIgnoreCaseAscii(trimmed, "urn:ogc:def:crs:epsg:"))
+        else if (StartsWithIgnoreCaseAscii(trimmed, "urn:ogc:def:crs:epsg:") ||
+            StartsWithIgnoreCaseAscii(trimmed, "urn:x-ogc:def:crs:epsg:"))
         {
             const size_t lastColon = trimmed.find_last_of(':');
             if (lastColon == std::string::npos)
@@ -1033,6 +1037,17 @@ std::shared_ptr<const GeoCrs> GeoCrsManager::GetFromDefinitionCached(const std::
     {
         GBLOG_WARNING(GB_STR("【GeoCrsManager::GetFromDefinitionCached】definition 为空。"));
         return GetEmptyCrsShared();
+    }
+
+    if (LooksLikeWktUtf8(trimmed))
+    {
+        return GetFromWktCached(trimmed);
+    }
+
+    const int epsgCode = ParseEpsgCodeFromStringUtf8(trimmed);
+    if (epsgCode > 0)
+    {
+        return GetFromEpsgCached(epsgCode);
     }
 
     const DefinitionKey key{ trimmed, allowNetworkAccess, allowFileAccess };
@@ -1446,32 +1461,16 @@ bool GeoCrsManager::TryGetValidAreasCached(const std::string& wktUtf8, GeoBoundi
         }
     }
 
-    // 复用 CRS 缓存（优先），避免重复解析。
+    // 复用 CRS 缓存（优先），避免重复解析。虽然接口名保留 wktUtf8，
+    // 但这里也兼容 "EPSG:xxxx" / "ESRI:xxxx" 等用户输入定义。
     std::shared_ptr<const GeoCrs> crs;
+    if (LooksLikeWktUtf8(trimmed))
     {
-        GB_ReadLockGuard readGuard(g_wktCacheLock);
-        const auto it = g_wktCache.find(trimmed);
-        if (it != g_wktCache.end())
-        {
-            crs = it->second;
-        }
+        crs = GetFromWktCached(trimmed);
     }
-
-    if (!crs)
+    else
     {
-        const std::shared_ptr<const GeoCrs> created = std::make_shared<GeoCrs>(GeoCrs::CreateFromWkt(trimmed));
-
-        GB_WriteLockGuard writeGuard(g_wktCacheLock);
-        const auto it = g_wktCache.find(trimmed);
-        if (it != g_wktCache.end())
-        {
-            crs = it->second;
-        }
-        else
-        {
-            crs = created;
-            g_wktCache.emplace(trimmed, crs);
-        }
+        crs = GetFromDefinitionCached(trimmed, true, true);
     }
 
     ValidAreas areas;

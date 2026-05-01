@@ -6,6 +6,8 @@
 #include "GeoBase/GB_Utf8String.h"
 
 #include "cpl_conv.h"
+#include "cpl_error.h"
+#include "gdal_version.h"
 #include "ogr_spatialref.h"
 #include "ogr_srs_api.h"
 
@@ -209,7 +211,67 @@ namespace
 		return value <= -999.5;
 	}
 
+	static std::string SafeCString(const char* text)
+	{
+		return text ? std::string(text) : std::string();
+	}
 
+	static bool IsValidAreaOfUseValues(double west, double south, double east, double north)
+	{
+		if (!IsFinite(west) || !IsFinite(south) || !IsFinite(east) || !IsFinite(north))
+		{
+			return false;
+		}
+
+		return !IsUnknownAreaOfUseValue(west) &&
+			!IsUnknownAreaOfUseValue(south) &&
+			!IsUnknownAreaOfUseValue(east) &&
+			!IsUnknownAreaOfUseValue(north);
+	}
+
+	static bool TryGetAreaOfUseFromSrs(const OGRSpatialReference& srs, double& west, double& south, double& east, double& north)
+	{
+		const char* areaName = nullptr;
+		if (srs.GetAreaOfUse(&west, &south, &east, &north, &areaName) && IsValidAreaOfUseValues(west, south, east, north))
+		{
+			return true;
+		}
+
+		// 某些 WKT 片段自身不带 AREA / BBOX，但可以通过 EPSG/ESRI 匹配找回 area of use。
+		std::unique_ptr<OGRSpatialReference, GeoCrsOgrSrsDeleter> cloned(srs.Clone());
+		if (cloned)
+		{
+			CPLPushErrorHandler(CPLQuietErrorHandler);
+			const OGRErr err = cloned->AutoIdentifyEPSG();
+			CPLPopErrorHandler();
+
+			if (err == OGRERR_NONE && cloned->GetAreaOfUse(&west, &south, &east, &north, &areaName) && IsValidAreaOfUseValues(west, south, east, north))
+			{
+				return true;
+			}
+		}
+
+		static const char* const preferredAuthorities[] = { "EPSG", "ESRI" };
+		for (size_t i = 0; i < sizeof(preferredAuthorities) / sizeof(preferredAuthorities[0]); i++)
+		{
+			CPLPushErrorHandler(CPLQuietErrorHandler);
+			OGRSpatialReference* bestMatchRaw = srs.FindBestMatch(70, preferredAuthorities[i], nullptr);
+			CPLPopErrorHandler();
+
+			std::unique_ptr<OGRSpatialReference, GeoCrsOgrSrsDeleter> bestMatch(bestMatchRaw);
+			if (!bestMatch)
+			{
+				continue;
+			}
+
+			if (bestMatch->GetAreaOfUse(&west, &south, &east, &north, &areaName) && IsValidAreaOfUseValues(west, south, east, north))
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
 
 	static double ClampDouble(double value, double minValue, double maxValue)
 	{
@@ -623,6 +685,9 @@ GeoCrs::GeoCrs(GeoCrs&& other) noexcept : spatialReference(nullptr)
 
 void GeoCrs::InvalidateCachesNoLock() const
 {
+	hasCachedIsValid = false;
+	cachedIsValid = false;
+
 	hasCachedDefaultEpsgCode = false;
 	cachedDefaultEpsgCode = 0;
 
@@ -653,10 +718,36 @@ bool GeoCrs::IsValidNoLock() const
 {
 	if (IsEmptyNoLock())
 	{
+		hasCachedIsValid = true;
+		cachedIsValid = false;
 		return false;
 	}
 
-	return spatialReference->Validate() == OGRERR_NONE;
+	if (hasCachedIsValid)
+	{
+		return cachedIsValid;
+	}
+
+	const bool valid = (spatialReference->Validate() == OGRERR_NONE);
+	cachedIsValid = valid;
+	hasCachedIsValid = true;
+	return valid;
+}
+
+bool GeoCrs::IsAxisOrderReversedByAuthorityNoLock() const
+{
+	if (IsEmptyNoLock())
+	{
+		return false;
+	}
+
+	const OGRSpatialReferenceH srsHandle = reinterpret_cast<OGRSpatialReferenceH>(const_cast<OGRSpatialReference*>(spatialReference.get()));
+	if (srsHandle == nullptr)
+	{
+		return false;
+	}
+
+	return OSREPSGTreatsAsLatLong(srsHandle) != 0 || OSREPSGTreatsAsNorthingEasting(srsHandle) != 0;
 }
 
 OGRSpatialReference* GeoCrs::EnsureSpatialReferenceNoLock()
@@ -879,18 +970,10 @@ std::vector<GeoCrs::LonLatAreaSegment> GeoCrs::GetValidAreaLonLatSegmentsNoLock(
 	double south = 0;
 	double east = 0;
 	double north = 0;
-	const char* areaName = nullptr;
 
-	const bool ok = spatialReference->GetAreaOfUse(&west, &south, &east, &north, &areaName);
-	if (!ok)
+	if (!TryGetAreaOfUseFromSrs(*spatialReference, west, south, east, north))
 	{
-		GBLOG_WARNING(GB_STR("【GeoCrs::GetValidAreaLonLatSegments】GetAreaOfUse 失败。"));
-		return segments;
-	}
-
-	if (IsUnknownAreaOfUseValue(west) || IsUnknownAreaOfUseValue(south) || IsUnknownAreaOfUseValue(east) || IsUnknownAreaOfUseValue(north))
-	{
-		GBLOG_WARNING(GB_STR("【GeoCrs::GetValidAreaLonLatSegments】未知区域。"));
+		GBLOG_WARNING(GB_STR("【GeoCrs::GetValidAreaLonLatSegments】未能获取可用的 area of use。"));
 		return segments;
 	}
 
@@ -1227,6 +1310,8 @@ GeoCrs& GeoCrs::operator=(const GeoCrs& other)
 	// 先在 other 的锁保护下克隆数据，尽量缩短双对象同时被锁住的时间，规避死锁风险。
 	std::unique_ptr<OGRSpatialReference, GeoCrsOgrSrsDeleter> clonedSrs(nullptr);
 	bool otherUseTraditionalGisAxisOrder = true;
+	bool otherHasCachedIsValid = false;
+	bool otherCachedIsValid = false;
 	bool otherHasCachedDefaultEpsgCode = false;
 	int otherCachedDefaultEpsgCode = 0;
 	int otherCachedUidKind = -2;
@@ -1239,6 +1324,8 @@ GeoCrs& GeoCrs::operator=(const GeoCrs& other)
 		std::lock_guard<std::recursive_mutex> otherLock(other.mutex);
 
 		otherUseTraditionalGisAxisOrder = other.useTraditionalGisAxisOrder;
+		otherHasCachedIsValid = other.hasCachedIsValid;
+		otherCachedIsValid = other.cachedIsValid;
 		otherHasCachedDefaultEpsgCode = other.hasCachedDefaultEpsgCode;
 		otherCachedDefaultEpsgCode = other.cachedDefaultEpsgCode;
 		otherCachedUidKind = other.cachedUidKind;
@@ -1273,6 +1360,8 @@ GeoCrs& GeoCrs::operator=(const GeoCrs& other)
 			ApplyAxisOrderStrategy(*spatialReference, useTraditionalGisAxisOrder);
 		}
 
+		hasCachedIsValid = otherHasCachedIsValid;
+		cachedIsValid = otherCachedIsValid;
 		hasCachedDefaultEpsgCode = otherHasCachedDefaultEpsgCode;
 		cachedDefaultEpsgCode = otherCachedDefaultEpsgCode;
 		cachedUidKind = otherCachedUidKind;
@@ -1300,6 +1389,8 @@ GeoCrs& GeoCrs::operator=(GeoCrs&& other) noexcept
 	spatialReference = std::move(other.spatialReference);
 	useTraditionalGisAxisOrder = other.useTraditionalGisAxisOrder;
 
+	hasCachedIsValid = other.hasCachedIsValid;
+	cachedIsValid = other.cachedIsValid;
 	hasCachedDefaultEpsgCode = other.hasCachedDefaultEpsgCode;
 	cachedDefaultEpsgCode = other.cachedDefaultEpsgCode;
 	cachedUidKind = other.cachedUidKind;
@@ -1314,6 +1405,8 @@ GeoCrs& GeoCrs::operator=(GeoCrs&& other) noexcept
 	else
 	{
 		useTraditionalGisAxisOrder = true;
+		hasCachedIsValid = false;
+		cachedIsValid = false;
 		hasCachedDefaultEpsgCode = false;
 		cachedDefaultEpsgCode = 0;
 		cachedUidKind = -2;
@@ -1324,6 +1417,8 @@ GeoCrs& GeoCrs::operator=(GeoCrs&& other) noexcept
 
 	// 保持被移动对象可用（置为空 CRS）
 	other.useTraditionalGisAxisOrder = true;
+	other.hasCachedIsValid = false;
+	other.cachedIsValid = false;
 	other.hasCachedDefaultEpsgCode = false;
 	other.cachedDefaultEpsgCode = 0;
 	other.cachedUidKind = -2;
@@ -1393,10 +1488,19 @@ bool GeoCrs::SetFromWkt(const std::string& wktUtf8)
 	}
 
 	const char* wkt = trimmed.c_str();
+	CPLPushErrorHandler(CPLQuietErrorHandler);
+	CPLErrorReset();
 	const OGRErr err = srs->importFromWkt(&wkt);
+	const std::string lastErrorMessage = SafeCString(CPLGetLastErrorMsg());
+	CPLPopErrorHandler();
 	if (err != OGRERR_NONE)
 	{
-		GBLOG_WARNING(GB_STR("【GeoCrs::SetFromWkt】importFromWkt失败: err=") + std::to_string(static_cast<int>(err)));
+		std::string message = GB_STR("【GeoCrs::SetFromWkt】importFromWkt失败: err=") + std::to_string(static_cast<int>(err));
+		if (!lastErrorMessage.empty())
+		{
+			message += GB_STR(", message=") + lastErrorMessage;
+		}
+		GBLOG_WARNING(message);
 		ResetNoLock();
 		return false;
 	}
@@ -1470,9 +1574,7 @@ bool GeoCrs::SetFromUserInput(const std::string& definitionUtf8, bool allowNetwo
 	CPLPushErrorHandler(CPLQuietErrorHandler);
 	CPLErrorReset();
 	const OGRErr err = srs->SetFromUserInput(trimmed.c_str(), options);
-	const CPLErr lastErrorType = CPLGetLastErrorType();
-	const CPLErrorNum lastErrorNo = CPLGetLastErrorNo();
-	const std::string lastErrorMessage = CPLGetLastErrorMsg();
+	const std::string lastErrorMessage = SafeCString(CPLGetLastErrorMsg());
 	CPLPopErrorHandler();
 
 	if (err != OGRERR_NONE)
@@ -1490,7 +1592,12 @@ bool GeoCrs::SetFromUserInput(const std::string& definitionUtf8, bool allowNetwo
 			}
 		}
 
-		GBLOG_WARNING(GB_STR("【GeoCrs::SetFromUserInput】SetFromUserInput失败: err=") + std::to_string(static_cast<int>(err)) + GB_STR(", definition=") + trimmed);
+		std::string message = GB_STR("【GeoCrs::SetFromUserInput】SetFromUserInput失败: err=") + std::to_string(static_cast<int>(err)) + GB_STR(", definition=") + trimmed;
+		if (!lastErrorMessage.empty())
+		{
+			message += GB_STR(", message=") + lastErrorMessage;
+		}
+		GBLOG_WARNING(message);
 		ResetNoLock();
 		return false;
 	}
@@ -1671,6 +1778,12 @@ bool GeoCrs::IsLocal() const
 	}
 
 	return spatialReference->IsLocal() != 0;
+}
+
+bool GeoCrs::IsTraditionalGisAxisOrderEnabled() const
+{
+	std::lock_guard<std::recursive_mutex> lock(mutex);
+	return useTraditionalGisAxisOrder;
 }
 
 
@@ -1939,6 +2052,22 @@ const OGRSpatialReference& GeoCrs::GetConstRef() const
 	}
 
 	return *spatialReference;
+}
+
+std::unique_ptr<OGRSpatialReference, GeoCrsOgrSrsDeleter> GeoCrs::CloneOgrSpatialReference() const
+{
+	std::lock_guard<std::recursive_mutex> lock(mutex);
+	if (spatialReference == nullptr)
+	{
+		return std::unique_ptr<OGRSpatialReference, GeoCrsOgrSrsDeleter>(nullptr);
+	}
+
+	std::unique_ptr<OGRSpatialReference, GeoCrsOgrSrsDeleter> cloned(spatialReference->Clone());
+	if (cloned)
+	{
+		ApplyAxisOrderStrategy(*cloned, useTraditionalGisAxisOrder);
+	}
+	return cloned;
 }
 
 OGRSpatialReference& GeoCrs::GetRef()
