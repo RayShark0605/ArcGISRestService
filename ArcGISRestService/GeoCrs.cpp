@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cerrno>
+#include <cctype>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -216,6 +217,26 @@ namespace
 		return text ? std::string(text) : std::string();
 	}
 
+	static bool IsOnlyAsciiWhitespaceOrEnd(const char* text)
+	{
+		if (text == nullptr)
+		{
+			return true;
+		}
+
+		const unsigned char* cursor = reinterpret_cast<const unsigned char*>(text);
+		while (*cursor != '\0')
+		{
+			if (!std::isspace(*cursor))
+			{
+				return false;
+			}
+			cursor++;
+		}
+
+		return true;
+	}
+
 	static bool IsValidAreaOfUseValues(double west, double south, double east, double north)
 	{
 		if (!IsFinite(west) || !IsFinite(south) || !IsFinite(east) || !IsFinite(north))
@@ -223,10 +244,25 @@ namespace
 			return false;
 		}
 
-		return !IsUnknownAreaOfUseValue(west) &&
-			!IsUnknownAreaOfUseValue(south) &&
-			!IsUnknownAreaOfUseValue(east) &&
-			!IsUnknownAreaOfUseValue(north);
+		if (IsUnknownAreaOfUseValue(west) || IsUnknownAreaOfUseValue(south) ||
+			IsUnknownAreaOfUseValue(east) || IsUnknownAreaOfUseValue(north))
+		{
+			return false;
+		}
+
+		// area of use 的经纬度可以跨越日期变更线（west > east），但纬度必须形成非退化区间。
+		if (!(south < north))
+		{
+			return false;
+		}
+
+		// west == east 通常表示缺失或退化范围；不作为有效二维范围使用。
+		if (west == east)
+		{
+			return false;
+		}
+
+		return true;
 	}
 
 	static bool TryGetAreaOfUseFromSrs(const OGRSpatialReference& srs, double& west, double& south, double& east, double& north)
@@ -303,6 +339,70 @@ namespace
 				latitudes.push_back(lat);
 			}
 		}
+	}
+
+	static bool TryExpandRectangle(GB_Rectangle& inOutRect, const GB_Rectangle& rect)
+	{
+		if (!rect.IsValid())
+		{
+			return false;
+		}
+
+		if (!inOutRect.IsValid())
+		{
+			inOutRect = rect;
+		}
+		else
+		{
+			inOutRect.Expand(rect);
+		}
+
+		return true;
+	}
+
+	static bool TryTransformLonLatSegmentBounds(
+		OGRCoordinateTransformation& transform,
+		const GeoCrs::LonLatAreaSegment& segment,
+		int densifyPointCount,
+		GB_Rectangle& outRect)
+	{
+		outRect = GB_Rectangle::Invalid;
+
+		if (!IsFinite(segment.west) || !IsFinite(segment.south) ||
+			!IsFinite(segment.east) || !IsFinite(segment.north) ||
+			!(segment.west < segment.east) || !(segment.south < segment.north))
+		{
+			return false;
+		}
+
+#if defined(GDAL_VERSION_NUM) && GDAL_VERSION_NUM >= 3040000
+		double minX = 0.0;
+		double minY = 0.0;
+		double maxX = 0.0;
+		double maxY = 0.0;
+		const int normalizedDensifyPointCount = std::max(2, densifyPointCount);
+		const int ok = transform.TransformBounds(
+			segment.west,
+			segment.south,
+			segment.east,
+			segment.north,
+			&minX,
+			&minY,
+			&maxX,
+			&maxY,
+			normalizedDensifyPointCount);
+
+		if (ok != FALSE && IsFinite(minX) && IsFinite(minY) && IsFinite(maxX) && IsFinite(maxY))
+		{
+			outRect.Set(minX, minY, maxX, maxY);
+			return outRect.IsValid();
+		}
+#else
+		(void)transform;
+		(void)densifyPointCount;
+#endif
+
+		return false;
 	}
 
 	static int NormalizeValidAreaPolygonEdgeSampleCount(int edgeSampleCount)
@@ -988,15 +1088,24 @@ std::vector<GeoCrs::LonLatAreaSegment> GeoCrs::GetValidAreaLonLatSegmentsNoLock(
 		std::swap(south, north);
 	}
 
+	if (!(south < north) || west == east)
+	{
+		GBLOG_WARNING(GB_STR("【GeoCrs::GetValidAreaLonLatSegments】area of use 为退化范围。"));
+		return segments;
+	}
+
 	// 跨越日期变更线时 west 可能大于 east。此时返回 2 段，以便上层按两段采样/计算。
-	if (west <= east)
+	if (west < east)
 	{
 		LonLatAreaSegment segment;
 		segment.west = west;
 		segment.south = south;
 		segment.east = east;
 		segment.north = north;
-		segments.push_back(segment);
+		if (IsValidLonLatAreaSegment(segment))
+		{
+			segments.push_back(segment);
+		}
 	}
 	else
 	{
@@ -1012,11 +1121,11 @@ std::vector<GeoCrs::LonLatAreaSegment> GeoCrs::GetValidAreaLonLatSegmentsNoLock(
 		segment2.east = east;
 		segment2.north = north;
 
-		if (segment1.west <= segment1.east)
+		if (IsValidLonLatAreaSegment(segment1))
 		{
 			segments.push_back(segment1);
 		}
-		if (segment2.west <= segment2.east)
+		if (IsValidLonLatAreaSegment(segment2))
 		{
 			segments.push_back(segment2);
 		}
@@ -1145,9 +1254,35 @@ GeoBoundingBox GeoCrs::GetValidAreaNoLock() const
 		return MakeInvalidGeoBoundingBox();
 	}
 
-	// 采样密度：21x21。相较 3x3 更能覆盖非线性投影边界的弯曲情况。
+	// GDAL >= 3.4 时优先使用 TransformBounds：它会沿边界加密采样，
+	// 对投影边界弯曲、极区与跨日期线分段范围更稳健；失败后再退回手工网格采样。
 	const int gridCount = 21;
+	GB_Rectangle transformBoundsRect = GB_Rectangle::Invalid;
+	bool hasTransformBoundsRect = false;
+	for (const LonLatAreaSegment& seg : lonLatSegments)
+	{
+		GB_Rectangle segmentRect;
+		if (TryTransformLonLatSegmentBounds(*transform, seg, gridCount, segmentRect))
+		{
+			hasTransformBoundsRect = TryExpandRectangle(transformBoundsRect, segmentRect) || hasTransformBoundsRect;
+		}
+	}
 
+	if (hasTransformBoundsRect && transformBoundsRect.IsValid())
+	{
+		GeoBoundingBox result;
+		result.wktUtf8 = ExportToWktUtf8NoLock(WktFormat::Wkt2_2018, false);
+		result.rect = transformBoundsRect;
+
+		if (!useTraditionalGisAxisOrder && spatialReference->EPSGTreatsAsNorthingEasting() != 0)
+		{
+			result.rect = GB_Rectangle(result.rect.minY, result.rect.minX, result.rect.maxY, result.rect.maxX);
+		}
+
+		return result;
+	}
+
+	// 兜底采样密度：21x21。相较 3x3 更能覆盖非线性投影边界的弯曲情况。
 	std::vector<double> longitudes;
 	std::vector<double> latitudes;
 	longitudes.reserve(static_cast<size_t>(gridCount) * static_cast<size_t>(gridCount) * lonLatSegments.size());
@@ -1505,6 +1640,13 @@ bool GeoCrs::SetFromWkt(const std::string& wktUtf8)
 		return false;
 	}
 
+	if (!IsOnlyAsciiWhitespaceOrEnd(wkt))
+	{
+		GBLOG_WARNING(GB_STR("【GeoCrs::SetFromWkt】WKT 后存在无法解析的多余字符。"));
+		ResetNoLock();
+		return false;
+	}
+
 	ApplyAxisOrderStrategy(*srs, useTraditionalGisAxisOrder);
 	InvalidateCachesNoLock();
 	return IsValidNoLock();
@@ -1530,10 +1672,19 @@ bool GeoCrs::SetFromEpsgCode(int epsgCode)
 		return false;
 	}
 
+	CPLPushErrorHandler(CPLQuietErrorHandler);
+	CPLErrorReset();
 	const OGRErr err = srs->importFromEPSG(epsgCode);
+	const std::string lastErrorMessage = SafeCString(CPLGetLastErrorMsg());
+	CPLPopErrorHandler();
 	if (err != OGRERR_NONE)
 	{
-		GBLOG_WARNING(GB_STR("【GeoCrs::SetFromEpsgCode】importFromEPSG失败: err=") + std::to_string(static_cast<int>(err)));
+		std::string message = GB_STR("【GeoCrs::SetFromEpsgCode】importFromEPSG失败: err=") + std::to_string(static_cast<int>(err));
+		if (!lastErrorMessage.empty())
+		{
+			message += GB_STR(", message=") + lastErrorMessage;
+		}
+		GBLOG_WARNING(message);
 		ResetNoLock();
 		return false;
 	}

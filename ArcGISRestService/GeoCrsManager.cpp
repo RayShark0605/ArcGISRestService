@@ -298,6 +298,26 @@ namespace
         return true;
     }
 
+    bool IsOnlyAsciiWhitespaceOrEnd(const char* text)
+    {
+        if (text == nullptr)
+        {
+            return true;
+        }
+
+        const unsigned char* cursor = reinterpret_cast<const unsigned char*>(text);
+        while (*cursor != '\0')
+        {
+            if (!std::isspace(*cursor))
+            {
+                return false;
+            }
+            cursor++;
+        }
+
+        return true;
+    }
+
     std::string GetCurrentWorkingDirectoryUtf8()
     {
 #ifdef _WIN32
@@ -1202,6 +1222,25 @@ bool GeoCrsManager::ValidateWktUtf8(const std::string& wktUtf8, std::string* err
                 *errorMessageUtf8 += GB_STR("\n\n") + importErrorMessage;
             }
         }
+        return false;
+    }
+
+    // OSRImportFromWkt 会推进 wktPointer；若后面还残留非空白字符，应视为非法，
+    // 避免 "合法 WKT + 垃圾尾巴" 被误判为有效定义。
+    if (!IsOnlyAsciiWhitespaceOrEnd(wktPointer))
+    {
+        OSRDestroySpatialReference(spatialReference);
+
+        {
+            GB_WriteLockGuard writeGuard(g_wktValidityCacheLock);
+            g_wktValidityCache[trimmed] = false;
+        }
+
+        if (errorMessageUtf8 != nullptr)
+        {
+            *errorMessageUtf8 = GB_STR("输入的 WKT 后存在无法解析的多余字符。");
+        }
+
         return false;
     }
 
