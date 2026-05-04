@@ -76,6 +76,125 @@ namespace
         return text ? std::string(text) : std::string();
     }
 
+    bool StartsWithIgnoreCaseAscii(const std::string& text, const std::string& prefix)
+    {
+        if (text.size() < prefix.size())
+        {
+            return false;
+        }
+
+        for (size_t i = 0; i < prefix.size(); i++)
+        {
+            const unsigned char textChar = static_cast<unsigned char>(text[i]);
+            const unsigned char prefixChar = static_cast<unsigned char>(prefix[i]);
+            if (std::tolower(textChar) != std::tolower(prefixChar))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    std::string ToUpperAsciiUtf8(const std::string& text)
+    {
+        std::string result = text;
+        for (size_t i = 0; i < result.size(); i++)
+        {
+            if (result[i] >= 'a' && result[i] <= 'z')
+            {
+                result[i] = static_cast<char>(result[i] - 'a' + 'A');
+            }
+        }
+        return result;
+    }
+
+    bool TryNormalizeSimpleAuthorityCodeUtf8(const std::string& definitionUtf8, std::string& outDefinitionUtf8)
+    {
+        outDefinitionUtf8.clear();
+
+        const std::string trimmed = GB_Utf8Trim(definitionUtf8);
+        const size_t colonPos = trimmed.find(':');
+        if (colonPos == std::string::npos || colonPos == 0 || colonPos + 1 >= trimmed.size())
+        {
+            return false;
+        }
+
+        // 仅处理 AUTHORITY:CODE 这种简单形式，避免误改 URN、URL、PROJ 字符串等复杂定义。
+        if (trimmed.find(':', colonPos + 1) != std::string::npos)
+        {
+            return false;
+        }
+
+        const std::string authority = GB_Utf8Trim(trimmed.substr(0, colonPos));
+        const std::string code = GB_Utf8Trim(trimmed.substr(colonPos + 1));
+        if (authority.empty() || code.empty())
+        {
+            return false;
+        }
+
+        for (size_t i = 0; i < authority.size(); i++)
+        {
+            const unsigned char ch = static_cast<unsigned char>(authority[i]);
+            if (!std::isalnum(ch) && ch != '_')
+            {
+                return false;
+            }
+        }
+
+        for (size_t i = 0; i < code.size(); i++)
+        {
+            const char ch = code[i];
+            if (ch < '0' || ch > '9')
+            {
+                return false;
+            }
+        }
+
+        outDefinitionUtf8 = ToUpperAsciiUtf8(authority) + ":" + code;
+        return true;
+    }
+
+    std::string NormalizeDefinitionForCacheUtf8(const std::string& definitionUtf8)
+    {
+        const std::string trimmed = GB_Utf8Trim(definitionUtf8);
+        std::string normalized;
+        if (TryNormalizeSimpleAuthorityCodeUtf8(trimmed, normalized))
+        {
+            return normalized;
+        }
+
+        return trimmed;
+    }
+
+    std::string MakeStableCrsCacheKeyUtf8(const GeoCrs& crs, const std::string& fallbackUtf8)
+    {
+        if (!crs.IsValid())
+        {
+            return fallbackUtf8;
+        }
+
+        const std::string authorityCode = crs.ToAuthorityStringUtf8(false, false, 90);
+        if (!authorityCode.empty())
+        {
+            return "AUTH:" + authorityCode;
+        }
+
+        const std::string uid = crs.GetUidUtf8();
+        if (!uid.empty())
+        {
+            return "UID:" + uid;
+        }
+
+        const std::string canonicalWkt = crs.ExportToWktUtf8(GeoCrs::WktFormat::Wkt2_2018, false);
+        if (!canonicalWkt.empty())
+        {
+            return "WKT2:" + canonicalWkt;
+        }
+
+        return fallbackUtf8;
+    }
+
     GeoCrsDatabaseType ToGeoCrsDatabaseType(OSRCRSType type)
     {
         switch (type)
@@ -406,7 +525,7 @@ namespace
         {
             ProjDbSearchNode node = std::move(queue.front());
             queue.pop_front();
-            ++visitedDirs;
+            visitedDirs++;
 
             const std::string projDbPath = GB_JoinPath(node.dirUtf8, "proj.db");
             if (GB_IsFileExists(projDbPath))
@@ -696,24 +815,6 @@ namespace
         //  2) "urn:ogc:def:crs:EPSG::4326" / "urn:ogc:def:crs:EPSG:<ver>:4326"
         //  3) "http(s)://www.opengis.net/def/crs/EPSG/0/4326"
         std::string codePart = trimmed;
-
-        auto StartsWithIgnoreCaseAscii = [](const std::string& text, const std::string& prefix) -> bool
-            {
-                if (text.size() < prefix.size())
-                {
-                    return false;
-                }
-                for (size_t i = 0; i < prefix.size(); i++)
-                {
-                    const unsigned char a = static_cast<unsigned char>(text[i]);
-                    const unsigned char b = static_cast<unsigned char>(prefix[i]);
-                    if (std::tolower(a) != std::tolower(b))
-                    {
-                        return false;
-                    }
-                }
-                return true;
-            };
 
         // 1) EPSG:xxxx
         if (StartsWithIgnoreCaseAscii(trimmed, "EPSG"))
@@ -1070,7 +1171,8 @@ std::shared_ptr<const GeoCrs> GeoCrsManager::GetFromDefinitionCached(const std::
         return GetFromEpsgCached(epsgCode);
     }
 
-    const DefinitionKey key{ trimmed, allowNetworkAccess, allowFileAccess };
+    const std::string normalizedDefinition = NormalizeDefinitionForCacheUtf8(trimmed);
+    const DefinitionKey key{ normalizedDefinition, allowNetworkAccess, allowFileAccess };
 
     {
         GB_ReadLockGuard readGuard(g_definitionCacheLock);
@@ -1081,7 +1183,7 @@ std::shared_ptr<const GeoCrs> GeoCrsManager::GetFromDefinitionCached(const std::
         }
     }
 
-    std::shared_ptr<const GeoCrs> crs = std::make_shared<GeoCrs>(GeoCrs::CreateFromUserInput(trimmed, allowNetworkAccess, allowFileAccess));
+    std::shared_ptr<const GeoCrs> crs = std::make_shared<GeoCrs>(GeoCrs::CreateFromUserInput(normalizedDefinition, allowNetworkAccess, allowFileAccess));
 
     {
         GB_WriteLockGuard writeGuard(g_definitionCacheLock);
@@ -1298,7 +1400,8 @@ bool GeoCrsManager::IsDefinitionValidCached(const std::string& definitionUtf8, b
         return crs && crs->IsValid();
     }
 
-    const DefinitionKey key{ trimmed, allowNetworkAccess, allowFileAccess };
+    const std::string normalizedDefinition = NormalizeDefinitionForCacheUtf8(trimmed);
+    const DefinitionKey key{ normalizedDefinition, allowNetworkAccess, allowFileAccess };
 
     {
         GB_ReadLockGuard readGuard(g_definitionValidityCacheLock);
@@ -1322,7 +1425,7 @@ bool GeoCrsManager::IsDefinitionValidCached(const std::string& definitionUtf8, b
         }
     }
 
-    const GeoCrs temp = GeoCrs::CreateFromUserInput(trimmed, allowNetworkAccess, allowFileAccess);
+    const GeoCrs temp = GeoCrs::CreateFromUserInput(normalizedDefinition, allowNetworkAccess, allowFileAccess);
     const bool valid = temp.IsValid();
 
     {
@@ -1406,7 +1509,8 @@ bool GeoCrsManager::IsDefinitionAxisOrderReversedCached(const std::string& defin
         return reversed;
     }
 
-    const DefinitionKey key{ trimmed, allowNetworkAccess, allowFileAccess };
+    const std::string normalizedDefinition = NormalizeDefinitionForCacheUtf8(trimmed);
+    const DefinitionKey key{ normalizedDefinition, allowNetworkAccess, allowFileAccess };
 
     {
         GB_ReadLockGuard readGuard(g_definitionAxisOrderReversedCacheLock);
@@ -1418,7 +1522,7 @@ bool GeoCrsManager::IsDefinitionAxisOrderReversedCached(const std::string& defin
     }
 
     // 复用 CRS 缓存（避免重复解析）。
-    const std::shared_ptr<const GeoCrs> crs = GetFromDefinitionCached(trimmed, allowNetworkAccess, allowFileAccess);
+    const std::shared_ptr<const GeoCrs> crs = GetFromDefinitionCached(normalizedDefinition, allowNetworkAccess, allowFileAccess);
     const bool reversed = crs ? IsAxisOrderReversedByAuthorityInternal(*crs) : false;
 
     {
@@ -1456,18 +1560,35 @@ std::shared_ptr<const GeoCrs> GeoCrsManager::GetFromWktCached(const std::string&
     }
 
     std::shared_ptr<const GeoCrs> crs = std::make_shared<GeoCrs>(GeoCrs::CreateFromWkt(trimmed));
+    const std::string stableKey = (crs && crs->IsValid()) ? MakeStableCrsCacheKeyUtf8(*crs, trimmed) : trimmed;
 
     {
         GB_WriteLockGuard writeGuard(g_wktCacheLock);
-        const auto it = g_wktCache.find(trimmed);
-        if (it != g_wktCache.end())
+
+        const auto trimmedIt = g_wktCache.find(trimmed);
+        if (trimmedIt != g_wktCache.end())
         {
-            return it->second;
+            return trimmedIt->second;
         }
+
+        if (stableKey != trimmed)
+        {
+            const auto stableIt = g_wktCache.find(stableKey);
+            if (stableIt != g_wktCache.end())
+            {
+                g_wktCache.emplace(trimmed, stableIt->second);
+                return stableIt->second;
+            }
+        }
+
         g_wktCache.emplace(trimmed, crs);
+        if (stableKey != trimmed)
+        {
+            g_wktCache.emplace(stableKey, crs);
+        }
     }
 
-    // 也同步写入 validity cache（避免重复解析）
+    // 也同步写入 validity cache（避免重复解析）。
     {
         const bool valid = crs ? crs->IsValid() : false;
         GB_WriteLockGuard writeGuard(g_wktValidityCacheLock);
@@ -1477,6 +1598,7 @@ std::shared_ptr<const GeoCrs> GeoCrsManager::GetFromWktCached(const std::string&
     return crs;
 }
 
+
 bool GeoCrsManager::TryGetValidAreasCached(const std::string& wktUtf8, GeoBoundingBox& outLonLatArea, GeoBoundingBox& outSelfArea)
 {
     EnsureInitializedInternal();
@@ -1484,8 +1606,8 @@ bool GeoCrsManager::TryGetValidAreasCached(const std::string& wktUtf8, GeoBoundi
     const std::string trimmed = GB_Utf8Trim(wktUtf8);
     if (trimmed.empty())
     {
-        outLonLatArea = GeoBoundingBox();
-        outSelfArea = GeoBoundingBox();
+        outLonLatArea = GeoBoundingBox::Invalid;
+        outSelfArea = GeoBoundingBox::Invalid;
         return false;
     }
 
@@ -1512,8 +1634,23 @@ bool GeoCrsManager::TryGetValidAreasCached(const std::string& wktUtf8, GeoBoundi
         crs = GetFromDefinitionCached(trimmed, true, true);
     }
 
+    const std::string stableKey = (crs && crs->IsValid()) ? MakeStableCrsCacheKeyUtf8(*crs, trimmed) : trimmed;
+    if (stableKey != trimmed)
+    {
+        GB_ReadLockGuard readGuard(g_validAreaCacheLock);
+        const auto it = g_validAreaCache.find(stableKey);
+        if (it != g_validAreaCache.end())
+        {
+            outLonLatArea = it->second.lonLatArea;
+            outSelfArea = it->second.selfArea;
+            return outLonLatArea.IsValid() && outSelfArea.IsValid();
+        }
+    }
+
     ValidAreas areas;
-    if (crs)
+    areas.lonLatArea = GeoBoundingBox::Invalid;
+    areas.selfArea = GeoBoundingBox::Invalid;
+    if (crs && crs->IsValid())
     {
         areas.lonLatArea = crs->GetValidAreaLonLat();
         areas.selfArea = crs->GetValidArea();
@@ -1521,21 +1658,38 @@ bool GeoCrsManager::TryGetValidAreasCached(const std::string& wktUtf8, GeoBoundi
 
     {
         GB_WriteLockGuard writeGuard(g_validAreaCacheLock);
-        const auto it = g_validAreaCache.find(trimmed);
-        if (it != g_validAreaCache.end())
+        const auto trimmedIt = g_validAreaCache.find(trimmed);
+        if (trimmedIt != g_validAreaCache.end())
         {
-            outLonLatArea = it->second.lonLatArea;
-            outSelfArea = it->second.selfArea;
+            outLonLatArea = trimmedIt->second.lonLatArea;
+            outSelfArea = trimmedIt->second.selfArea;
             return outLonLatArea.IsValid() && outSelfArea.IsValid();
         }
 
+        if (stableKey != trimmed)
+        {
+            const auto stableIt = g_validAreaCache.find(stableKey);
+            if (stableIt != g_validAreaCache.end())
+            {
+                g_validAreaCache.emplace(trimmed, stableIt->second);
+                outLonLatArea = stableIt->second.lonLatArea;
+                outSelfArea = stableIt->second.selfArea;
+                return outLonLatArea.IsValid() && outSelfArea.IsValid();
+            }
+        }
+
         g_validAreaCache.emplace(trimmed, areas);
+        if (stableKey != trimmed)
+        {
+            g_validAreaCache.emplace(stableKey, areas);
+        }
     }
 
     outLonLatArea = areas.lonLatArea;
     outSelfArea = areas.selfArea;
     return outLonLatArea.IsValid() && outSelfArea.IsValid();
 }
+
 
 size_t GeoCrsManager::GetCachedEpsgCount()
 {
@@ -1578,6 +1732,7 @@ void GeoCrsManager::EnsureInitializedInternal()
     const std::string existingDir = FindProjDatabaseDirByExistingProjPaths();
     if (!existingDir.empty())
     {
+        ApplyProjDatabaseDirectoryUtf8Internal(existingDir);
         g_projDatabaseDirUtf8 = existingDir;
         g_isInitialized.store(true, std::memory_order_release);
         return;

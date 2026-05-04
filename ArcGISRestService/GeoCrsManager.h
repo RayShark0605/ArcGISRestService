@@ -82,6 +82,7 @@ public:
 	static bool ReinitializeBySearchingProjDb();
 
 	// 清空内部所有缓存（不改变 PROJ 搜索路径）。
+	// 注意：这只影响后续解析与查询，不会修改已经返回给调用方的共享 GeoCrs 对象。
 	static void ClearCaches();
 
 	// 枚举坐标系数据库中的 CRS 记录。
@@ -152,7 +153,8 @@ public:
 	static bool IsDefinitionAxisOrderReversedCached(const std::string& definitionUtf8, bool allowNetworkAccess = true, bool allowFileAccess = true);
 
 	// 带缓存地获取一个 GeoCrs（WKT 解析）。
-	// 注意：返回的是共享只读对象；如需可写对象，请拷贝一份。
+	// 注意：返回的是共享只读对象；如需可写对象，请拷贝一份。内部会用规范化标识辅助去重，
+	// 但外部仍可直接传入原始 WKT 文本。
 	static std::shared_ptr<const GeoCrs> GetFromWktCached(const std::string& wktUtf8);
 
 	// 带缓存地获取 WKT 对应坐标系的：

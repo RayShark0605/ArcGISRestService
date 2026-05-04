@@ -56,10 +56,13 @@ public:
 
     bool operator!=(const GeoCrs& other) const;
 
+    // 设置为 EPSG 坐标系。成功后替换当前内容；失败时保持当前对象不变。
     bool SetFromEpsgCode(int epsgCode);
 
+    // 设置为 WKT 坐标系。成功后替换当前内容；失败时保持当前对象不变。
     bool SetFromWkt(const std::string& wktUtf8);
 
+    // 设置为 GDAL/OGR SetFromUserInput() 支持的 CRS 定义。成功后替换当前内容；失败时保持当前对象不变。
     bool SetFromUserInput(const std::string& definitionUtf8, bool allowNetworkAccess = false, bool allowFileAccess = false);
 
     // 重置为空坐标系。返回 true 表示成功（内部 OGRSpatialReference 可用），false 表示失败。

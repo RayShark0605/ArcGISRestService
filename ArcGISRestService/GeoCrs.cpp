@@ -608,6 +608,39 @@ namespace
 		return OGRSpatialReference::FromHandle(handle);
 	}
 
+	static std::unique_ptr<OGRSpatialReference, GeoCrsOgrSrsDeleter> CreateOgrSpatialReferencePtr()
+	{
+		return std::unique_ptr<OGRSpatialReference, GeoCrsOgrSrsDeleter>(CreateOgrSpatialReference());
+	}
+
+	static bool ValidatePreparedSpatialReference(OGRSpatialReference& srs, const std::string& logContextUtf8)
+	{
+		if (srs.IsEmpty())
+		{
+			GBLOG_WARNING(logContextUtf8 + GB_STR("坐标系为空。"));
+			return false;
+		}
+
+		CPLPushErrorHandler(CPLQuietErrorHandler);
+		CPLErrorReset();
+		const OGRErr err = srs.Validate();
+		const std::string lastErrorMessage = SafeCString(CPLGetLastErrorMsg());
+		CPLPopErrorHandler();
+
+		if (err != OGRERR_NONE)
+		{
+			std::string message = logContextUtf8 + GB_STR("坐标系未通过 Validate 校验: err=") + std::to_string(static_cast<int>(err));
+			if (!lastErrorMessage.empty())
+			{
+				message += GB_STR(", message=") + lastErrorMessage;
+			}
+			GBLOG_WARNING(message);
+			return false;
+		}
+
+		return true;
+	}
+
 	static void ApplyAxisOrderStrategy(OGRSpatialReference& srs, bool useTraditionalGisAxisOrder)
 	{
 		srs.SetAxisMappingStrategy(useTraditionalGisAxisOrder ? OAMS_TRADITIONAL_GIS_ORDER : OAMS_AUTHORITY_COMPLIANT);
@@ -1362,6 +1395,7 @@ GeoBoundingBox GeoCrs::GetValidAreaNoLock() const
 
 	return result;
 }
+
 std::vector<std::vector<GB_Point2d>> GeoCrs::GetValidAreaPolygonsNoLock(int edgeSampleCount) const
 {
 	std::vector<std::vector<GB_Point2d>> result;
@@ -1604,10 +1638,6 @@ bool GeoCrs::Reset()
 
 bool GeoCrs::SetFromWkt(const std::string& wktUtf8)
 {
-	std::lock_guard<std::recursive_mutex> lock(mutex);
-
-	ResetNoLock();
-
 	const std::string trimmed = GB_Utf8Trim(wktUtf8);
 	if (trimmed.empty())
 	{
@@ -1615,17 +1645,19 @@ bool GeoCrs::SetFromWkt(const std::string& wktUtf8)
 		return false;
 	}
 
-	OGRSpatialReference* srs = EnsureSpatialReferenceNoLock();
-	if (srs == nullptr)
+	std::lock_guard<std::recursive_mutex> lock(mutex);
+
+	std::unique_ptr<OGRSpatialReference, GeoCrsOgrSrsDeleter> newSrs = CreateOgrSpatialReferencePtr();
+	if (!newSrs)
 	{
-		GBLOG_WARNING(GB_STR("【GeoCrs::SetFromWkt】空的 srs。"));
+		GBLOG_WARNING(GB_STR("【GeoCrs::SetFromWkt】创建 srs 失败。"));
 		return false;
 	}
 
 	const char* wkt = trimmed.c_str();
 	CPLPushErrorHandler(CPLQuietErrorHandler);
 	CPLErrorReset();
-	const OGRErr err = srs->importFromWkt(&wkt);
+	const OGRErr err = newSrs->importFromWkt(&wkt);
 	const std::string lastErrorMessage = SafeCString(CPLGetLastErrorMsg());
 	CPLPopErrorHandler();
 	if (err != OGRERR_NONE)
@@ -1636,45 +1668,47 @@ bool GeoCrs::SetFromWkt(const std::string& wktUtf8)
 			message += GB_STR(", message=") + lastErrorMessage;
 		}
 		GBLOG_WARNING(message);
-		ResetNoLock();
 		return false;
 	}
 
 	if (!IsOnlyAsciiWhitespaceOrEnd(wkt))
 	{
 		GBLOG_WARNING(GB_STR("【GeoCrs::SetFromWkt】WKT 后存在无法解析的多余字符。"));
-		ResetNoLock();
 		return false;
 	}
 
-	ApplyAxisOrderStrategy(*srs, useTraditionalGisAxisOrder);
+	ApplyAxisOrderStrategy(*newSrs, useTraditionalGisAxisOrder);
+	if (!ValidatePreparedSpatialReference(*newSrs, GB_STR("【GeoCrs::SetFromWkt】")))
+	{
+		return false;
+	}
+
+	spatialReference.swap(newSrs);
 	InvalidateCachesNoLock();
-	return IsValidNoLock();
+	return true;
 }
 
 
 bool GeoCrs::SetFromEpsgCode(int epsgCode)
 {
-	std::lock_guard<std::recursive_mutex> lock(mutex);
-
-	ResetNoLock();
-
 	if (epsgCode <= 0)
 	{
 		GBLOG_WARNING(GB_STR("【GeoCrs::SetFromEpsgCode】epsgCode无效: ") + std::to_string(epsgCode));
 		return false;
 	}
 
-	OGRSpatialReference* srs = EnsureSpatialReferenceNoLock();
-	if (srs == nullptr)
+	std::lock_guard<std::recursive_mutex> lock(mutex);
+
+	std::unique_ptr<OGRSpatialReference, GeoCrsOgrSrsDeleter> newSrs = CreateOgrSpatialReferencePtr();
+	if (!newSrs)
 	{
-		GBLOG_WARNING(GB_STR("【GeoCrs::SetFromEpsgCode】空的 srs。"));
+		GBLOG_WARNING(GB_STR("【GeoCrs::SetFromEpsgCode】创建 srs 失败。"));
 		return false;
 	}
 
 	CPLPushErrorHandler(CPLQuietErrorHandler);
 	CPLErrorReset();
-	const OGRErr err = srs->importFromEPSG(epsgCode);
+	const OGRErr err = newSrs->importFromEPSG(epsgCode);
 	const std::string lastErrorMessage = SafeCString(CPLGetLastErrorMsg());
 	CPLPopErrorHandler();
 	if (err != OGRERR_NONE)
@@ -1685,22 +1719,23 @@ bool GeoCrs::SetFromEpsgCode(int epsgCode)
 			message += GB_STR(", message=") + lastErrorMessage;
 		}
 		GBLOG_WARNING(message);
-		ResetNoLock();
 		return false;
 	}
 
-	ApplyAxisOrderStrategy(*srs, useTraditionalGisAxisOrder);
+	ApplyAxisOrderStrategy(*newSrs, useTraditionalGisAxisOrder);
+	if (!ValidatePreparedSpatialReference(*newSrs, GB_STR("【GeoCrs::SetFromEpsgCode】")))
+	{
+		return false;
+	}
+
+	spatialReference.swap(newSrs);
 	InvalidateCachesNoLock();
-	return IsValidNoLock();
+	return true;
 }
 
 
 bool GeoCrs::SetFromUserInput(const std::string& definitionUtf8, bool allowNetworkAccess, bool allowFileAccess)
 {
-	std::lock_guard<std::recursive_mutex> lock(mutex);
-
-	ResetNoLock();
-
 	const std::string trimmed = GB_Utf8Trim(definitionUtf8);
 	if (trimmed.empty())
 	{
@@ -1708,23 +1743,24 @@ bool GeoCrs::SetFromUserInput(const std::string& definitionUtf8, bool allowNetwo
 		return false;
 	}
 
-	OGRSpatialReference* srs = EnsureSpatialReferenceNoLock();
-	if (srs == nullptr)
+	std::lock_guard<std::recursive_mutex> lock(mutex);
+
+	std::unique_ptr<OGRSpatialReference, GeoCrsOgrSrsDeleter> newSrs = CreateOgrSpatialReferencePtr();
+	if (!newSrs)
 	{
-		GBLOG_WARNING(GB_STR("【GeoCrs::SetFromUserInput】空的 srs。"));
+		GBLOG_WARNING(GB_STR("【GeoCrs::SetFromUserInput】创建 srs 失败。"));
 		return false;
 	}
 
 	// GDAL 3.x 起，为了安全性，SetFromUserInput() 默认会带有访问限制（不允许网络/文件读取）。
 	// 若确需放开，需要使用带 options 的重载，显式传入 ALLOW_NETWORK_ACCESS / ALLOW_FILE_ACCESS。
-	// 参考 GDAL/OGR 文档：OGRSpatialReference::SetFromUserInput(pszDefinition, papszOptions)。
 	const char* const networkOption = allowNetworkAccess ? "ALLOW_NETWORK_ACCESS=YES" : "ALLOW_NETWORK_ACCESS=NO";
 	const char* const fileOption = allowFileAccess ? "ALLOW_FILE_ACCESS=YES" : "ALLOW_FILE_ACCESS=NO";
 	const char* const options[] = { networkOption, fileOption, nullptr };
 
 	CPLPushErrorHandler(CPLQuietErrorHandler);
 	CPLErrorReset();
-	const OGRErr err = srs->SetFromUserInput(trimmed.c_str(), options);
+	const OGRErr err = newSrs->SetFromUserInput(trimmed.c_str(), options);
 	const std::string lastErrorMessage = SafeCString(CPLGetLastErrorMsg());
 	CPLPopErrorHandler();
 
@@ -1736,11 +1772,7 @@ bool GeoCrs::SetFromUserInput(const std::string& definitionUtf8, bool allowNetwo
 		int epsgCode = 0;
 		if (TryExtractEpsgCodeFromOgcCrsUrn(trimmed, epsgCode))
 		{
-			const bool ok = SetFromEpsgCode(epsgCode);
-			if (ok)
-			{
-				return true;
-			}
+			return SetFromEpsgCode(epsgCode);
 		}
 
 		std::string message = GB_STR("【GeoCrs::SetFromUserInput】SetFromUserInput失败: err=") + std::to_string(static_cast<int>(err)) + GB_STR(", definition=") + trimmed;
@@ -1749,13 +1781,18 @@ bool GeoCrs::SetFromUserInput(const std::string& definitionUtf8, bool allowNetwo
 			message += GB_STR(", message=") + lastErrorMessage;
 		}
 		GBLOG_WARNING(message);
-		ResetNoLock();
 		return false;
 	}
 
-	ApplyAxisOrderStrategy(*srs, useTraditionalGisAxisOrder);
+	ApplyAxisOrderStrategy(*newSrs, useTraditionalGisAxisOrder);
+	if (!ValidatePreparedSpatialReference(*newSrs, GB_STR("【GeoCrs::SetFromUserInput】")))
+	{
+		return false;
+	}
+
+	spatialReference.swap(newSrs);
 	InvalidateCachesNoLock();
-	return IsValidNoLock();
+	return true;
 }
 
 
