@@ -52,10 +52,10 @@ namespace
 	constexpr int WheelZoomEndDetectionIntervalMs = 300;
 	constexpr int CrsValidAreaPolygonEdgeSampleCount = 129;
 	constexpr int MaxVectorBatchPointCount = 8192;
-	constexpr size_t MaxExactVectorDrawableCount = 80000;
-	constexpr size_t MaxFastLodDrawnDrawableCount = 60000;
-	constexpr int FastLodGridCellSizePixels = 6;
-	constexpr unsigned char FastLodMaxDrawCountPerCell = 2;
+	constexpr size_t MaxExactVectorDrawableCount = 30000;
+	constexpr size_t MaxFastLodDrawnDrawableCount = 24000;
+	constexpr int FastLodGridCellSizePixels = 8;
+	constexpr unsigned char FastLodMaxDrawCountPerCell = 1;
 	constexpr double MinimumFastLodScreenRectSizePixels = 1.25;
 	constexpr double MinimumVectorPaintMarginPixels = 1.0;
 	const std::string CrsValidAreaDrawableUid = "__QMainCanvas_CrsValidArea__";
@@ -681,6 +681,132 @@ namespace
 				if (isVisible(drawable) && extent.IsValid() && extent.IsIntersects(queryWorldExtent))
 				{
 					outIndices.push_back(drawableIndex);
+				}
+			}
+
+			if (node.firstChildIndex >= 0)
+			{
+				for (int childOffset = 0; childOffset < 4; childOffset++)
+				{
+					const size_t childNodeIndex = static_cast<size_t>(node.firstChildIndex + childOffset);
+					if (childNodeIndex < spatialIndex.nodes.size())
+					{
+						nodeStack.push_back(childNodeIndex);
+					}
+				}
+			}
+		}
+	}
+
+	template <typename TContainer, typename TGetExtent, typename TIsVisible>
+	bool CollectVisibleDrawableIndicesBySpatialIndexTreeLimited(const TContainer& drawables, const QMainCanvasSpatialIndex& spatialIndex,
+		const GB_Rectangle& queryWorldExtent, size_t maxCount, std::vector<size_t>& outIndices, TGetExtent getExtent, TIsVisible isVisible)
+	{
+		outIndices.clear();
+		if (maxCount == 0 || drawables.empty() || !spatialIndex.isValid || spatialIndex.nodes.empty() || !queryWorldExtent.IsValid())
+		{
+			return false;
+		}
+
+		outIndices.reserve(std::min(maxCount, drawables.size()));
+
+		std::vector<size_t> nodeStack;
+		nodeStack.reserve(64);
+		nodeStack.push_back(0);
+
+		while (!nodeStack.empty())
+		{
+			const size_t nodeIndex = nodeStack.back();
+			nodeStack.pop_back();
+			if (nodeIndex >= spatialIndex.nodes.size())
+			{
+				continue;
+			}
+
+			const QMainCanvasSpatialIndexNode& node = spatialIndex.nodes[nodeIndex];
+			if (!node.extent.IsValid() || !node.extent.IsIntersects(queryWorldExtent))
+			{
+				continue;
+			}
+
+			for (size_t drawableIndex : node.drawableIndices)
+			{
+				if (drawableIndex >= drawables.size())
+				{
+					continue;
+				}
+
+				const auto& drawable = drawables[drawableIndex];
+				const GB_Rectangle& extent = getExtent(drawable);
+				if (isVisible(drawable) && extent.IsValid() && extent.IsIntersects(queryWorldExtent))
+				{
+					outIndices.push_back(drawableIndex);
+					if (outIndices.size() >= maxCount)
+					{
+						return true;
+					}
+				}
+			}
+
+			if (node.firstChildIndex >= 0)
+			{
+				for (int childOffset = 0; childOffset < 4; childOffset++)
+				{
+					const size_t childNodeIndex = static_cast<size_t>(node.firstChildIndex + childOffset);
+					if (childNodeIndex < spatialIndex.nodes.size())
+					{
+						nodeStack.push_back(childNodeIndex);
+					}
+				}
+			}
+		}
+
+		return false;
+	}
+
+	template <typename TContainer, typename TGetExtent, typename TIsVisible, typename TCallback>
+	void ForEachVisibleDrawableIndexBySpatialIndexTree(const TContainer& drawables, const QMainCanvasSpatialIndex& spatialIndex,
+		const GB_Rectangle& queryWorldExtent, TGetExtent getExtent, TIsVisible isVisible, TCallback callback)
+	{
+		if (drawables.empty() || !spatialIndex.isValid || spatialIndex.nodes.empty() || !queryWorldExtent.IsValid())
+		{
+			return;
+		}
+
+		std::vector<size_t> nodeStack;
+		nodeStack.reserve(64);
+		nodeStack.push_back(0);
+
+		while (!nodeStack.empty())
+		{
+			const size_t nodeIndex = nodeStack.back();
+			nodeStack.pop_back();
+			if (nodeIndex >= spatialIndex.nodes.size())
+			{
+				continue;
+			}
+
+			const QMainCanvasSpatialIndexNode& node = spatialIndex.nodes[nodeIndex];
+			if (!node.extent.IsValid() || !node.extent.IsIntersects(queryWorldExtent))
+			{
+				continue;
+			}
+
+			for (size_t drawableIndex : node.drawableIndices)
+			{
+				if (drawableIndex >= drawables.size())
+				{
+					continue;
+				}
+
+				const auto& drawable = drawables[drawableIndex];
+				const GB_Rectangle& extent = getExtent(drawable);
+				if (isVisible(drawable) && extent.IsValid() && extent.IsIntersects(queryWorldExtent))
+				{
+					if (!callback(drawableIndex))
+					{
+						return;
+					}
 				}
 			}
 
@@ -2938,6 +3064,20 @@ void QMainCanvas::CollectVisiblePointDrawableIndices(const GB_Rectangle& queryWo
 		});
 }
 
+bool QMainCanvas::CollectVisiblePointDrawableIndicesLimited(const GB_Rectangle& queryWorldExtent, size_t maxCount, std::vector<size_t>& outIndices) const
+{
+	EnsurePointDrawableSpatialIndex();
+	return CollectVisibleDrawableIndicesBySpatialIndexTreeLimited(pointDrawables, pointDrawableSpatialIndexCache, queryWorldExtent, maxCount, outIndices,
+		[](const CachedPointDrawable& item) -> const GB_Rectangle&
+		{
+			return item.extent;
+		},
+		[](const CachedPointDrawable& item) -> bool
+		{
+			return item.point.visible;
+		});
+}
+
 void QMainCanvas::EnsurePolylineDrawableSpatialIndex() const
 {
 	if (!polylineDrawableSpatialIndexDirty)
@@ -2973,6 +3113,20 @@ void QMainCanvas::CollectVisiblePolylineDrawableIndices(const GB_Rectangle& quer
 		});
 }
 
+bool QMainCanvas::CollectVisiblePolylineDrawableIndicesLimited(const GB_Rectangle& queryWorldExtent, size_t maxCount, std::vector<size_t>& outIndices) const
+{
+	EnsurePolylineDrawableSpatialIndex();
+	return CollectVisibleDrawableIndicesBySpatialIndexTreeLimited(polylineDrawables, polylineDrawableSpatialIndexCache, queryWorldExtent, maxCount, outIndices,
+		[](const CachedPolylineDrawable& item) -> const GB_Rectangle&
+		{
+			return item.extent;
+		},
+		[](const CachedPolylineDrawable& item) -> bool
+		{
+			return item.polyline.visible;
+		});
+}
+
 void QMainCanvas::EnsurePolygonDrawableSpatialIndex() const
 {
 	if (!polygonDrawableSpatialIndexDirty)
@@ -2998,6 +3152,20 @@ void QMainCanvas::CollectVisiblePolygonDrawableIndices(const GB_Rectangle& query
 {
 	EnsurePolygonDrawableSpatialIndex();
 	CollectVisibleDrawableIndicesBySpatialIndexTree(polygonDrawables, polygonDrawableSpatialIndexCache, queryWorldExtent, outIndices,
+		[](const CachedPolygonDrawable& item) -> const GB_Rectangle&
+		{
+			return item.extent;
+		},
+		[](const CachedPolygonDrawable& item) -> bool
+		{
+			return item.polygon.visible;
+		});
+}
+
+bool QMainCanvas::CollectVisiblePolygonDrawableIndicesLimited(const GB_Rectangle& queryWorldExtent, size_t maxCount, std::vector<size_t>& outIndices) const
+{
+	EnsurePolygonDrawableSpatialIndex();
+	return CollectVisibleDrawableIndicesBySpatialIndexTreeLimited(polygonDrawables, polygonDrawableSpatialIndexCache, queryWorldExtent, maxCount, outIndices,
 		[](const CachedPolygonDrawable& item) -> const GB_Rectangle&
 		{
 			return item.extent;
@@ -3497,35 +3665,43 @@ void QMainCanvas::DrawDrawables(QPainter& painter, const QRectF& exposedRect) co
 	const GB_Rectangle polylineDrawQueryWorldExtent = ExpandedWorldQueryExtent(baseQueryWorldExtent, GetMaxPolylineDrawableScreenMarginPixels(), pixelSize);
 	const GB_Rectangle polygonDrawQueryWorldExtent = ExpandedWorldQueryExtent(baseQueryWorldExtent, GetMaxPolygonDrawableScreenMarginPixels(), pixelSize);
 
+	bool vectorDrawableLimitReached = false;
+	size_t remainingExactCollectCount = MaxExactVectorDrawableCount + 1;
+
 	if (!pointDrawables.empty())
 	{
-		CollectVisiblePointDrawableIndices(pointDrawQueryWorldExtent, pointDrawableVisibleIndexScratch);
+		const bool limitReached = CollectVisiblePointDrawableIndicesLimited(pointDrawQueryWorldExtent, remainingExactCollectCount, pointDrawableVisibleIndexScratch);
+		vectorDrawableLimitReached = vectorDrawableLimitReached || limitReached;
+		remainingExactCollectCount = pointDrawableVisibleIndexScratch.size() >= remainingExactCollectCount ? 0 : remainingExactCollectCount - pointDrawableVisibleIndexScratch.size();
 	}
 	else
 	{
 		pointDrawableVisibleIndexScratch.clear();
 	}
 
-	if (!polylineDrawables.empty())
+	if (!vectorDrawableLimitReached && !polylineDrawables.empty())
 	{
-		CollectVisiblePolylineDrawableIndices(polylineDrawQueryWorldExtent, polylineDrawableVisibleIndexScratch);
+		const bool limitReached = CollectVisiblePolylineDrawableIndicesLimited(polylineDrawQueryWorldExtent, remainingExactCollectCount, polylineDrawableVisibleIndexScratch);
+		vectorDrawableLimitReached = vectorDrawableLimitReached || limitReached;
+		remainingExactCollectCount = polylineDrawableVisibleIndexScratch.size() >= remainingExactCollectCount ? 0 : remainingExactCollectCount - polylineDrawableVisibleIndexScratch.size();
 	}
 	else
 	{
 		polylineDrawableVisibleIndexScratch.clear();
 	}
 
-	if (!polygonDrawables.empty())
+	if (!vectorDrawableLimitReached && !polygonDrawables.empty())
 	{
-		CollectVisiblePolygonDrawableIndices(polygonDrawQueryWorldExtent, polygonDrawableVisibleIndexScratch);
+		const bool limitReached = CollectVisiblePolygonDrawableIndicesLimited(polygonDrawQueryWorldExtent, remainingExactCollectCount, polygonDrawableVisibleIndexScratch);
+		vectorDrawableLimitReached = vectorDrawableLimitReached || limitReached;
 	}
 	else
 	{
 		polygonDrawableVisibleIndexScratch.clear();
 	}
 
-	const size_t visibleVectorDrawableCount = pointDrawableVisibleIndexScratch.size() + polylineDrawableVisibleIndexScratch.size() + polygonDrawableVisibleIndexScratch.size();
-	if (mapTileVisibleIndexScratch.empty() && visibleVectorDrawableCount == 0)
+	const size_t exactCollectedVectorDrawableCount = pointDrawableVisibleIndexScratch.size() + polylineDrawableVisibleIndexScratch.size() + polygonDrawableVisibleIndexScratch.size();
+	if (mapTileVisibleIndexScratch.empty() && exactCollectedVectorDrawableCount == 0 && !vectorDrawableLimitReached)
 	{
 		return;
 	}
@@ -3533,10 +3709,10 @@ void QMainCanvas::DrawDrawables(QPainter& painter, const QRectF& exposedRect) co
 	painter.setRenderHint(QPainter::Antialiasing, false);
 	painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
 
-	if (visibleVectorDrawableCount <= MaxExactVectorDrawableCount)
+	if (!vectorDrawableLimitReached && exactCollectedVectorDrawableCount <= MaxExactVectorDrawableCount)
 	{
 		visibleDrawableReferenceScratch.clear();
-		visibleDrawableReferenceScratch.reserve(mapTileVisibleIndexScratch.size() + visibleVectorDrawableCount);
+		visibleDrawableReferenceScratch.reserve(mapTileVisibleIndexScratch.size() + exactCollectedVectorDrawableCount);
 
 		for (size_t mapTileIndex : mapTileVisibleIndexScratch)
 		{
@@ -3570,8 +3746,7 @@ void QMainCanvas::DrawDrawables(QPainter& painter, const QRectF& exposedRect) co
 			}
 		}
 
-		DrawVectorDrawablesFastLod(painter, safeExposedRect, pointDrawQueryWorldExtent, polylineDrawQueryWorldExtent, polygonDrawQueryWorldExtent,
-			pointDrawableVisibleIndexScratch, polylineDrawableVisibleIndexScratch, polygonDrawableVisibleIndexScratch);
+		DrawVectorDrawablesFastLod(painter, safeExposedRect, pointDrawQueryWorldExtent, polylineDrawQueryWorldExtent, polygonDrawQueryWorldExtent);
 	}
 
 	painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
@@ -3627,8 +3802,7 @@ void QMainCanvas::DrawVisibleDrawableReferencesExact(QPainter& painter, const QR
 }
 
 void QMainCanvas::DrawVectorDrawablesFastLod(QPainter& painter, const QRectF& exposedRect, const GB_Rectangle& pointDrawQueryWorldExtent,
-	const GB_Rectangle& polylineDrawQueryWorldExtent, const GB_Rectangle& polygonDrawQueryWorldExtent,
-	const std::vector<size_t>& pointIndices, const std::vector<size_t>& polylineIndices, const std::vector<size_t>& polygonIndices) const
+	const GB_Rectangle& polylineDrawQueryWorldExtent, const GB_Rectangle& polygonDrawQueryWorldExtent) const
 {
 	const auto MakeUsableScreenRect = [](const QRectF& inputRect) -> QRectF
 		{
@@ -3653,114 +3827,199 @@ void QMainCanvas::DrawVectorDrawablesFastLod(QPainter& painter, const QRectF& ex
 			return rect;
 		};
 
-	VectorLodPaintGrid polygonLodGrid(exposedRect, FastLodGridCellSizePixels, FastLodMaxDrawCountPerCell);
-	size_t drawnPolygonCount = 0;
-	for (size_t polygonIndex : polygonIndices)
+	if (!polygonDrawables.empty() && polygonDrawQueryWorldExtent.IsValid())
 	{
-		if (polygonLodGrid.IsFullySaturated())
-		{
-			break;
-		}
-		if (drawnPolygonCount >= MaxFastLodDrawnDrawableCount)
-		{
-			break;
-		}
-		if (polygonIndex >= polygonDrawables.size())
-		{
-			continue;
-		}
+		EnsurePolygonDrawableSpatialIndex();
+		VectorLodPaintGrid polygonLodGrid(exposedRect, FastLodGridCellSizePixels, FastLodMaxDrawCountPerCell);
+		size_t drawnPolygonCount = 0;
+		ForEachVisibleDrawableIndexBySpatialIndexTree(polygonDrawables, polygonDrawableSpatialIndexCache, polygonDrawQueryWorldExtent,
+			[](const CachedPolygonDrawable& item) -> const GB_Rectangle&
+			{
+				return item.extent;
+			},
+			[](const CachedPolygonDrawable& item) -> bool
+			{
+				return item.polygon.visible;
+			},
+			[this, &painter, &exposedRect, &polygonDrawQueryWorldExtent, &polygonLodGrid, &drawnPolygonCount, &MakeUsableScreenRect](size_t polygonIndex) -> bool
+			{
+				if (polygonLodGrid.IsFullySaturated() || drawnPolygonCount >= MaxFastLodDrawnDrawableCount)
+				{
+					return false;
+				}
 
-		const CachedPolygonDrawable& cachedPolygon = polygonDrawables[polygonIndex];
-		if (!cachedPolygon.polygon.visible || !cachedPolygon.extent.IsValid() || !cachedPolygon.extent.IsIntersects(polygonDrawQueryWorldExtent))
-		{
-			continue;
-		}
+				if (polygonIndex >= polygonDrawables.size())
+				{
+					return true;
+				}
 
-		GB_Rectangle clippedExtent = cachedPolygon.extent.Intersected(polygonDrawQueryWorldExtent);
-		QRectF screenRect = MakeUsableScreenRect(WorldRectangleToScreenRectangle(clippedExtent).adjusted(-cachedPolygon.screenMarginPixels, -cachedPolygon.screenMarginPixels, cachedPolygon.screenMarginPixels, cachedPolygon.screenMarginPixels));
-		if (!polygonLodGrid.TryAccept(screenRect))
-		{
-			continue;
-		}
+				const CachedPolygonDrawable& cachedPolygon = polygonDrawables[polygonIndex];
+				const GB_Rectangle clippedExtent = cachedPolygon.extent.Intersected(polygonDrawQueryWorldExtent);
+				if (!clippedExtent.IsValid())
+				{
+					return true;
+				}
 
-		DrawCachedPolygonDrawable(painter, cachedPolygon, polygonDrawQueryWorldExtent, exposedRect);
-		drawnPolygonCount++;
+				QRectF screenRect = MakeUsableScreenRect(WorldRectangleToScreenRectangle(clippedExtent).adjusted(-cachedPolygon.screenMarginPixels, -cachedPolygon.screenMarginPixels, cachedPolygon.screenMarginPixels, cachedPolygon.screenMarginPixels));
+				if (!polygonLodGrid.TryAccept(screenRect))
+				{
+					return true;
+				}
+
+				DrawCachedPolygonDrawableFastLod(painter, cachedPolygon, polygonDrawQueryWorldExtent, exposedRect);
+				drawnPolygonCount++;
+				return !(polygonLodGrid.IsFullySaturated() || drawnPolygonCount >= MaxFastLodDrawnDrawableCount);
+			});
 	}
 
-	VectorLodPaintGrid polylineLodGrid(exposedRect, FastLodGridCellSizePixels, FastLodMaxDrawCountPerCell);
-	size_t drawnPolylineCount = 0;
-	for (size_t polylineIndex : polylineIndices)
+	if (!polylineDrawables.empty() && polylineDrawQueryWorldExtent.IsValid())
 	{
-		if (polylineLodGrid.IsFullySaturated())
-		{
-			break;
-		}
-		if (drawnPolylineCount >= MaxFastLodDrawnDrawableCount)
-		{
-			break;
-		}
-		if (polylineIndex >= polylineDrawables.size())
-		{
-			continue;
-		}
+		EnsurePolylineDrawableSpatialIndex();
+		VectorLodPaintGrid polylineLodGrid(exposedRect, FastLodGridCellSizePixels, FastLodMaxDrawCountPerCell);
+		size_t drawnPolylineCount = 0;
+		ForEachVisibleDrawableIndexBySpatialIndexTree(polylineDrawables, polylineDrawableSpatialIndexCache, polylineDrawQueryWorldExtent,
+			[](const CachedPolylineDrawable& item) -> const GB_Rectangle&
+			{
+				return item.extent;
+			},
+			[](const CachedPolylineDrawable& item) -> bool
+			{
+				return item.polyline.visible;
+			},
+			[this, &painter, &exposedRect, &polylineDrawQueryWorldExtent, &polylineLodGrid, &drawnPolylineCount, &MakeUsableScreenRect](size_t polylineIndex) -> bool
+			{
+				if (polylineLodGrid.IsFullySaturated() || drawnPolylineCount >= MaxFastLodDrawnDrawableCount)
+				{
+					return false;
+				}
 
-		const CachedPolylineDrawable& cachedPolyline = polylineDrawables[polylineIndex];
-		if (!cachedPolyline.polyline.visible || !cachedPolyline.extent.IsValid() || !cachedPolyline.extent.IsIntersects(polylineDrawQueryWorldExtent))
-		{
-			continue;
-		}
+				if (polylineIndex >= polylineDrawables.size())
+				{
+					return true;
+				}
 
-		GB_Rectangle clippedExtent = cachedPolyline.extent.Intersected(polylineDrawQueryWorldExtent);
-		QRectF screenRect = MakeUsableScreenRect(WorldRectangleToScreenRectangle(clippedExtent).adjusted(-cachedPolyline.screenMarginPixels, -cachedPolyline.screenMarginPixels, cachedPolyline.screenMarginPixels, cachedPolyline.screenMarginPixels));
-		if (!polylineLodGrid.TryAccept(screenRect))
-		{
-			continue;
-		}
+				const CachedPolylineDrawable& cachedPolyline = polylineDrawables[polylineIndex];
+				const GB_Rectangle clippedExtent = cachedPolyline.extent.Intersected(polylineDrawQueryWorldExtent);
+				if (!clippedExtent.IsValid())
+				{
+					return true;
+				}
 
-		DrawCachedPolylineDrawable(painter, cachedPolyline, polylineDrawQueryWorldExtent, exposedRect);
-		drawnPolylineCount++;
+				QRectF screenRect = MakeUsableScreenRect(WorldRectangleToScreenRectangle(clippedExtent).adjusted(-cachedPolyline.screenMarginPixels, -cachedPolyline.screenMarginPixels, cachedPolyline.screenMarginPixels, cachedPolyline.screenMarginPixels));
+				if (!polylineLodGrid.TryAccept(screenRect))
+				{
+					return true;
+				}
+
+				DrawCachedPolylineDrawableFastLod(painter, cachedPolyline, polylineDrawQueryWorldExtent, exposedRect);
+				drawnPolylineCount++;
+				return !(polylineLodGrid.IsFullySaturated() || drawnPolylineCount >= MaxFastLodDrawnDrawableCount);
+			});
 	}
 
-	VectorLodPaintGrid pointLodGrid(exposedRect, FastLodGridCellSizePixels, FastLodMaxDrawCountPerCell);
-	size_t drawnPointCount = 0;
-	for (size_t pointIndex : pointIndices)
+	if (!pointDrawables.empty() && pointDrawQueryWorldExtent.IsValid())
 	{
-		if (pointLodGrid.IsFullySaturated())
-		{
-			break;
-		}
-		if (drawnPointCount >= MaxFastLodDrawnDrawableCount)
-		{
-			break;
-		}
-		if (pointIndex >= pointDrawables.size())
-		{
-			continue;
-		}
+		EnsurePointDrawableSpatialIndex();
+		VectorLodPaintGrid pointLodGrid(exposedRect, FastLodGridCellSizePixels, FastLodMaxDrawCountPerCell);
+		size_t drawnPointCount = 0;
+		ForEachVisibleDrawableIndexBySpatialIndexTree(pointDrawables, pointDrawableSpatialIndexCache, pointDrawQueryWorldExtent,
+			[](const CachedPointDrawable& item) -> const GB_Rectangle&
+			{
+				return item.extent;
+			},
+			[](const CachedPointDrawable& item) -> bool
+			{
+				return item.point.visible;
+			},
+			[this, &painter, &exposedRect, &pointDrawQueryWorldExtent, &pointLodGrid, &drawnPointCount, &MakeUsableScreenRect](size_t pointIndex) -> bool
+			{
+				if (pointLodGrid.IsFullySaturated() || drawnPointCount >= MaxFastLodDrawnDrawableCount)
+				{
+					return false;
+				}
 
-		const CachedPointDrawable& cachedPoint = pointDrawables[pointIndex];
-		if (!cachedPoint.point.visible || !cachedPoint.extent.IsValid() || !cachedPoint.extent.IsIntersects(pointDrawQueryWorldExtent))
-		{
-			continue;
-		}
+				if (pointIndex >= pointDrawables.size())
+				{
+					return true;
+				}
 
-		const GB_Point2d screenPoint = WorldToScreen(cachedPoint.point.position);
-		if (!screenPoint.IsValid())
-		{
-			continue;
-		}
+				const CachedPointDrawable& cachedPoint = pointDrawables[pointIndex];
+				const GB_Point2d screenPoint = WorldToScreen(cachedPoint.point.position);
+				if (!screenPoint.IsValid())
+				{
+					return true;
+				}
 
-		const double halfSize = std::max(1.0, static_cast<double>(cachedPoint.point.symbolSize) * 0.5 + cachedPoint.screenMarginPixels);
-		QRectF screenRect(screenPoint.x - halfSize, screenPoint.y - halfSize, halfSize * 2.0, halfSize * 2.0);
-		screenRect = MakeUsableScreenRect(screenRect);
-		if (!pointLodGrid.TryAccept(screenRect))
-		{
-			continue;
-		}
+				const double halfSize = std::max(1.0, static_cast<double>(cachedPoint.point.symbolSize) * 0.5 + cachedPoint.screenMarginPixels);
+				QRectF screenRect(screenPoint.x - halfSize, screenPoint.y - halfSize, halfSize * 2.0, halfSize * 2.0);
+				screenRect = MakeUsableScreenRect(screenRect);
+				if (!pointLodGrid.TryAccept(screenRect))
+				{
+					return true;
+				}
 
-		DrawCachedPointDrawable(painter, cachedPoint, pointDrawQueryWorldExtent, exposedRect);
-		drawnPointCount++;
+				DrawCachedPointDrawableFastLod(painter, cachedPoint, pointDrawQueryWorldExtent, exposedRect);
+				drawnPointCount++;
+				return !(pointLodGrid.IsFullySaturated() || drawnPointCount >= MaxFastLodDrawnDrawableCount);
+			});
 	}
+}
+
+void QMainCanvas::DrawCachedPointDrawableFastLod(QPainter& painter, const CachedPointDrawable& cachedPoint, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const
+{
+	DrawCachedPointDrawable(painter, cachedPoint, queryWorldExtent, exposedRect);
+}
+
+void QMainCanvas::DrawCachedPolylineDrawableFastLod(QPainter& painter, const CachedPolylineDrawable& cachedPolyline, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const
+{
+	if (!cachedPolyline.polyline.visible || cachedPolyline.polyline.vertices.size() < 2 || cachedPolyline.polyline.lineWidth <= 0 || cachedPolyline.polyline.lineColor.IsTransparent())
+	{
+		return;
+	}
+
+	if (!cachedPolyline.extent.IsValid() || !cachedPolyline.extent.IsIntersects(queryWorldExtent))
+	{
+		return;
+	}
+
+	const GB_Rectangle clippedExtent = cachedPolyline.extent.Intersected(queryWorldExtent);
+	if (!clippedExtent.IsValid())
+	{
+		return;
+	}
+
+	QRectF screenRect = WorldRectangleToScreenRectangle(clippedExtent).adjusted(-cachedPolyline.screenMarginPixels, -cachedPolyline.screenMarginPixels, cachedPolyline.screenMarginPixels, cachedPolyline.screenMarginPixels);
+	if (!screenRect.isValid() || screenRect.isEmpty() || !screenRect.intersects(exposedRect))
+	{
+		return;
+	}
+
+	const QPointF center = screenRect.center();
+	QPointF startPoint;
+	QPointF endPoint;
+	if (screenRect.width() >= screenRect.height())
+	{
+		startPoint = QPointF(screenRect.left(), center.y());
+		endPoint = QPointF(screenRect.right(), center.y());
+	}
+	else
+	{
+		startPoint = QPointF(center.x(), screenRect.top());
+		endPoint = QPointF(center.x(), screenRect.bottom());
+	}
+
+	QPen pen(ToQColor(cachedPolyline.polyline.lineColor), std::max(1, cachedPolyline.polyline.lineWidth), Qt::SolidLine, Qt::SquareCap, Qt::MiterJoin);
+	painter.setPen(pen);
+	painter.setBrush(Qt::NoBrush);
+	painter.drawLine(startPoint, endPoint);
+}
+
+void QMainCanvas::DrawCachedPolygonDrawableFastLod(QPainter& painter, const CachedPolygonDrawable& cachedPolygon, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const
+{
+	// Fast LOD 只负责“少画多少个对象”，不应改变单个 PolygonDrawable 的几何语义。
+	// 旧实现用 extent 的屏幕包围盒 fillRect/drawRect 表示多边形，缩小到 LOD 阈值后会把所有面对象显示成矩形。
+	// 这里改回对已被 LOD 网格选中的少量多边形执行精确绘制，避免视觉上把任意多边形退化为矩形。
+	DrawCachedPolygonDrawable(painter, cachedPolygon, queryWorldExtent, exposedRect);
 }
 
 void QMainCanvas::DrawCachedMapTile(QPainter& painter, const CachedMapTile& cachedTile, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect,

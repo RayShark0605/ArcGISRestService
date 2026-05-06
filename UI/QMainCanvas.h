@@ -304,12 +304,15 @@ private:
 	void EnsurePointDrawableSpatialIndex() const;
 	void InvalidatePointDrawableSpatialIndex() const;
 	void CollectVisiblePointDrawableIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const;
+	bool CollectVisiblePointDrawableIndicesLimited(const GB_Rectangle& queryWorldExtent, size_t maxCount, std::vector<size_t>& outIndices) const;
 	void EnsurePolylineDrawableSpatialIndex() const;
 	void InvalidatePolylineDrawableSpatialIndex() const;
 	void CollectVisiblePolylineDrawableIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const;
+	bool CollectVisiblePolylineDrawableIndicesLimited(const GB_Rectangle& queryWorldExtent, size_t maxCount, std::vector<size_t>& outIndices) const;
 	void EnsurePolygonDrawableSpatialIndex() const;
 	void InvalidatePolygonDrawableSpatialIndex() const;
 	void CollectVisiblePolygonDrawableIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const;
+	bool CollectVisiblePolygonDrawableIndicesLimited(const GB_Rectangle& queryWorldExtent, size_t maxCount, std::vector<size_t>& outIndices) const;
 	void InvalidateVectorDrawableSpatialIndexes() const;
 	void InvalidateVectorDrawableMaxScreenMarginCaches() const;
 	double GetMaxPointDrawableScreenMarginPixels() const;
@@ -321,8 +324,11 @@ private:
 	void DrawCachedPointDrawable(QPainter& painter, const CachedPointDrawable& cachedPoint, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const;
 	void DrawCachedPolylineDrawable(QPainter& painter, const CachedPolylineDrawable& cachedPolyline, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const;
 	void DrawCachedPolygonDrawable(QPainter& painter, const CachedPolygonDrawable& cachedPolygon, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const;
+	void DrawCachedPointDrawableFastLod(QPainter& painter, const CachedPointDrawable& cachedPoint, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const;
+	void DrawCachedPolylineDrawableFastLod(QPainter& painter, const CachedPolylineDrawable& cachedPolyline, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const;
+	void DrawCachedPolygonDrawableFastLod(QPainter& painter, const CachedPolygonDrawable& cachedPolygon, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const;
 	void DrawVisibleDrawableReferencesExact(QPainter& painter, const QRectF& exposedRect, const GB_Rectangle& mapTileQueryWorldExtent, const GB_Rectangle& pointDrawQueryWorldExtent, const GB_Rectangle& polylineDrawQueryWorldExtent, const GB_Rectangle& polygonDrawQueryWorldExtent, const QPainterPath* crsClipPath, bool hasPreciseCrsClip, bool canUseCrsPolygonExtents) const;
-	void DrawVectorDrawablesFastLod(QPainter& painter, const QRectF& exposedRect, const GB_Rectangle& pointDrawQueryWorldExtent, const GB_Rectangle& polylineDrawQueryWorldExtent, const GB_Rectangle& polygonDrawQueryWorldExtent, const std::vector<size_t>& pointIndices, const std::vector<size_t>& polylineIndices, const std::vector<size_t>& polygonIndices) const;
+	void DrawVectorDrawablesFastLod(QPainter& painter, const QRectF& exposedRect, const GB_Rectangle& pointDrawQueryWorldExtent, const GB_Rectangle& polylineDrawQueryWorldExtent, const GB_Rectangle& polygonDrawQueryWorldExtent) const;
 	void DrawCoordinateAxes(QPainter& painter) const;
 	void DrawCrsValidArea(QPainter& painter) const;
 	void DrawMapContent(QPainter& painter, const QRectF& exposedRect) const;
