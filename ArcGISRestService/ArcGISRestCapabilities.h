@@ -74,7 +74,7 @@ struct CalculateImageRequestItemsInput
 	std::string layerId = "";
 	std::string imageFormat = "";
 	const ArcGISRestServiceInfo* serviceInfo = nullptr;
-	
+
 	bool isTiled = false;
 	bool isImageServer = false;
 	int dpi = 96;

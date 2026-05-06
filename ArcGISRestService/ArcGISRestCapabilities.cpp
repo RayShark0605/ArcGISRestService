@@ -820,6 +820,42 @@ namespace
 		return GB_Md5Hash(nodeFeatureText);
 	}
 
+	inline bool UrlEndsWithArcGISServiceType(const std::string& url, const std::string& serviceType)
+	{
+		std::string normalizedUrl = GB_UrlOperator::GetUrlBase(url);
+		if (normalizedUrl.empty())
+		{
+			normalizedUrl = url;
+		}
+
+		while (!normalizedUrl.empty() && normalizedUrl.back() == '/')
+		{
+			normalizedUrl.pop_back();
+		}
+
+		return GB_Utf8EndsWith(normalizedUrl, "/" + serviceType, false);
+	}
+
+	inline bool IsImageServiceRootNode(const ArcGISRestServiceInfo& serviceInfo, const ArcGISRestServiceTreeNode& node)
+	{
+		if (node.type == ArcGISRestServiceTreeNode::NodeType::ImageService || UrlEndsWithArcGISServiceType(node.url, "ImageServer"))
+		{
+			return true;
+		}
+
+		const auto serviceDataTypeIter = serviceInfo.rawJsonMap.find("serviceDataType");
+		if (serviceDataTypeIter != serviceInfo.rawJsonMap.end())
+		{
+			const std::string serviceDataType = serviceDataTypeIter->second.ToString();
+			if (GB_Utf8Find(serviceDataType, "ImageService", false) >= 0)
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
 	inline ArcGISRestServiceTreeNode::NodeType GetVectorLayerNodeType(const ArcGISMapServiceLayerEntry& layerEntry)
 	{
 		if (GB_Utf8Equals(layerEntry.geometryType, "esriGeometryPoint", false) || GB_Utf8Equals(layerEntry.geometryType, "esriGeometryMultipoint", false))
@@ -1473,9 +1509,13 @@ bool BuildArcGISRestServiceTree(const ArcGISRestServiceInfo& serviceInfo, ArcGIS
 	}
 	else if (serviceInfo.resourceType == ArcGISRestResourceType::Service)
 	{
-		// 根据 capabilities 字段判断服务是否具有 Vector（Query）和 Raster（Map）能力
-		bool hasVectorEntry = false, hasRasterEntry = false;
-		bool isImageService = false;
+		const bool isImageService = IsImageServiceRootNode(serviceInfo, node);
+
+		// 根据 capabilities 字段判断服务是否具有 Vector（Query）和 Raster（Map）能力。
+		// ImageServer 本身就是服务级栅格影像源，Query/Catalog 表示影像目录能力，不能当成普通矢量图层入口。
+		bool hasVectorEntry = false;
+		bool hasRasterEntry = isImageService;
+		if (!isImageService)
 		{
 			for (const std::string& capability : serviceInfo.capabilities)
 			{
@@ -1485,17 +1525,6 @@ bool BuildArcGISRestServiceTree(const ArcGISRestServiceInfo& serviceInfo, ArcGIS
 				}
 				else if (GB_Utf8Equals(capability, "Map", false))
 				{
-					hasRasterEntry = true;
-				}
-			}
-			if (serviceInfo.rawJsonMap.find("serviceDataType") != serviceInfo.rawJsonMap.end())
-			{
-				// 如果是 esriImageService, 则强制同时认为具有 Map 和 Query 能力
-				const std::string serviceDataType = serviceInfo.rawJsonMap.at("serviceDataType").ToString();
-				if (GB_Utf8Find(serviceDataType, "ImageService", false) >= 0)
-				{
-					isImageService = true;
-					hasVectorEntry = true;
 					hasRasterEntry = true;
 				}
 			}
@@ -1559,8 +1588,9 @@ bool BuildArcGISRestServiceTree(const ArcGISRestServiceInfo& serviceInfo, ArcGIS
 			return GB_Utf8CompareLogical(a.text, b.text) < 0;
 			});
 
-		// 如果有多个图层，并且服务支持导出图片，则在图层列表顶部添加一个“全部图层”的节点
-		if (serviceInfo.layers.size() > 1 && !serviceInfo.supportedImageFormatTypes.empty() && !node.children.empty())
+		// 如果有多个图层，并且服务支持导出图片，则在图层列表顶部添加一个“全部图层”的节点。
+		// ImageServer 的可导入入口是服务本身，不应伪装为 MapServer 风格的 all-layers 子图层。
+		if (!isImageService && serviceInfo.layers.size() > 1 && !serviceInfo.supportedImageFormatTypes.empty() && !node.children.empty())
 		{
 			ArcGISRestServiceTreeNode allLayersNode;
 			allLayersNode.type = NodeType::AllLayers;
@@ -1578,15 +1608,37 @@ bool BuildArcGISRestServiceTree(const ArcGISRestServiceInfo& serviceInfo, ArcGIS
 			node.children.insert(node.children.begin(), allLayersNode);
 		}
 
-		if (isImageService && node.children.empty())
+		// ImageServer 没有 MapServer 意义上的 layerId。为了保持服务浏览面板与其它服务一致，
+		// ImageService 服务节点本身仅作为可展开容器，真正可拖入画布的是下面这个服务级栅格子节点。
+		// 子节点 URL 仍然指向 ImageServer 服务根 URL，后续导入流程会根据父服务类型识别为 ImageServer，
+		// 并通过 /exportImage 请求影像，不会拼接 MapServer 风格的 layers=show:<layerId>。
+		if (isImageService)
 		{
-			ArcGISRestServiceTreeNode imageServiceNode;
-			imageServiceNode.type = NodeType::RasterLayer;
-			imageServiceNode.text = (serviceInfo.name.empty() ? node.text : serviceInfo.name);
-			imageServiceNode.url = node.url;
-			imageServiceNode.uid = CalculateTreeNodeUid(imageServiceNode.type, imageServiceNode.text, imageServiceNode.url);
-			imageServiceNode.parentUid = node.uid;
-			node.children.push_back(imageServiceNode);
+			bool hasServiceLevelRasterNode = false;
+			for (const ArcGISRestServiceTreeNode& child : node.children)
+			{
+				if (child.type == NodeType::RasterLayer && GB_Utf8Equals(child.url, node.url, false))
+				{
+					hasServiceLevelRasterNode = true;
+					break;
+				}
+			}
+
+			if (!hasServiceLevelRasterNode)
+			{
+				ArcGISRestServiceTreeNode imageLayerNode;
+				imageLayerNode.type = NodeType::RasterLayer;
+				imageLayerNode.text = !node.text.empty() ? node.text : serviceInfo.name;
+				if (imageLayerNode.text.empty())
+				{
+					imageLayerNode.text = GB_STR("ImageServer 影像图层");
+				}
+				imageLayerNode.url = node.url;
+				imageLayerNode.uid = CalculateTreeNodeUid(imageLayerNode.type, imageLayerNode.text, imageLayerNode.url);
+				imageLayerNode.parentUid = node.uid;
+				imageLayerNode.serviceInfo = serviceInfo;
+				node.children.insert(node.children.begin(), std::move(imageLayerNode));
+			}
 		}
 	}
 	node.serviceInfo = serviceInfo;

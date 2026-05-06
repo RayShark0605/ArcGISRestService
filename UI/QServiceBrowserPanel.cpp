@@ -1626,7 +1626,7 @@ QTreeWidgetItem* QServiceBrowserPanel::CreateTreeItemFromArcGISRestNode(const Ar
 		return nullptr;
 	}
 
-	const bool canDrag = CanDragArcGISRestNodeByDefault(node.type);
+	bool canDrag = CanDragArcGISRestNodeByDefault(node.type);
 	const bool hasLazyChildren = ShouldShowLazyExpandableIndicator(node, showLazyExpandableIndicators);
 
 	QTreeWidgetItem* item = new QTreeWidgetItem();
@@ -1964,7 +1964,7 @@ void QServiceBrowserPanel::RestoreArcGISRestNodeLazyExpansionState(const ArcGISR
 		return;
 	}
 
-	const bool canDrag = CanDragArcGISRestNodeByDefault(node.type);
+	bool canDrag = CanDragArcGISRestNodeByDefault(node.type);
 	const bool hasLazyChildren = ShouldShowLazyExpandableIndicator(node, showLazyExpandableIndicators);
 
 	RemoveChildrenAndUnregister(item);
@@ -2822,7 +2822,9 @@ bool QServiceBrowserPanel::BuildArcGISRestLayerImportRequest(QTreeWidgetItem* it
 	const ArcGISRestServiceTreeNode::NodeType requestNodeType = static_cast<ArcGISRestServiceTreeNode::NodeType>(nodeInfo.nodeType);
 	const ArcGISRestServiceTreeNode::NodeType serviceNodeType = static_cast<ArcGISRestServiceTreeNode::NodeType>(serviceItem->data(0, RoleNodeType).toInt());
 	const std::string layerId = ExtractLayerIdForImport(item, serviceUrl, serviceInfoHolder.get());
-	if (requestNodeType != ArcGISRestServiceTreeNode::NodeType::AllLayers && layerId.empty() && !IsArcGISRestServiceNodeType(requestNodeType))
+	const bool allowEmptyLayerId = (serviceNodeType == ArcGISRestServiceTreeNode::NodeType::ImageService) ||
+		(requestNodeType == ArcGISRestServiceTreeNode::NodeType::ImageService);
+	if (requestNodeType != ArcGISRestServiceTreeNode::NodeType::AllLayers && layerId.empty() && !IsArcGISRestServiceNodeType(requestNodeType) && !allowEmptyLayerId)
 	{
 		if (errorMessage)
 		{
@@ -3190,7 +3192,6 @@ bool QServiceBrowserPanel::CanDragArcGISRestNodeByDefault(ArcGISRestServiceTreeN
 	case ArcGISRestServiceTreeNode::NodeType::Root:
 	case ArcGISRestServiceTreeNode::NodeType::Folder:
 	case ArcGISRestServiceTreeNode::NodeType::MapService:
-	case ArcGISRestServiceTreeNode::NodeType::ImageService:
 	case ArcGISRestServiceTreeNode::NodeType::FeatureService:
 	case ArcGISRestServiceTreeNode::NodeType::Table:
 	default:
