@@ -32,7 +32,6 @@ class QPainterPath;
 class QResizeEvent;
 class QWheelEvent;
 
-class MapTile;
 class QMainCanvas : public QWidget
 {
 	Q_OBJECT
@@ -78,9 +77,31 @@ public:
 	GB_Point2d ScreenToWorld(const GB_Point2d& point) const;
 	bool TryGetCurrentMouseWorldPosition(GB_Point2d& outPosition) const;
 
-	void AddMapTile(const MapTile& tile);
-	void AddMapTile(const MapTile& tile, double layerNumber);
-	void AddMapTiles(const std::vector<MapTile>& tiles);
+	void AddMapTile(const MapTileDrawable& tile);
+	void AddMapTile(const MapTileDrawable& tile, double layerNumber);
+	void AddMapTiles(const std::vector<MapTileDrawable>& tiles);
+
+	void AddPointDrawable(const PointDrawable& point);
+	void AddPointDrawable(const PointDrawable& point, double layerNumber);
+	void AddPointDrawable(PointDrawable&& point);
+	void AddPointDrawable(PointDrawable&& point, double layerNumber);
+	void AddPointDrawables(const std::vector<PointDrawable>& points);
+	void AddPointDrawables(std::vector<PointDrawable>&& points);
+
+	void AddPolylineDrawable(const PolylineDrawable& polyline);
+	void AddPolylineDrawable(const PolylineDrawable& polyline, double layerNumber);
+	void AddPolylineDrawable(PolylineDrawable&& polyline);
+	void AddPolylineDrawable(PolylineDrawable&& polyline, double layerNumber);
+	void AddPolylineDrawables(const std::vector<PolylineDrawable>& polylines);
+	void AddPolylineDrawables(std::vector<PolylineDrawable>&& polylines);
+
+	void AddPolygonDrawable(const PolygonDrawable& polygon);
+	void AddPolygonDrawable(const PolygonDrawable& polygon, double layerNumber);
+	void AddPolygonDrawable(PolygonDrawable&& polygon);
+	void AddPolygonDrawable(PolygonDrawable&& polygon, double layerNumber);
+	void AddPolygonDrawables(const std::vector<PolygonDrawable>& polygons);
+	void AddPolygonDrawables(std::vector<PolygonDrawable>&& polygons);
+
 	bool HasDrawables() const;
 
 	void ClearDrawables();
@@ -110,7 +131,7 @@ protected:
 private:
 	struct CachedMapTile
 	{
-		MapTile tile;
+		MapTileDrawable tile;
 		QPixmap pixmap;
 		double tileExtentWidth = 0.0;
 		double tileExtentHeight = 0.0;
@@ -119,6 +140,44 @@ private:
 		double pixmapWidth = 0.0;
 		double pixmapHeight = 0.0;
 		std::uint64_t insertionSequence = 0;
+	};
+
+	struct CachedPointDrawable
+	{
+		PointDrawable point;
+		GB_Rectangle extent;
+		double screenMarginPixels = 0.0;
+		std::uint64_t insertionSequence = 0;
+	};
+
+	struct CachedPolylineDrawable
+	{
+		PolylineDrawable polyline;
+		GB_Rectangle extent;
+		double screenMarginPixels = 0.0;
+		std::uint64_t insertionSequence = 0;
+	};
+
+	struct CachedPolygonDrawable
+	{
+		PolygonDrawable polygon;
+		GB_Rectangle extent;
+		double screenMarginPixels = 0.0;
+		std::uint64_t insertionSequence = 0;
+	};
+
+	enum class CachedDrawableKind
+	{
+		MapTile = 0,
+		Point,
+		Polyline,
+		Polygon
+	};
+
+	struct VisibleDrawableReference
+	{
+		CachedDrawableKind kind = CachedDrawableKind::MapTile;
+		size_t index = 0;
 	};
 
 	std::string crsWkt = "";
@@ -150,12 +209,39 @@ private:
 	mutable double crsMetersPerUnitCache = 0.0;
 
 	std::vector<CachedMapTile> mapTiles;
+	std::vector<CachedPointDrawable> pointDrawables;
+	std::vector<CachedPolylineDrawable> polylineDrawables;
+	std::vector<CachedPolygonDrawable> polygonDrawables;
 	std::uint64_t nextDrawableInsertionSequence = 0;
 
 	mutable bool mapTileSpatialIndexDirty = true;
 	mutable std::vector<size_t> mapTileMinXOrderCache;
 	mutable std::vector<size_t> mapTileMaxXOrderCache;
 	mutable std::vector<size_t> mapTileVisibleIndexScratch;
+
+	mutable bool pointDrawableSpatialIndexDirty = true;
+	mutable std::vector<size_t> pointDrawableMinXOrderCache;
+	mutable std::vector<size_t> pointDrawableMaxXOrderCache;
+	mutable std::vector<size_t> pointDrawableVisibleIndexScratch;
+
+	mutable bool polylineDrawableSpatialIndexDirty = true;
+	mutable std::vector<size_t> polylineDrawableMinXOrderCache;
+	mutable std::vector<size_t> polylineDrawableMaxXOrderCache;
+	mutable std::vector<size_t> polylineDrawableVisibleIndexScratch;
+
+	mutable bool polygonDrawableSpatialIndexDirty = true;
+	mutable std::vector<size_t> polygonDrawableMinXOrderCache;
+	mutable std::vector<size_t> polygonDrawableMaxXOrderCache;
+	mutable std::vector<size_t> polygonDrawableVisibleIndexScratch;
+
+	mutable std::vector<VisibleDrawableReference> visibleDrawableReferenceScratch;
+
+	mutable bool pointDrawableMaxScreenMarginCacheDirty = true;
+	mutable double pointDrawableMaxScreenMarginCache = 0.0;
+	mutable bool polylineDrawableMaxScreenMarginCacheDirty = true;
+	mutable double polylineDrawableMaxScreenMarginCache = 0.0;
+	mutable bool polygonDrawableMaxScreenMarginCacheDirty = true;
+	mutable double polygonDrawableMaxScreenMarginCache = 0.0;
 
 	mutable bool allDrawableExtentCacheDirty = true;
 	mutable GB_Rectangle allDrawableExtentCache;
@@ -190,14 +276,39 @@ private:
 	static bool IsTopLayerNumber(double layerNumber);
 	static bool IsBottomLayerNumber(double layerNumber);
 	static int GetLayerPaintOrderGroup(double layerNumber);
+	static bool IsCachedDrawablePaintOrderLess(double firstLayerNumber, std::uint64_t firstInsertionSequence, double secondLayerNumber, std::uint64_t secondInsertionSequence);
 	static bool IsCachedMapTilePaintOrderLess(const CachedMapTile& firstTile, const CachedMapTile& secondTile);
-	bool TryCreateCachedMapTile(const MapTile& tile, double layerNumber, CachedMapTile& outCachedTile);
+	bool IsVisibleDrawableReferencePaintOrderLess(const VisibleDrawableReference& firstReference, const VisibleDrawableReference& secondReference) const;
+	double GetVisibleDrawableReferenceLayerNumber(const VisibleDrawableReference& reference) const;
+	std::uint64_t GetVisibleDrawableReferenceInsertionSequence(const VisibleDrawableReference& reference) const;
+	bool TryCreateCachedMapTile(const MapTileDrawable& tile, double layerNumber, CachedMapTile& outCachedTile);
+	bool TryCreateCachedPointDrawable(PointDrawable point, double layerNumber, CachedPointDrawable& outCachedPoint);
+	bool TryCreateCachedPolylineDrawable(PolylineDrawable polyline, double layerNumber, CachedPolylineDrawable& outCachedPolyline);
+	bool TryCreateCachedPolygonDrawable(PolygonDrawable polygon, double layerNumber, CachedPolygonDrawable& outCachedPolygon);
 	void InsertCachedMapTile(CachedMapTile&& cachedTile);
 	void EnsureMapTileSpatialIndex() const;
 	void InvalidateMapTileSpatialIndex() const;
 	void CollectVisibleMapTileIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const;
+	void EnsurePointDrawableSpatialIndex() const;
+	void InvalidatePointDrawableSpatialIndex() const;
+	void CollectVisiblePointDrawableIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const;
+	void EnsurePolylineDrawableSpatialIndex() const;
+	void InvalidatePolylineDrawableSpatialIndex() const;
+	void CollectVisiblePolylineDrawableIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const;
+	void EnsurePolygonDrawableSpatialIndex() const;
+	void InvalidatePolygonDrawableSpatialIndex() const;
+	void CollectVisiblePolygonDrawableIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const;
+	void InvalidateVectorDrawableSpatialIndexes() const;
+	void InvalidateVectorDrawableMaxScreenMarginCaches() const;
+	double GetMaxPointDrawableScreenMarginPixels() const;
+	double GetMaxPolylineDrawableScreenMarginPixels() const;
+	double GetMaxPolygonDrawableScreenMarginPixels() const;
 	void DrawBackground(QPainter& painter) const;
-	void DrawMapTiles(QPainter& painter, const QRectF& exposedRect) const;
+	void DrawDrawables(QPainter& painter, const QRectF& exposedRect) const;
+	void DrawCachedMapTile(QPainter& painter, const CachedMapTile& cachedTile, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect, const QPainterPath* crsClipPath, bool hasPreciseCrsClip, bool canUseCrsPolygonExtents) const;
+	void DrawCachedPointDrawable(QPainter& painter, const CachedPointDrawable& cachedPoint, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const;
+	void DrawCachedPolylineDrawable(QPainter& painter, const CachedPolylineDrawable& cachedPolyline, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const;
+	void DrawCachedPolygonDrawable(QPainter& painter, const CachedPolygonDrawable& cachedPolygon, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const;
 	void DrawCoordinateAxes(QPainter& painter) const;
 	void DrawCrsValidArea(QPainter& painter) const;
 	void DrawMapContent(QPainter& painter, const QRectF& exposedRect) const;
@@ -222,6 +333,7 @@ private:
 
 	bool IsDrawableUidInSet(const std::vector<std::string>& drawablesUids, const std::string& uid) const;
 	bool HasVisibleMapTileIntersectingExtent(const GB_Rectangle& extent) const;
+	GB_Rectangle CalculateVisibleVectorDrawableExtent() const;
 	GB_Rectangle CalculateAllDrawableExtent() const;
 	void InvalidateAllDrawableExtentCache() const;
 

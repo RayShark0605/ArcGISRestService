@@ -1365,7 +1365,7 @@ public:
 
 	struct DisplayedTileRecord
 	{
-		MapTile tile;
+		MapTileDrawable tile;
 		std::string layerUid = "";
 		double layerNumber = 0.0;
 	};
@@ -1406,7 +1406,7 @@ public:
 		std::string tileUid = "";
 		std::string layerUid = "";
 		double layerNumber = 0.0;
-		MapTile tile;
+		MapTileDrawable tile;
 	};
 
 	explicit Impl(LayerRefresher* owner)
@@ -2457,7 +2457,7 @@ private:
 		}
 
 		std::vector<std::string> uidsToRemove;
-		std::vector<MapTile> tilesToAdd;
+		std::vector<MapTileDrawable> tilesToAdd;
 		uidsToRemove.reserve(results.size());
 		tilesToAdd.reserve(results.size());
 

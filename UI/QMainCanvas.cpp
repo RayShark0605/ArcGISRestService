@@ -5,6 +5,7 @@
 #include "GeoBase/GB_Math.h"
 
 #include <QApplication>
+#include <QBrush>
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QEvent>
@@ -47,6 +48,8 @@ namespace
 	constexpr int ViewStateChangedDebounceIntervalMs = 180;
 	constexpr int WheelZoomEndDetectionIntervalMs = 300;
 	constexpr int CrsValidAreaPolygonEdgeSampleCount = 129;
+	constexpr int MaxVectorBatchPointCount = 8192;
+	constexpr double MinimumVectorPaintMarginPixels = 1.0;
 	const std::string CrsValidAreaDrawableUid = "__QMainCanvas_CrsValidArea__";
 
 	QColor ToQColor(const GB_ColorRGBA& color)
@@ -261,6 +264,296 @@ namespace
 	bool IsFiniteNonNegative(double value)
 	{
 		return std::isfinite(value) && value >= 0;
+	}
+
+
+	GB_Rectangle MakePointExtent(const GB_Point2d& point)
+	{
+		if (!IsPointFinite(point))
+		{
+			return GB_Rectangle::Invalid;
+		}
+
+		return GB_Rectangle(point);
+	}
+
+	GB_Rectangle CalculatePointsExtent(const std::vector<GB_Point2d>& points)
+	{
+		GB_Rectangle extent;
+		extent.Reset();
+		for (const GB_Point2d& point : points)
+		{
+			if (IsPointFinite(point))
+			{
+				extent.Expand(point);
+			}
+		}
+		return extent;
+	}
+
+	double GetPointDrawableScreenMarginPixels(const PointDrawable& point)
+	{
+		const double symbolSize = std::max(1, point.symbolSize);
+		const double borderWidth = std::max(0, point.borderWidth);
+		return symbolSize * 0.5 + borderWidth + MinimumVectorPaintMarginPixels;
+	}
+
+	double GetPolylineDrawableScreenMarginPixels(const PolylineDrawable& polyline)
+	{
+		return std::max(0, polyline.lineWidth) * 0.5 + MinimumVectorPaintMarginPixels;
+	}
+
+	double GetPolygonDrawableScreenMarginPixels(const PolygonDrawable& polygon)
+	{
+		return std::max(0, polygon.borderWidth) * 0.5 + MinimumVectorPaintMarginPixels;
+	}
+
+	GB_Rectangle ExpandedWorldQueryExtent(const GB_Rectangle& extent, double marginPixels, double currentPixelSize)
+	{
+		if (!extent.IsValid())
+		{
+			return GB_Rectangle::Invalid;
+		}
+
+		GB_Rectangle result = extent;
+		if (std::isfinite(marginPixels) && marginPixels > 0.0 && std::isfinite(currentPixelSize) && currentPixelSize > 0.0)
+		{
+			const double marginWorld = marginPixels * currentPixelSize;
+			result.Buffer(marginWorld, marginWorld);
+		}
+		return result;
+	}
+
+	int ComputeClipOutCode(const GB_Point2d& point, const GB_Rectangle& clipRect)
+	{
+		int code = 0;
+		if (point.x < clipRect.minX)
+		{
+			code |= 1;
+		}
+		else if (point.x > clipRect.maxX)
+		{
+			code |= 2;
+		}
+
+		if (point.y < clipRect.minY)
+		{
+			code |= 4;
+		}
+		else if (point.y > clipRect.maxY)
+		{
+			code |= 8;
+		}
+
+		return code;
+	}
+
+	bool ClipSegmentToRectangle(const GB_Point2d& sourceStart, const GB_Point2d& sourceEnd, const GB_Rectangle& clipRect, GB_Point2d& outStart, GB_Point2d& outEnd)
+	{
+		outStart = sourceStart;
+		outEnd = sourceEnd;
+
+		if (!IsPointFinite(outStart) || !IsPointFinite(outEnd) || !clipRect.IsValid())
+		{
+			return false;
+		}
+
+		int startCode = ComputeClipOutCode(outStart, clipRect);
+		int endCode = ComputeClipOutCode(outEnd, clipRect);
+
+		while (true)
+		{
+			if ((startCode | endCode) == 0)
+			{
+				return true;
+			}
+
+			if ((startCode & endCode) != 0)
+			{
+				return false;
+			}
+
+			const int outsideCode = startCode != 0 ? startCode : endCode;
+			double x = 0.0;
+			double y = 0.0;
+
+			const double deltaX = outEnd.x - outStart.x;
+			const double deltaY = outEnd.y - outStart.y;
+
+			if ((outsideCode & 8) != 0)
+			{
+				if (std::abs(deltaY) <= GB_Epsilon)
+				{
+					return false;
+				}
+				x = outStart.x + deltaX * (clipRect.maxY - outStart.y) / deltaY;
+				y = clipRect.maxY;
+			}
+			else if ((outsideCode & 4) != 0)
+			{
+				if (std::abs(deltaY) <= GB_Epsilon)
+				{
+					return false;
+				}
+				x = outStart.x + deltaX * (clipRect.minY - outStart.y) / deltaY;
+				y = clipRect.minY;
+			}
+			else if ((outsideCode & 2) != 0)
+			{
+				if (std::abs(deltaX) <= GB_Epsilon)
+				{
+					return false;
+				}
+				y = outStart.y + deltaY * (clipRect.maxX - outStart.x) / deltaX;
+				x = clipRect.maxX;
+			}
+			else if ((outsideCode & 1) != 0)
+			{
+				if (std::abs(deltaX) <= GB_Epsilon)
+				{
+					return false;
+				}
+				y = outStart.y + deltaY * (clipRect.minX - outStart.x) / deltaX;
+				x = clipRect.minX;
+			}
+
+			if (!std::isfinite(x) || !std::isfinite(y))
+			{
+				return false;
+			}
+
+			if (outsideCode == startCode)
+			{
+				outStart.Set(x, y);
+				startCode = ComputeClipOutCode(outStart, clipRect);
+			}
+			else
+			{
+				outEnd.Set(x, y);
+				endCode = ComputeClipOutCode(outEnd, clipRect);
+			}
+		}
+	}
+
+	bool AreScreenPointsNearlyEqual(const QPointF& firstPoint, const QPointF& secondPoint)
+	{
+		return std::abs(firstPoint.x() - secondPoint.x()) <= 0.01 && std::abs(firstPoint.y() - secondPoint.y()) <= 0.01;
+	}
+
+	int GetSafeVectorReserveCount(size_t pointCount)
+	{
+		const size_t safeCount = std::min(pointCount, static_cast<size_t>(MaxVectorBatchPointCount));
+		return safeCount > static_cast<size_t>(std::numeric_limits<int>::max()) ? std::numeric_limits<int>::max() : static_cast<int>(safeCount);
+	}
+
+
+	template <typename TContainer, typename TGetExtent>
+	void RebuildDrawableSpatialIndex(const TContainer& drawables, std::vector<size_t>& minXOrderCache, std::vector<size_t>& maxXOrderCache, TGetExtent getExtent)
+	{
+		minXOrderCache.clear();
+		maxXOrderCache.clear();
+		minXOrderCache.reserve(drawables.size());
+		maxXOrderCache.reserve(drawables.size());
+
+		for (size_t i = 0; i < drawables.size(); i++)
+		{
+			const GB_Rectangle& extent = getExtent(drawables[i]);
+			if (extent.IsValid())
+			{
+				minXOrderCache.push_back(i);
+				maxXOrderCache.push_back(i);
+			}
+		}
+
+		std::sort(minXOrderCache.begin(), minXOrderCache.end(), [&drawables, &getExtent](size_t firstIndex, size_t secondIndex) -> bool
+			{
+				const double firstMinX = getExtent(drawables[firstIndex]).minX;
+				const double secondMinX = getExtent(drawables[secondIndex]).minX;
+				if (firstMinX != secondMinX)
+				{
+					return firstMinX < secondMinX;
+				}
+
+				return firstIndex < secondIndex;
+			});
+
+		std::sort(maxXOrderCache.begin(), maxXOrderCache.end(), [&drawables, &getExtent](size_t firstIndex, size_t secondIndex) -> bool
+			{
+				const double firstMaxX = getExtent(drawables[firstIndex]).maxX;
+				const double secondMaxX = getExtent(drawables[secondIndex]).maxX;
+				if (firstMaxX != secondMaxX)
+				{
+					return firstMaxX < secondMaxX;
+				}
+
+				return firstIndex < secondIndex;
+			});
+	}
+
+	template <typename TContainer, typename TGetExtent, typename TIsVisible>
+	void CollectVisibleDrawableIndicesByExtent(const TContainer& drawables, const std::vector<size_t>& minXOrderCache, const std::vector<size_t>& maxXOrderCache,
+		const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices, TGetExtent getExtent, TIsVisible isVisible)
+	{
+		outIndices.clear();
+		if (drawables.empty() || !queryWorldExtent.IsValid() || minXOrderCache.empty() || maxXOrderCache.empty())
+		{
+			return;
+		}
+
+		const double queryMinX = queryWorldExtent.minX - GB_Epsilon;
+		const double queryMaxX = queryWorldExtent.maxX + GB_Epsilon;
+
+		const auto minXEndIter = std::upper_bound(minXOrderCache.begin(), minXOrderCache.end(), queryMaxX,
+			[&drawables, &getExtent](double value, size_t drawableIndex) -> bool
+			{
+				return value < getExtent(drawables[drawableIndex]).minX;
+			});
+
+		const auto maxXBeginIter = std::lower_bound(maxXOrderCache.begin(), maxXOrderCache.end(), queryMinX,
+			[&drawables, &getExtent](size_t drawableIndex, double value) -> bool
+			{
+				return getExtent(drawables[drawableIndex]).maxX < value;
+			});
+
+		const size_t minXCandidateCount = static_cast<size_t>(std::distance(minXOrderCache.begin(), minXEndIter));
+		const size_t maxXCandidateCount = static_cast<size_t>(std::distance(maxXBeginIter, maxXOrderCache.end()));
+		const size_t reserveCount = std::min(minXCandidateCount, maxXCandidateCount);
+		outIndices.reserve(reserveCount);
+
+		const auto TryAppendDrawableIndex = [&drawables, &queryWorldExtent, &outIndices, &getExtent, &isVisible](size_t drawableIndex)
+			{
+				if (drawableIndex >= drawables.size())
+				{
+					return;
+				}
+
+				const auto& drawable = drawables[drawableIndex];
+				const GB_Rectangle& extent = getExtent(drawable);
+				if (isVisible(drawable) && extent.IsValid() && extent.IsIntersects(queryWorldExtent))
+				{
+					outIndices.push_back(drawableIndex);
+				}
+			};
+
+		if (minXCandidateCount <= maxXCandidateCount)
+		{
+			for (auto iter = minXOrderCache.begin(); iter != minXEndIter; ++iter)
+			{
+				TryAppendDrawableIndex(*iter);
+			}
+		}
+		else
+		{
+			for (auto iter = maxXBeginIter; iter != maxXOrderCache.end(); ++iter)
+			{
+				TryAppendDrawableIndex(*iter);
+			}
+		}
+
+		if (outIndices.size() > 1)
+		{
+			std::sort(outIndices.begin(), outIndices.end());
+		}
 	}
 
 	bool AreNearlyEqual(double firstValue, double secondValue)
@@ -680,6 +973,15 @@ void QMainCanvas::ZoomFull()
 		}
 	}
 
+	if (hasAppliedCrsClipForZoom)
+	{
+		const GB_Rectangle vectorDrawableExtent = CalculateVisibleVectorDrawableExtent();
+		if (vectorDrawableExtent.IsValid())
+		{
+			allExtent.Expand(vectorDrawableExtent);
+		}
+	}
+
 	if (!hasAppliedCrsClipForZoom)
 	{
 		allExtent = CalculateAllDrawableExtent();
@@ -737,12 +1039,12 @@ bool QMainCanvas::TryGetCurrentMouseWorldPosition(GB_Point2d& outPosition) const
 	return outPosition.IsValid();
 }
 
-void QMainCanvas::AddMapTile(const MapTile& tile)
+void QMainCanvas::AddMapTile(const MapTileDrawable& tile)
 {
 	AddMapTile(tile, tile.layerNumber);
 }
 
-void QMainCanvas::AddMapTile(const MapTile& tile, double layerNumber)
+void QMainCanvas::AddMapTile(const MapTileDrawable& tile, double layerNumber)
 {
 	CachedMapTile cachedTile;
 	if (!TryCreateCachedMapTile(tile, layerNumber, cachedTile))
@@ -768,7 +1070,7 @@ void QMainCanvas::AddMapTile(const MapTile& tile, double layerNumber)
 	}
 }
 
-void QMainCanvas::AddMapTiles(const std::vector<MapTile>& tiles)
+void QMainCanvas::AddMapTiles(const std::vector<MapTileDrawable>& tiles)
 {
 	if (tiles.empty())
 	{
@@ -778,7 +1080,7 @@ void QMainCanvas::AddMapTiles(const std::vector<MapTile>& tiles)
 	std::vector<CachedMapTile> cachedTiles;
 	cachedTiles.reserve(tiles.size());
 
-	for (const MapTile& tile : tiles)
+	for (const MapTileDrawable& tile : tiles)
 	{
 		CachedMapTile cachedTile;
 		if (TryCreateCachedMapTile(tile, tile.layerNumber, cachedTile))
@@ -828,27 +1130,338 @@ void QMainCanvas::AddMapTiles(const std::vector<MapTile>& tiles)
 	}
 }
 
-bool QMainCanvas::HasDrawables() const
+void QMainCanvas::AddPointDrawable(const PointDrawable& point)
 {
-	if (!mapTiles.empty())
+	AddPointDrawable(point, point.layerNumber);
+}
+
+void QMainCanvas::AddPointDrawable(const PointDrawable& point, double layerNumber)
+{
+	PointDrawable pointCopy = point;
+	AddPointDrawable(std::move(pointCopy), layerNumber);
+}
+
+void QMainCanvas::AddPointDrawable(PointDrawable&& point)
+{
+	const double layerNumber = point.layerNumber;
+	AddPointDrawable(std::move(point), layerNumber);
+}
+
+void QMainCanvas::AddPointDrawable(PointDrawable&& point, double layerNumber)
+{
+	CachedPointDrawable cachedPoint;
+	if (!TryCreateCachedPointDrawable(std::move(point), layerNumber, cachedPoint))
 	{
-		return true;
+		return;
 	}
 
-	// 后续如果恢复 vectorDrawables / extentMarkerDrawables，
-	// 这里也应把它们纳入 Canvas 是否已有内容 的判断。
-	return false;
+	const bool shouldZoomToAddedPoint = !viewExtent.IsValid();
+	const GB_Rectangle addedExtent = cachedPoint.extent;
+
+	pointDrawables.push_back(std::move(cachedPoint));
+	InvalidatePointDrawableSpatialIndex();
+	pointDrawableMaxScreenMarginCacheDirty = true;
+	InvalidateAllDrawableExtentCache();
+	InvalidateMapContentCache();
+
+	if (shouldZoomToAddedPoint && addedExtent.IsValid())
+	{
+		ZoomToExtent(addedExtent, 0.05);
+	}
+	else
+	{
+		update();
+	}
+}
+
+void QMainCanvas::AddPointDrawables(const std::vector<PointDrawable>& points)
+{
+	if (points.empty())
+	{
+		return;
+	}
+
+	std::vector<PointDrawable> pointCopies = points;
+	AddPointDrawables(std::move(pointCopies));
+}
+
+void QMainCanvas::AddPointDrawables(std::vector<PointDrawable>&& points)
+{
+	if (points.empty())
+	{
+		return;
+	}
+
+	std::vector<CachedPointDrawable> cachedPoints;
+	cachedPoints.reserve(points.size());
+	GB_Rectangle addedExtent;
+	addedExtent.Reset();
+
+	for (PointDrawable& point : points)
+	{
+		const double layerNumber = point.layerNumber;
+		CachedPointDrawable cachedPoint;
+		if (TryCreateCachedPointDrawable(std::move(point), layerNumber, cachedPoint))
+		{
+			addedExtent.Expand(cachedPoint.extent);
+			cachedPoints.push_back(std::move(cachedPoint));
+		}
+	}
+
+	if (cachedPoints.empty())
+	{
+		return;
+	}
+
+	const bool shouldZoomToAddedPoints = !viewExtent.IsValid();
+	pointDrawables.reserve(pointDrawables.size() + cachedPoints.size());
+	for (CachedPointDrawable& cachedPoint : cachedPoints)
+	{
+		pointDrawables.push_back(std::move(cachedPoint));
+	}
+
+	InvalidatePointDrawableSpatialIndex();
+	pointDrawableMaxScreenMarginCacheDirty = true;
+	InvalidateAllDrawableExtentCache();
+	InvalidateMapContentCache();
+
+	if (shouldZoomToAddedPoints && addedExtent.IsValid())
+	{
+		ZoomToExtent(addedExtent, 0.05);
+	}
+	else
+	{
+		update();
+	}
+}
+
+void QMainCanvas::AddPolylineDrawable(const PolylineDrawable& polyline)
+{
+	AddPolylineDrawable(polyline, polyline.layerNumber);
+}
+
+void QMainCanvas::AddPolylineDrawable(const PolylineDrawable& polyline, double layerNumber)
+{
+	PolylineDrawable polylineCopy = polyline;
+	AddPolylineDrawable(std::move(polylineCopy), layerNumber);
+}
+
+void QMainCanvas::AddPolylineDrawable(PolylineDrawable&& polyline)
+{
+	const double layerNumber = polyline.layerNumber;
+	AddPolylineDrawable(std::move(polyline), layerNumber);
+}
+
+void QMainCanvas::AddPolylineDrawable(PolylineDrawable&& polyline, double layerNumber)
+{
+	CachedPolylineDrawable cachedPolyline;
+	if (!TryCreateCachedPolylineDrawable(std::move(polyline), layerNumber, cachedPolyline))
+	{
+		return;
+	}
+
+	const bool shouldZoomToAddedPolyline = !viewExtent.IsValid();
+	const GB_Rectangle addedExtent = cachedPolyline.extent;
+
+	polylineDrawables.push_back(std::move(cachedPolyline));
+	InvalidatePolylineDrawableSpatialIndex();
+	polylineDrawableMaxScreenMarginCacheDirty = true;
+	InvalidateAllDrawableExtentCache();
+	InvalidateMapContentCache();
+
+	if (shouldZoomToAddedPolyline && addedExtent.IsValid())
+	{
+		ZoomToExtent(addedExtent, 0.05);
+	}
+	else
+	{
+		update();
+	}
+}
+
+void QMainCanvas::AddPolylineDrawables(const std::vector<PolylineDrawable>& polylines)
+{
+	if (polylines.empty())
+	{
+		return;
+	}
+
+	std::vector<PolylineDrawable> polylineCopies = polylines;
+	AddPolylineDrawables(std::move(polylineCopies));
+}
+
+void QMainCanvas::AddPolylineDrawables(std::vector<PolylineDrawable>&& polylines)
+{
+	if (polylines.empty())
+	{
+		return;
+	}
+
+	std::vector<CachedPolylineDrawable> cachedPolylines;
+	cachedPolylines.reserve(polylines.size());
+	GB_Rectangle addedExtent;
+	addedExtent.Reset();
+
+	for (PolylineDrawable& polyline : polylines)
+	{
+		const double layerNumber = polyline.layerNumber;
+		CachedPolylineDrawable cachedPolyline;
+		if (TryCreateCachedPolylineDrawable(std::move(polyline), layerNumber, cachedPolyline))
+		{
+			addedExtent.Expand(cachedPolyline.extent);
+			cachedPolylines.push_back(std::move(cachedPolyline));
+		}
+	}
+
+	if (cachedPolylines.empty())
+	{
+		return;
+	}
+
+	const bool shouldZoomToAddedPolylines = !viewExtent.IsValid();
+	polylineDrawables.reserve(polylineDrawables.size() + cachedPolylines.size());
+	for (CachedPolylineDrawable& cachedPolyline : cachedPolylines)
+	{
+		polylineDrawables.push_back(std::move(cachedPolyline));
+	}
+
+	InvalidatePolylineDrawableSpatialIndex();
+	polylineDrawableMaxScreenMarginCacheDirty = true;
+	InvalidateAllDrawableExtentCache();
+	InvalidateMapContentCache();
+
+	if (shouldZoomToAddedPolylines && addedExtent.IsValid())
+	{
+		ZoomToExtent(addedExtent, 0.05);
+	}
+	else
+	{
+		update();
+	}
+}
+
+void QMainCanvas::AddPolygonDrawable(const PolygonDrawable& polygon)
+{
+	AddPolygonDrawable(polygon, polygon.layerNumber);
+}
+
+void QMainCanvas::AddPolygonDrawable(const PolygonDrawable& polygon, double layerNumber)
+{
+	PolygonDrawable polygonCopy = polygon;
+	AddPolygonDrawable(std::move(polygonCopy), layerNumber);
+}
+
+void QMainCanvas::AddPolygonDrawable(PolygonDrawable&& polygon)
+{
+	const double layerNumber = polygon.layerNumber;
+	AddPolygonDrawable(std::move(polygon), layerNumber);
+}
+
+void QMainCanvas::AddPolygonDrawable(PolygonDrawable&& polygon, double layerNumber)
+{
+	CachedPolygonDrawable cachedPolygon;
+	if (!TryCreateCachedPolygonDrawable(std::move(polygon), layerNumber, cachedPolygon))
+	{
+		return;
+	}
+
+	const bool shouldZoomToAddedPolygon = !viewExtent.IsValid();
+	const GB_Rectangle addedExtent = cachedPolygon.extent;
+
+	polygonDrawables.push_back(std::move(cachedPolygon));
+	InvalidatePolygonDrawableSpatialIndex();
+	polygonDrawableMaxScreenMarginCacheDirty = true;
+	InvalidateAllDrawableExtentCache();
+	InvalidateMapContentCache();
+
+	if (shouldZoomToAddedPolygon && addedExtent.IsValid())
+	{
+		ZoomToExtent(addedExtent, 0.05);
+	}
+	else
+	{
+		update();
+	}
+}
+
+void QMainCanvas::AddPolygonDrawables(const std::vector<PolygonDrawable>& polygons)
+{
+	if (polygons.empty())
+	{
+		return;
+	}
+
+	std::vector<PolygonDrawable> polygonCopies = polygons;
+	AddPolygonDrawables(std::move(polygonCopies));
+}
+
+void QMainCanvas::AddPolygonDrawables(std::vector<PolygonDrawable>&& polygons)
+{
+	if (polygons.empty())
+	{
+		return;
+	}
+
+	std::vector<CachedPolygonDrawable> cachedPolygons;
+	cachedPolygons.reserve(polygons.size());
+	GB_Rectangle addedExtent;
+	addedExtent.Reset();
+
+	for (PolygonDrawable& polygon : polygons)
+	{
+		const double layerNumber = polygon.layerNumber;
+		CachedPolygonDrawable cachedPolygon;
+		if (TryCreateCachedPolygonDrawable(std::move(polygon), layerNumber, cachedPolygon))
+		{
+			addedExtent.Expand(cachedPolygon.extent);
+			cachedPolygons.push_back(std::move(cachedPolygon));
+		}
+	}
+
+	if (cachedPolygons.empty())
+	{
+		return;
+	}
+
+	const bool shouldZoomToAddedPolygons = !viewExtent.IsValid();
+	polygonDrawables.reserve(polygonDrawables.size() + cachedPolygons.size());
+	for (CachedPolygonDrawable& cachedPolygon : cachedPolygons)
+	{
+		polygonDrawables.push_back(std::move(cachedPolygon));
+	}
+
+	InvalidatePolygonDrawableSpatialIndex();
+	polygonDrawableMaxScreenMarginCacheDirty = true;
+	InvalidateAllDrawableExtentCache();
+	InvalidateMapContentCache();
+
+	if (shouldZoomToAddedPolygons && addedExtent.IsValid())
+	{
+		ZoomToExtent(addedExtent, 0.05);
+	}
+	else
+	{
+		update();
+	}
+}
+
+bool QMainCanvas::HasDrawables() const
+{
+	return !mapTiles.empty() || !pointDrawables.empty() || !polylineDrawables.empty() || !polygonDrawables.empty();
 }
 
 void QMainCanvas::ClearDrawables()
 {
 	const bool hadDrawables = HasDrawables();
 	mapTiles.clear();
+	pointDrawables.clear();
+	polylineDrawables.clear();
+	polygonDrawables.clear();
 	InvalidateMapTileSpatialIndex();
+	InvalidateVectorDrawableSpatialIndexes();
+	InvalidateVectorDrawableMaxScreenMarginCaches();
 	InvalidateAllDrawableExtentCache();
 	InvalidateMapContentCache();
-	//vectorDrawables.clear();
-	//extentMarkerDrawables.clear();
 	if (hadDrawables)
 	{
 		update();
@@ -865,28 +1478,63 @@ void QMainCanvas::RemoveDrawables(const std::vector<std::string>& drawablesUids)
 	const std::unordered_set<std::string> uidSet(drawablesUids.begin(), drawablesUids.end());
 
 	bool hasChanged = false;
+	bool mapTilesChanged = false;
+	bool pointsChanged = false;
+	bool polylinesChanged = false;
+	bool polygonsChanged = false;
+
 	const size_t oldMapTileCount = mapTiles.size();
 	mapTiles.erase(std::remove_if(mapTiles.begin(), mapTiles.end(), [&uidSet](const CachedMapTile& item) {
 		return !item.tile.uid.empty() && uidSet.find(item.tile.uid) != uidSet.end();
 		}), mapTiles.end());
-	hasChanged = hasChanged || oldMapTileCount != mapTiles.size();
-	if (hasChanged)
+	mapTilesChanged = oldMapTileCount != mapTiles.size();
+	hasChanged = hasChanged || mapTilesChanged;
+
+	const size_t oldPointCount = pointDrawables.size();
+	pointDrawables.erase(std::remove_if(pointDrawables.begin(), pointDrawables.end(), [&uidSet](const CachedPointDrawable& item) {
+		return !item.point.uid.empty() && uidSet.find(item.point.uid) != uidSet.end();
+		}), pointDrawables.end());
+	pointsChanged = oldPointCount != pointDrawables.size();
+	hasChanged = hasChanged || pointsChanged;
+
+	const size_t oldPolylineCount = polylineDrawables.size();
+	polylineDrawables.erase(std::remove_if(polylineDrawables.begin(), polylineDrawables.end(), [&uidSet](const CachedPolylineDrawable& item) {
+		return !item.polyline.uid.empty() && uidSet.find(item.polyline.uid) != uidSet.end();
+		}), polylineDrawables.end());
+	polylinesChanged = oldPolylineCount != polylineDrawables.size();
+	hasChanged = hasChanged || polylinesChanged;
+
+	const size_t oldPolygonCount = polygonDrawables.size();
+	polygonDrawables.erase(std::remove_if(polygonDrawables.begin(), polygonDrawables.end(), [&uidSet](const CachedPolygonDrawable& item) {
+		return !item.polygon.uid.empty() && uidSet.find(item.polygon.uid) != uidSet.end();
+		}), polygonDrawables.end());
+	polygonsChanged = oldPolygonCount != polygonDrawables.size();
+	hasChanged = hasChanged || polygonsChanged;
+
+	if (mapTilesChanged)
 	{
 		InvalidateMapTileSpatialIndex();
-		InvalidateAllDrawableExtentCache();
-		InvalidateMapContentCache();
 	}
-
-	//vectorDrawables.erase(std::remove_if(vectorDrawables.begin(), vectorDrawables.end(), [this, &drawablesUids](const VectorDrawable& item) {
-	//	return IsDrawableUidInSet(drawablesUids, item.uid);
-	//	}), vectorDrawables.end());
-
-	//extentMarkerDrawables.erase(std::remove_if(extentMarkerDrawables.begin(), extentMarkerDrawables.end(), [this, &drawablesUids](const ExtentMarkerDrawable& item) {
-	//	return IsDrawableUidInSet(drawablesUids, item.uid);
-	//	}), extentMarkerDrawables.end());
+	if (pointsChanged)
+	{
+		InvalidatePointDrawableSpatialIndex();
+		pointDrawableMaxScreenMarginCacheDirty = true;
+	}
+	if (polylinesChanged)
+	{
+		InvalidatePolylineDrawableSpatialIndex();
+		polylineDrawableMaxScreenMarginCacheDirty = true;
+	}
+	if (polygonsChanged)
+	{
+		InvalidatePolygonDrawableSpatialIndex();
+		polygonDrawableMaxScreenMarginCacheDirty = true;
+	}
 
 	if (hasChanged)
 	{
+		InvalidateAllDrawableExtentCache();
+		InvalidateMapContentCache();
 		update();
 	}
 }
@@ -906,6 +1554,10 @@ void QMainCanvas::SetDrawablesVisible(const std::vector<std::string>& drawablesU
 	}
 
 	bool hasChanged = false;
+	bool pointVisibilityChanged = false;
+	bool polylineVisibilityChanged = false;
+	bool polygonVisibilityChanged = false;
+
 	for (CachedMapTile& item : mapTiles)
 	{
 		if (!item.tile.uid.empty() && uidSet.find(item.tile.uid) != uidSet.end() && item.tile.visible != visible)
@@ -915,21 +1567,48 @@ void QMainCanvas::SetDrawablesVisible(const std::vector<std::string>& drawablesU
 		}
 	}
 
-	//for (VectorDrawable& item : vectorDrawables)
-	//{
-	//	if (IsDrawableUidInSet(drawablesUids, item.uid))
-	//	{
-	//		item.visible = visible;
-	//	}
-	//}
+	for (CachedPointDrawable& item : pointDrawables)
+	{
+		if (!item.point.uid.empty() && uidSet.find(item.point.uid) != uidSet.end() && item.point.visible != visible)
+		{
+			item.point.visible = visible;
+			hasChanged = true;
+			pointVisibilityChanged = true;
+		}
+	}
 
-	//for (ExtentMarkerDrawable& item : extentMarkerDrawables)
-	//{
-	//	if (IsDrawableUidInSet(drawablesUids, item.uid))
-	//	{
-	//		item.visible = visible;
-	//	}
-	//}
+	for (CachedPolylineDrawable& item : polylineDrawables)
+	{
+		if (!item.polyline.uid.empty() && uidSet.find(item.polyline.uid) != uidSet.end() && item.polyline.visible != visible)
+		{
+			item.polyline.visible = visible;
+			hasChanged = true;
+			polylineVisibilityChanged = true;
+		}
+	}
+
+	for (CachedPolygonDrawable& item : polygonDrawables)
+	{
+		if (!item.polygon.uid.empty() && uidSet.find(item.polygon.uid) != uidSet.end() && item.polygon.visible != visible)
+		{
+			item.polygon.visible = visible;
+			hasChanged = true;
+			polygonVisibilityChanged = true;
+		}
+	}
+
+	if (pointVisibilityChanged)
+	{
+		pointDrawableMaxScreenMarginCacheDirty = true;
+	}
+	if (polylineVisibilityChanged)
+	{
+		polylineDrawableMaxScreenMarginCacheDirty = true;
+	}
+	if (polygonVisibilityChanged)
+	{
+		polygonDrawableMaxScreenMarginCacheDirty = true;
+	}
 
 	if (hasChanged)
 	{
@@ -950,22 +1629,52 @@ void QMainCanvas::SetDrawablesLayerNumber(const std::vector<std::string>& drawab
 
 	const double normalizedLayerNumber = NormalizeLayerNumber(layerNumber);
 	bool hasChanged = false;
+	bool mapTileLayerChanged = false;
+
 	for (CachedMapTile& item : mapTiles)
 	{
 		if (!item.tile.uid.empty() && uidSet.find(item.tile.uid) != uidSet.end() && item.tile.layerNumber != normalizedLayerNumber)
 		{
 			item.tile.layerNumber = normalizedLayerNumber;
 			hasChanged = true;
+			mapTileLayerChanged = true;
 		}
 	}
 
-	// 后续如果恢复 vectorDrawables / extentMarkerDrawables，
-	// 这里也应同步调整它们的 layerNumber 并参与重排。
+	for (CachedPointDrawable& item : pointDrawables)
+	{
+		if (!item.point.uid.empty() && uidSet.find(item.point.uid) != uidSet.end() && item.point.layerNumber != normalizedLayerNumber)
+		{
+			item.point.layerNumber = normalizedLayerNumber;
+			hasChanged = true;
+		}
+	}
+
+	for (CachedPolylineDrawable& item : polylineDrawables)
+	{
+		if (!item.polyline.uid.empty() && uidSet.find(item.polyline.uid) != uidSet.end() && item.polyline.layerNumber != normalizedLayerNumber)
+		{
+			item.polyline.layerNumber = normalizedLayerNumber;
+			hasChanged = true;
+		}
+	}
+
+	for (CachedPolygonDrawable& item : polygonDrawables)
+	{
+		if (!item.polygon.uid.empty() && uidSet.find(item.polygon.uid) != uidSet.end() && item.polygon.layerNumber != normalizedLayerNumber)
+		{
+			item.polygon.layerNumber = normalizedLayerNumber;
+			hasChanged = true;
+		}
+	}
 
 	if (hasChanged)
 	{
-		std::sort(mapTiles.begin(), mapTiles.end(), IsCachedMapTilePaintOrderLess);
-		InvalidateMapTileSpatialIndex();
+		if (mapTileLayerChanged)
+		{
+			std::sort(mapTiles.begin(), mapTiles.end(), IsCachedMapTilePaintOrderLess);
+			InvalidateMapTileSpatialIndex();
+		}
 		InvalidateMapContentCache();
 		update();
 	}
@@ -1418,26 +2127,71 @@ int QMainCanvas::GetLayerPaintOrderGroup(double layerNumber)
 	return 1;
 }
 
-bool QMainCanvas::IsCachedMapTilePaintOrderLess(const CachedMapTile& firstTile, const CachedMapTile& secondTile)
+bool QMainCanvas::IsCachedDrawablePaintOrderLess(double firstLayerNumber, std::uint64_t firstInsertionSequence, double secondLayerNumber, std::uint64_t secondInsertionSequence)
 {
-	const int firstGroup = GetLayerPaintOrderGroup(firstTile.tile.layerNumber);
-	const int secondGroup = GetLayerPaintOrderGroup(secondTile.tile.layerNumber);
+	const int firstGroup = GetLayerPaintOrderGroup(firstLayerNumber);
+	const int secondGroup = GetLayerPaintOrderGroup(secondLayerNumber);
 	if (firstGroup != secondGroup)
 	{
 		return firstGroup < secondGroup;
 	}
 
-	if (firstGroup == 1 && firstTile.tile.layerNumber != secondTile.tile.layerNumber)
+	if (firstGroup == 1 && firstLayerNumber != secondLayerNumber)
 	{
 		// QPainter 后绘制的内容会覆盖先绘制的内容。
 		// 普通层号越大越靠底层，因此需要先绘制较大的层号。
-		return firstTile.tile.layerNumber > secondTile.tile.layerNumber;
+		return firstLayerNumber > secondLayerNumber;
 	}
 
-	return firstTile.insertionSequence < secondTile.insertionSequence;
+	return firstInsertionSequence < secondInsertionSequence;
 }
 
-bool QMainCanvas::TryCreateCachedMapTile(const MapTile& tile, double layerNumber, CachedMapTile& outCachedTile)
+bool QMainCanvas::IsCachedMapTilePaintOrderLess(const CachedMapTile& firstTile, const CachedMapTile& secondTile)
+{
+	return IsCachedDrawablePaintOrderLess(firstTile.tile.layerNumber, firstTile.insertionSequence, secondTile.tile.layerNumber, secondTile.insertionSequence);
+}
+
+bool QMainCanvas::IsVisibleDrawableReferencePaintOrderLess(const VisibleDrawableReference& firstReference, const VisibleDrawableReference& secondReference) const
+{
+	return IsCachedDrawablePaintOrderLess(GetVisibleDrawableReferenceLayerNumber(firstReference), GetVisibleDrawableReferenceInsertionSequence(firstReference),
+		GetVisibleDrawableReferenceLayerNumber(secondReference), GetVisibleDrawableReferenceInsertionSequence(secondReference));
+}
+
+double QMainCanvas::GetVisibleDrawableReferenceLayerNumber(const VisibleDrawableReference& reference) const
+{
+	switch (reference.kind)
+	{
+	case CachedDrawableKind::MapTile:
+		return reference.index < mapTiles.size() ? mapTiles[reference.index].tile.layerNumber : GetDefaultLayerNumber();
+	case CachedDrawableKind::Point:
+		return reference.index < pointDrawables.size() ? pointDrawables[reference.index].point.layerNumber : GetDefaultLayerNumber();
+	case CachedDrawableKind::Polyline:
+		return reference.index < polylineDrawables.size() ? polylineDrawables[reference.index].polyline.layerNumber : GetDefaultLayerNumber();
+	case CachedDrawableKind::Polygon:
+		return reference.index < polygonDrawables.size() ? polygonDrawables[reference.index].polygon.layerNumber : GetDefaultLayerNumber();
+	default:
+		return GetDefaultLayerNumber();
+	}
+}
+
+std::uint64_t QMainCanvas::GetVisibleDrawableReferenceInsertionSequence(const VisibleDrawableReference& reference) const
+{
+	switch (reference.kind)
+	{
+	case CachedDrawableKind::MapTile:
+		return reference.index < mapTiles.size() ? mapTiles[reference.index].insertionSequence : 0;
+	case CachedDrawableKind::Point:
+		return reference.index < pointDrawables.size() ? pointDrawables[reference.index].insertionSequence : 0;
+	case CachedDrawableKind::Polyline:
+		return reference.index < polylineDrawables.size() ? polylineDrawables[reference.index].insertionSequence : 0;
+	case CachedDrawableKind::Polygon:
+		return reference.index < polygonDrawables.size() ? polygonDrawables[reference.index].insertionSequence : 0;
+	default:
+		return 0;
+	}
+}
+
+bool QMainCanvas::TryCreateCachedMapTile(const MapTileDrawable& tile, double layerNumber, CachedMapTile& outCachedTile)
 {
 	outCachedTile = CachedMapTile();
 
@@ -1485,6 +2239,107 @@ bool QMainCanvas::TryCreateCachedMapTile(const MapTile& tile, double layerNumber
 	nextDrawableInsertionSequence++;
 
 	outCachedTile = std::move(cachedTile);
+	return true;
+}
+
+bool QMainCanvas::TryCreateCachedPointDrawable(PointDrawable point, double layerNumber, CachedPointDrawable& outCachedPoint)
+{
+	outCachedPoint = CachedPointDrawable();
+	if (!IsPointFinite(point.position))
+	{
+		return false;
+	}
+
+	if (point.symbolSize <= 0 || (point.fillColor.IsTransparent() && (point.borderWidth <= 0 || point.borderColor.IsTransparent())))
+	{
+		return false;
+	}
+
+	CachedPointDrawable cachedPoint;
+	cachedPoint.point = std::move(point);
+	cachedPoint.point.layerNumber = NormalizeLayerNumber(layerNumber);
+	if (cachedPoint.point.uid.empty())
+	{
+		cachedPoint.point.uid = cachedPoint.point.CalculateUid();
+	}
+
+	cachedPoint.extent = MakePointExtent(cachedPoint.point.position);
+	if (!cachedPoint.extent.IsValid())
+	{
+		return false;
+	}
+
+	cachedPoint.screenMarginPixels = GetPointDrawableScreenMarginPixels(cachedPoint.point);
+	cachedPoint.insertionSequence = nextDrawableInsertionSequence;
+	nextDrawableInsertionSequence++;
+	outCachedPoint = std::move(cachedPoint);
+	return true;
+}
+
+bool QMainCanvas::TryCreateCachedPolylineDrawable(PolylineDrawable polyline, double layerNumber, CachedPolylineDrawable& outCachedPolyline)
+{
+	outCachedPolyline = CachedPolylineDrawable();
+	if (polyline.vertices.size() < 2 || polyline.lineWidth <= 0 || polyline.lineColor.IsTransparent())
+	{
+		return false;
+	}
+
+	GB_Rectangle extent = CalculatePointsExtent(polyline.vertices);
+	if (!extent.IsValid())
+	{
+		return false;
+	}
+
+	CachedPolylineDrawable cachedPolyline;
+	cachedPolyline.polyline = std::move(polyline);
+	cachedPolyline.polyline.layerNumber = NormalizeLayerNumber(layerNumber);
+	if (cachedPolyline.polyline.uid.empty())
+	{
+		cachedPolyline.polyline.uid = cachedPolyline.polyline.CalculateUid();
+	}
+
+	cachedPolyline.extent = extent;
+	cachedPolyline.screenMarginPixels = GetPolylineDrawableScreenMarginPixels(cachedPolyline.polyline);
+	cachedPolyline.insertionSequence = nextDrawableInsertionSequence;
+	nextDrawableInsertionSequence++;
+	outCachedPolyline = std::move(cachedPolyline);
+	return true;
+}
+
+bool QMainCanvas::TryCreateCachedPolygonDrawable(PolygonDrawable polygon, double layerNumber, CachedPolygonDrawable& outCachedPolygon)
+{
+	outCachedPolygon = CachedPolygonDrawable();
+	if (polygon.vertices.size() < 3)
+	{
+		return false;
+	}
+
+	const bool canFill = !polygon.fillColor.IsTransparent();
+	const bool canDrawBorder = polygon.borderWidth > 0 && !polygon.borderColor.IsTransparent();
+	if (!canFill && !canDrawBorder)
+	{
+		return false;
+	}
+
+	GB_Rectangle extent = CalculatePointsExtent(polygon.vertices);
+	if (!extent.IsValid())
+	{
+		return false;
+	}
+
+	CachedPolygonDrawable cachedPolygon;
+	cachedPolygon.polygon = std::move(polygon);
+	cachedPolygon.polygon.layerNumber = NormalizeLayerNumber(layerNumber);
+	if (cachedPolygon.polygon.uid.empty())
+	{
+		cachedPolygon.polygon.uid = cachedPolygon.polygon.CalculateUid();
+	}
+
+	cachedPolygon.extent = extent;
+	cachedPolygon.screenMarginPixels = GetPolygonDrawableScreenMarginPixels(cachedPolygon.polygon);
+	cachedPolygon.insertionSequence = nextDrawableInsertionSequence;
+	nextDrawableInsertionSequence++;
+	outCachedPolygon = std::move(cachedPolygon);
 	return true;
 }
 
@@ -1624,6 +2479,194 @@ void QMainCanvas::CollectVisibleMapTileIndices(const GB_Rectangle& queryWorldExt
 	{
 		std::sort(outIndices.begin(), outIndices.end());
 	}
+}
+
+void QMainCanvas::EnsurePointDrawableSpatialIndex() const
+{
+	if (!pointDrawableSpatialIndexDirty)
+	{
+		return;
+	}
+
+	RebuildDrawableSpatialIndex(pointDrawables, pointDrawableMinXOrderCache, pointDrawableMaxXOrderCache, [](const CachedPointDrawable& item) -> const GB_Rectangle&
+		{
+			return item.extent;
+		});
+	pointDrawableSpatialIndexDirty = false;
+}
+
+void QMainCanvas::InvalidatePointDrawableSpatialIndex() const
+{
+	pointDrawableSpatialIndexDirty = true;
+	pointDrawableMinXOrderCache.clear();
+	pointDrawableMaxXOrderCache.clear();
+	pointDrawableVisibleIndexScratch.clear();
+}
+
+void QMainCanvas::CollectVisiblePointDrawableIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const
+{
+	EnsurePointDrawableSpatialIndex();
+	CollectVisibleDrawableIndicesByExtent(pointDrawables, pointDrawableMinXOrderCache, pointDrawableMaxXOrderCache, queryWorldExtent, outIndices,
+		[](const CachedPointDrawable& item) -> const GB_Rectangle&
+		{
+			return item.extent;
+		},
+		[](const CachedPointDrawable& item) -> bool
+		{
+			return item.point.visible;
+		});
+}
+
+void QMainCanvas::EnsurePolylineDrawableSpatialIndex() const
+{
+	if (!polylineDrawableSpatialIndexDirty)
+	{
+		return;
+	}
+
+	RebuildDrawableSpatialIndex(polylineDrawables, polylineDrawableMinXOrderCache, polylineDrawableMaxXOrderCache, [](const CachedPolylineDrawable& item) -> const GB_Rectangle&
+		{
+			return item.extent;
+		});
+	polylineDrawableSpatialIndexDirty = false;
+}
+
+void QMainCanvas::InvalidatePolylineDrawableSpatialIndex() const
+{
+	polylineDrawableSpatialIndexDirty = true;
+	polylineDrawableMinXOrderCache.clear();
+	polylineDrawableMaxXOrderCache.clear();
+	polylineDrawableVisibleIndexScratch.clear();
+}
+
+void QMainCanvas::CollectVisiblePolylineDrawableIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const
+{
+	EnsurePolylineDrawableSpatialIndex();
+	CollectVisibleDrawableIndicesByExtent(polylineDrawables, polylineDrawableMinXOrderCache, polylineDrawableMaxXOrderCache, queryWorldExtent, outIndices,
+		[](const CachedPolylineDrawable& item) -> const GB_Rectangle&
+		{
+			return item.extent;
+		},
+		[](const CachedPolylineDrawable& item) -> bool
+		{
+			return item.polyline.visible;
+		});
+}
+
+void QMainCanvas::EnsurePolygonDrawableSpatialIndex() const
+{
+	if (!polygonDrawableSpatialIndexDirty)
+	{
+		return;
+	}
+
+	RebuildDrawableSpatialIndex(polygonDrawables, polygonDrawableMinXOrderCache, polygonDrawableMaxXOrderCache, [](const CachedPolygonDrawable& item) -> const GB_Rectangle&
+		{
+			return item.extent;
+		});
+	polygonDrawableSpatialIndexDirty = false;
+}
+
+void QMainCanvas::InvalidatePolygonDrawableSpatialIndex() const
+{
+	polygonDrawableSpatialIndexDirty = true;
+	polygonDrawableMinXOrderCache.clear();
+	polygonDrawableMaxXOrderCache.clear();
+	polygonDrawableVisibleIndexScratch.clear();
+}
+
+void QMainCanvas::CollectVisiblePolygonDrawableIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const
+{
+	EnsurePolygonDrawableSpatialIndex();
+	CollectVisibleDrawableIndicesByExtent(polygonDrawables, polygonDrawableMinXOrderCache, polygonDrawableMaxXOrderCache, queryWorldExtent, outIndices,
+		[](const CachedPolygonDrawable& item) -> const GB_Rectangle&
+		{
+			return item.extent;
+		},
+		[](const CachedPolygonDrawable& item) -> bool
+		{
+			return item.polygon.visible;
+		});
+}
+
+void QMainCanvas::InvalidateVectorDrawableSpatialIndexes() const
+{
+	InvalidatePointDrawableSpatialIndex();
+	InvalidatePolylineDrawableSpatialIndex();
+	InvalidatePolygonDrawableSpatialIndex();
+}
+
+void QMainCanvas::InvalidateVectorDrawableMaxScreenMarginCaches() const
+{
+	pointDrawableMaxScreenMarginCacheDirty = true;
+	pointDrawableMaxScreenMarginCache = 0.0;
+	polylineDrawableMaxScreenMarginCacheDirty = true;
+	polylineDrawableMaxScreenMarginCache = 0.0;
+	polygonDrawableMaxScreenMarginCacheDirty = true;
+	polygonDrawableMaxScreenMarginCache = 0.0;
+}
+
+double QMainCanvas::GetMaxPointDrawableScreenMarginPixels() const
+{
+	if (!pointDrawableMaxScreenMarginCacheDirty)
+	{
+		return pointDrawableMaxScreenMarginCache;
+	}
+
+	double maxMarginPixels = 0.0;
+	for (const CachedPointDrawable& item : pointDrawables)
+	{
+		if (item.point.visible && std::isfinite(item.screenMarginPixels))
+		{
+			maxMarginPixels = std::max(maxMarginPixels, item.screenMarginPixels);
+		}
+	}
+
+	pointDrawableMaxScreenMarginCache = maxMarginPixels;
+	pointDrawableMaxScreenMarginCacheDirty = false;
+	return pointDrawableMaxScreenMarginCache;
+}
+
+double QMainCanvas::GetMaxPolylineDrawableScreenMarginPixels() const
+{
+	if (!polylineDrawableMaxScreenMarginCacheDirty)
+	{
+		return polylineDrawableMaxScreenMarginCache;
+	}
+
+	double maxMarginPixels = 0.0;
+	for (const CachedPolylineDrawable& item : polylineDrawables)
+	{
+		if (item.polyline.visible && std::isfinite(item.screenMarginPixels))
+		{
+			maxMarginPixels = std::max(maxMarginPixels, item.screenMarginPixels);
+		}
+	}
+
+	polylineDrawableMaxScreenMarginCache = maxMarginPixels;
+	polylineDrawableMaxScreenMarginCacheDirty = false;
+	return polylineDrawableMaxScreenMarginCache;
+}
+
+double QMainCanvas::GetMaxPolygonDrawableScreenMarginPixels() const
+{
+	if (!polygonDrawableMaxScreenMarginCacheDirty)
+	{
+		return polygonDrawableMaxScreenMarginCache;
+	}
+
+	double maxMarginPixels = 0.0;
+	for (const CachedPolygonDrawable& item : polygonDrawables)
+	{
+		if (item.polygon.visible && std::isfinite(item.screenMarginPixels))
+		{
+			maxMarginPixels = std::max(maxMarginPixels, item.screenMarginPixels);
+		}
+	}
+
+	polygonDrawableMaxScreenMarginCache = maxMarginPixels;
+	polygonDrawableMaxScreenMarginCacheDirty = false;
+	return polygonDrawableMaxScreenMarginCache;
 }
 
 void QMainCanvas::DrawBackground(QPainter& painter) const
@@ -1819,7 +2862,7 @@ bool QMainCanvas::TryGetCrsValidAreaScreenPathCache(const QPainterPath*& outPath
 		}
 
 		QPolygonF screenPolygon;
-		screenPolygon.reserve(static_cast<int>(clippedPolygon.size()));
+		screenPolygon.reserve(GetSafeVectorReserveCount(clippedPolygon.size()));
 		GB_Rectangle clippedPolygonExtent;
 		clippedPolygonExtent.Reset();
 
@@ -1958,9 +3001,9 @@ bool QMainCanvas::IsRectangleIntersectsCachedCrsValidAreaPolygonExtent(const GB_
 	return false;
 }
 
-void QMainCanvas::DrawMapTiles(QPainter& painter, const QRectF& exposedRect) const
+void QMainCanvas::DrawDrawables(QPainter& painter, const QRectF& exposedRect) const
 {
-	if (mapTiles.empty() || !viewExtent.IsValid() || !IsFinitePositive(pixelSize))
+	if (!viewExtent.IsValid() || !IsFinitePositive(pixelSize))
 	{
 		return;
 	}
@@ -1972,162 +3015,553 @@ void QMainCanvas::DrawMapTiles(QPainter& painter, const QRectF& exposedRect) con
 		return;
 	}
 
-	const double inversePixelSize = 1.0 / pixelSize;
 	const double viewMinX = viewExtent.minX;
 	const double viewMaxY = viewExtent.maxY;
-
-	GB_Rectangle queryWorldExtent;
-	queryWorldExtent.Set(viewMinX + safeExposedRect.left() * pixelSize,
+	GB_Rectangle baseQueryWorldExtent;
+	baseQueryWorldExtent.Set(viewMinX + safeExposedRect.left() * pixelSize,
 		viewMaxY - safeExposedRect.bottom() * pixelSize,
 		viewMinX + safeExposedRect.right() * pixelSize,
 		viewMaxY - safeExposedRect.top() * pixelSize);
-	queryWorldExtent = queryWorldExtent.Intersected(viewExtent);
-	if (!queryWorldExtent.IsValid() || queryWorldExtent.Width() <= 0.0 || queryWorldExtent.Height() <= 0.0)
+	baseQueryWorldExtent = baseQueryWorldExtent.Intersected(viewExtent);
+	if (!baseQueryWorldExtent.IsValid() || baseQueryWorldExtent.Width() <= 0.0 || baseQueryWorldExtent.Height() <= 0.0)
 	{
 		return;
 	}
 
+	GB_Rectangle mapTileQueryWorldExtent = baseQueryWorldExtent;
 	GB_Rectangle crsClipWorldExtent;
 	const QPainterPath* crsClipPath = nullptr;
 	bool hasPreciseCrsClip = false;
 	bool hasRectangularCrsClip = false;
 
-	if (clipMapTilesToCrsValidArea)
+	if (clipMapTilesToCrsValidArea && !mapTiles.empty())
 	{
 		if (EnsureCrsValidAreaPolygonsCache() && !crsValidAreaPolygonsCache.empty())
 		{
 			hasPreciseCrsClip = TryGetCrsValidAreaScreenPathCache(crsClipPath, crsClipWorldExtent);
-			if (!hasPreciseCrsClip)
+			if (hasPreciseCrsClip)
 			{
-				return;
+				mapTileQueryWorldExtent = mapTileQueryWorldExtent.Intersected(crsClipWorldExtent);
 			}
-
-			queryWorldExtent = queryWorldExtent.Intersected(crsClipWorldExtent);
-			if (!queryWorldExtent.IsValid() || queryWorldExtent.Width() <= 0.0 || queryWorldExtent.Height() <= 0.0)
+			else
 			{
-				return;
+				mapTileQueryWorldExtent.Reset();
 			}
 		}
 		else if (TryGetCrsValidArea(crsClipWorldExtent))
 		{
 			crsClipWorldExtent = crsClipWorldExtent.Intersected(viewExtent);
 			hasRectangularCrsClip = crsClipWorldExtent.IsValid() && crsClipWorldExtent.Width() > 0.0 && crsClipWorldExtent.Height() > 0.0;
-			if (!hasRectangularCrsClip)
+			if (hasRectangularCrsClip)
 			{
-				return;
+				mapTileQueryWorldExtent = mapTileQueryWorldExtent.Intersected(crsClipWorldExtent);
 			}
-
-			queryWorldExtent = queryWorldExtent.Intersected(crsClipWorldExtent);
-			if (!queryWorldExtent.IsValid() || queryWorldExtent.Width() <= 0.0 || queryWorldExtent.Height() <= 0.0)
+			else
 			{
-				return;
+				mapTileQueryWorldExtent.Reset();
 			}
 		}
 	}
 
 	const bool canUseCrsPolygonExtents = hasPreciseCrsClip && crsValidAreaPolygonExtentsCache.size() == crsValidAreaPolygonsCache.size();
 
-	CollectVisibleMapTileIndices(queryWorldExtent, mapTileVisibleIndexScratch);
-	if (mapTileVisibleIndexScratch.empty())
+	visibleDrawableReferenceScratch.clear();
+
+	if (!mapTiles.empty() && mapTileQueryWorldExtent.IsValid() && mapTileQueryWorldExtent.Width() > 0.0 && mapTileQueryWorldExtent.Height() > 0.0)
+	{
+		CollectVisibleMapTileIndices(mapTileQueryWorldExtent, mapTileVisibleIndexScratch);
+		visibleDrawableReferenceScratch.reserve(visibleDrawableReferenceScratch.size() + mapTileVisibleIndexScratch.size());
+		for (size_t mapTileIndex : mapTileVisibleIndexScratch)
+		{
+			visibleDrawableReferenceScratch.push_back(VisibleDrawableReference{ CachedDrawableKind::MapTile, mapTileIndex });
+		}
+	}
+
+	if (!pointDrawables.empty())
+	{
+		const GB_Rectangle pointQueryWorldExtent = ExpandedWorldQueryExtent(baseQueryWorldExtent, GetMaxPointDrawableScreenMarginPixels(), pixelSize);
+		CollectVisiblePointDrawableIndices(pointQueryWorldExtent, pointDrawableVisibleIndexScratch);
+		visibleDrawableReferenceScratch.reserve(visibleDrawableReferenceScratch.size() + pointDrawableVisibleIndexScratch.size());
+		for (size_t pointIndex : pointDrawableVisibleIndexScratch)
+		{
+			visibleDrawableReferenceScratch.push_back(VisibleDrawableReference{ CachedDrawableKind::Point, pointIndex });
+		}
+	}
+
+	if (!polylineDrawables.empty())
+	{
+		const GB_Rectangle polylineQueryWorldExtent = ExpandedWorldQueryExtent(baseQueryWorldExtent, GetMaxPolylineDrawableScreenMarginPixels(), pixelSize);
+		CollectVisiblePolylineDrawableIndices(polylineQueryWorldExtent, polylineDrawableVisibleIndexScratch);
+		visibleDrawableReferenceScratch.reserve(visibleDrawableReferenceScratch.size() + polylineDrawableVisibleIndexScratch.size());
+		for (size_t polylineIndex : polylineDrawableVisibleIndexScratch)
+		{
+			visibleDrawableReferenceScratch.push_back(VisibleDrawableReference{ CachedDrawableKind::Polyline, polylineIndex });
+		}
+	}
+
+	if (!polygonDrawables.empty())
+	{
+		const GB_Rectangle polygonQueryWorldExtent = ExpandedWorldQueryExtent(baseQueryWorldExtent, GetMaxPolygonDrawableScreenMarginPixels(), pixelSize);
+		CollectVisiblePolygonDrawableIndices(polygonQueryWorldExtent, polygonDrawableVisibleIndexScratch);
+		visibleDrawableReferenceScratch.reserve(visibleDrawableReferenceScratch.size() + polygonDrawableVisibleIndexScratch.size());
+		for (size_t polygonIndex : polygonDrawableVisibleIndexScratch)
+		{
+			visibleDrawableReferenceScratch.push_back(VisibleDrawableReference{ CachedDrawableKind::Polygon, polygonIndex });
+		}
+	}
+
+	if (visibleDrawableReferenceScratch.empty())
 	{
 		return;
 	}
 
-	if (hasPreciseCrsClip)
+	std::sort(visibleDrawableReferenceScratch.begin(), visibleDrawableReferenceScratch.end(), [this](const VisibleDrawableReference& firstReference, const VisibleDrawableReference& secondReference) -> bool
+		{
+			return IsVisibleDrawableReferencePaintOrderLess(firstReference, secondReference);
+		});
+
+	painter.setRenderHint(QPainter::Antialiasing, false);
+	painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
+
+	const GB_Rectangle pointDrawQueryWorldExtent = ExpandedWorldQueryExtent(baseQueryWorldExtent, GetMaxPointDrawableScreenMarginPixels(), pixelSize);
+	const GB_Rectangle polylineDrawQueryWorldExtent = ExpandedWorldQueryExtent(baseQueryWorldExtent, GetMaxPolylineDrawableScreenMarginPixels(), pixelSize);
+	const GB_Rectangle polygonDrawQueryWorldExtent = ExpandedWorldQueryExtent(baseQueryWorldExtent, GetMaxPolygonDrawableScreenMarginPixels(), pixelSize);
+
+	for (const VisibleDrawableReference& reference : visibleDrawableReferenceScratch)
+	{
+		switch (reference.kind)
+		{
+		case CachedDrawableKind::MapTile:
+			if (reference.index < mapTiles.size())
+			{
+				DrawCachedMapTile(painter, mapTiles[reference.index], mapTileQueryWorldExtent, safeExposedRect, crsClipPath, hasPreciseCrsClip, canUseCrsPolygonExtents);
+			}
+			break;
+		case CachedDrawableKind::Point:
+			if (reference.index < pointDrawables.size())
+			{
+				DrawCachedPointDrawable(painter, pointDrawables[reference.index], pointDrawQueryWorldExtent, safeExposedRect);
+			}
+			break;
+		case CachedDrawableKind::Polyline:
+			if (reference.index < polylineDrawables.size())
+			{
+				DrawCachedPolylineDrawable(painter, polylineDrawables[reference.index], polylineDrawQueryWorldExtent, safeExposedRect);
+			}
+			break;
+		case CachedDrawableKind::Polygon:
+			if (reference.index < polygonDrawables.size())
+			{
+				DrawCachedPolygonDrawable(painter, polygonDrawables[reference.index], polygonDrawQueryWorldExtent, safeExposedRect);
+			}
+			break;
+		default:
+			break;
+		}
+	}
+
+	painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
+	painter.setRenderHint(QPainter::Antialiasing, false);
+}
+
+void QMainCanvas::DrawCachedMapTile(QPainter& painter, const CachedMapTile& cachedTile, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect,
+	const QPainterPath* crsClipPath, bool hasPreciseCrsClip, bool canUseCrsPolygonExtents) const
+{
+	if (!cachedTile.tile.visible || cachedTile.pixmap.isNull() || !queryWorldExtent.IsValid() || !viewExtent.IsValid() || !IsFinitePositive(pixelSize))
+	{
+		return;
+	}
+
+	if (!IsFinitePositive(cachedTile.tileExtentWidth) || !IsFinitePositive(cachedTile.tileExtentHeight) ||
+		!IsFinitePositive(cachedTile.pixmapWidth) || !IsFinitePositive(cachedTile.pixmapHeight))
+	{
+		return;
+	}
+
+	GB_Rectangle clippedWorldRect = cachedTile.tile.extent.Intersected(queryWorldExtent);
+	if (!clippedWorldRect.IsValid() || clippedWorldRect.Width() <= 0.0 || clippedWorldRect.Height() <= 0.0)
+	{
+		return;
+	}
+
+	if (canUseCrsPolygonExtents)
+	{
+		bool mayIntersectCrsPolygon = false;
+		for (const GB_Rectangle& polygonExtent : crsValidAreaPolygonExtentsCache)
+		{
+			if (polygonExtent.IsValid() && polygonExtent.IsIntersects(clippedWorldRect))
+			{
+				mayIntersectCrsPolygon = true;
+				break;
+			}
+		}
+
+		if (!mayIntersectCrsPolygon)
+		{
+			return;
+		}
+	}
+
+	const double inversePixelSize = 1.0 / pixelSize;
+	const double viewMinX = viewExtent.minX;
+	const double viewMaxY = viewExtent.maxY;
+	const QRectF targetRect(
+		(clippedWorldRect.minX - viewMinX) * inversePixelSize,
+		(viewMaxY - clippedWorldRect.maxY) * inversePixelSize,
+		clippedWorldRect.Width() * inversePixelSize,
+		clippedWorldRect.Height() * inversePixelSize);
+
+	if (!targetRect.isValid() || targetRect.isEmpty() || !targetRect.intersects(exposedRect))
+	{
+		return;
+	}
+
+	const QRectF sourceRect(
+		(clippedWorldRect.minX - cachedTile.tile.extent.minX) * cachedTile.inverseTileExtentWidth * cachedTile.pixmapWidth,
+		(cachedTile.tile.extent.maxY - clippedWorldRect.maxY) * cachedTile.inverseTileExtentHeight * cachedTile.pixmapHeight,
+		clippedWorldRect.Width() * cachedTile.inverseTileExtentWidth * cachedTile.pixmapWidth,
+		clippedWorldRect.Height() * cachedTile.inverseTileExtentHeight * cachedTile.pixmapHeight);
+
+	if (!sourceRect.isValid() || sourceRect.isEmpty())
+	{
+		return;
+	}
+
+	const bool needsSmoothTransform = std::abs(targetRect.width() - sourceRect.width()) > 0.25 || std::abs(targetRect.height() - sourceRect.height()) > 0.25;
+	painter.setRenderHint(QPainter::SmoothPixmapTransform, needsSmoothTransform);
+
+	if (hasPreciseCrsClip && crsClipPath != nullptr)
 	{
 		painter.save();
 		painter.setClipPath(*crsClipPath, Qt::IntersectClip);
+		painter.drawPixmap(targetRect, cachedTile.pixmap, sourceRect);
+		painter.restore();
+	}
+	else
+	{
+		painter.drawPixmap(targetRect, cachedTile.pixmap, sourceRect);
+	}
+}
+
+void QMainCanvas::DrawCachedPointDrawable(QPainter& painter, const CachedPointDrawable& cachedPoint, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const
+{
+	if (!cachedPoint.point.visible || !cachedPoint.extent.IsValid() || !cachedPoint.extent.IsIntersects(queryWorldExtent))
+	{
+		return;
 	}
 
-	bool lastSmoothPixmapTransform = false;
-	painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
-
-	for (size_t mapTileIndex : mapTileVisibleIndexScratch)
+	const GB_Point2d screenPoint = WorldToScreen(cachedPoint.point.position);
+	if (!screenPoint.IsValid())
 	{
-		if (mapTileIndex >= mapTiles.size())
-		{
-			continue;
-		}
+		return;
+	}
 
-		const CachedMapTile& cachedTile = mapTiles[mapTileIndex];
-		if (!IsFinitePositive(cachedTile.tileExtentWidth) || !IsFinitePositive(cachedTile.tileExtentHeight) ||
-			!IsFinitePositive(cachedTile.pixmapWidth) || !IsFinitePositive(cachedTile.pixmapHeight))
-		{
-			continue;
-		}
+	const double symbolSize = static_cast<double>(std::max(1, cachedPoint.point.symbolSize));
+	const double halfSize = symbolSize * 0.5;
+	const QRectF symbolRect(screenPoint.x - halfSize, screenPoint.y - halfSize, symbolSize, symbolSize);
+	if (!symbolRect.adjusted(-cachedPoint.screenMarginPixels, -cachedPoint.screenMarginPixels, cachedPoint.screenMarginPixels, cachedPoint.screenMarginPixels).intersects(exposedRect))
+	{
+		return;
+	}
 
-		GB_Rectangle clippedWorldRect = cachedTile.tile.extent.Intersected(queryWorldExtent);
-		if (!clippedWorldRect.IsValid() || clippedWorldRect.Width() <= 0.0 || clippedWorldRect.Height() <= 0.0)
-		{
-			continue;
-		}
+	const bool canFill = cachedPoint.point.symbolFilled && !cachedPoint.point.fillColor.IsTransparent();
+	const bool canDrawBorder = cachedPoint.point.borderWidth > 0 && !cachedPoint.point.borderColor.IsTransparent();
+	if (!canFill && !canDrawBorder)
+	{
+		return;
+	}
 
-		if (canUseCrsPolygonExtents)
+	QPen pen(Qt::NoPen);
+	if (canDrawBorder)
+	{
+		pen = QPen(ToQColor(cachedPoint.point.borderColor), cachedPoint.point.borderWidth, Qt::SolidLine, Qt::SquareCap, Qt::MiterJoin);
+	}
+
+	const QBrush brush = canFill ? QBrush(ToQColor(cachedPoint.point.fillColor)) : QBrush(Qt::NoBrush);
+	painter.setPen(pen);
+	painter.setBrush(brush);
+
+	const QPointF center(screenPoint.x, screenPoint.y);
+	switch (cachedPoint.point.symbolShape)
+	{
+	case PointDrawable::SymbolShape::Circle:
+		painter.drawEllipse(symbolRect);
+		break;
+	case PointDrawable::SymbolShape::Square:
+		painter.drawRect(symbolRect);
+		break;
+	case PointDrawable::SymbolShape::Triangle:
+	{
+		QPolygonF polygon;
+		polygon.reserve(3);
+		polygon << QPointF(center.x(), center.y() - halfSize) << QPointF(center.x() + halfSize, center.y() + halfSize) << QPointF(center.x() - halfSize, center.y() + halfSize);
+		painter.drawPolygon(polygon);
+		break;
+	}
+	case PointDrawable::SymbolShape::Cross:
+	{
+		painter.setBrush(Qt::NoBrush);
+		QPen crossPen = canDrawBorder ? pen : QPen(ToQColor(cachedPoint.point.fillColor), std::max(1, cachedPoint.point.borderWidth));
+		painter.setPen(crossPen);
+		painter.drawLine(QPointF(center.x() - halfSize, center.y()), QPointF(center.x() + halfSize, center.y()));
+		painter.drawLine(QPointF(center.x(), center.y() - halfSize), QPointF(center.x(), center.y() + halfSize));
+		break;
+	}
+	case PointDrawable::SymbolShape::X:
+	{
+		painter.setBrush(Qt::NoBrush);
+		QPen xPen = canDrawBorder ? pen : QPen(ToQColor(cachedPoint.point.fillColor), std::max(1, cachedPoint.point.borderWidth));
+		painter.setPen(xPen);
+		painter.drawLine(QPointF(center.x() - halfSize, center.y() - halfSize), QPointF(center.x() + halfSize, center.y() + halfSize));
+		painter.drawLine(QPointF(center.x() - halfSize, center.y() + halfSize), QPointF(center.x() + halfSize, center.y() - halfSize));
+		break;
+	}
+	case PointDrawable::SymbolShape::Star:
+	{
+		painter.setBrush(Qt::NoBrush);
+		QPen starPen = canDrawBorder ? pen : QPen(ToQColor(cachedPoint.point.fillColor), std::max(1, cachedPoint.point.borderWidth));
+		painter.setPen(starPen);
+		painter.drawLine(QPointF(center.x() - halfSize, center.y()), QPointF(center.x() + halfSize, center.y()));
+		painter.drawLine(QPointF(center.x(), center.y() - halfSize), QPointF(center.x(), center.y() + halfSize));
+		painter.drawLine(QPointF(center.x() - halfSize, center.y() - halfSize), QPointF(center.x() + halfSize, center.y() + halfSize));
+		painter.drawLine(QPointF(center.x() - halfSize, center.y() + halfSize), QPointF(center.x() + halfSize, center.y() - halfSize));
+		break;
+	}
+	case PointDrawable::SymbolShape::FivePointStar:
+	{
+		QPolygonF polygon;
+		polygon.reserve(10);
+		const double innerRadius = halfSize * 0.45;
+		for (int i = 0; i < 10; i++)
 		{
-			bool mayIntersectCrsPolygon = false;
-			for (const GB_Rectangle& polygonExtent : crsValidAreaPolygonExtentsCache)
+			const double radius = (i % 2 == 0) ? halfSize : innerRadius;
+			const double angle = -GB_HalfPi + static_cast<double>(i) * GB_Pi / 5.0;
+			polygon << QPointF(center.x() + std::cos(angle) * radius, center.y() + std::sin(angle) * radius);
+		}
+		painter.drawPolygon(polygon);
+		break;
+	}
+	case PointDrawable::SymbolShape::Diamond:
+	{
+		QPolygonF polygon;
+		polygon.reserve(4);
+		polygon << QPointF(center.x(), center.y() - halfSize) << QPointF(center.x() + halfSize, center.y()) << QPointF(center.x(), center.y() + halfSize) << QPointF(center.x() - halfSize, center.y());
+		painter.drawPolygon(polygon);
+		break;
+	}
+	default:
+		painter.drawEllipse(symbolRect);
+		break;
+	}
+}
+
+void QMainCanvas::DrawCachedPolylineDrawable(QPainter& painter, const CachedPolylineDrawable& cachedPolyline, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const
+{
+	Q_UNUSED(exposedRect);
+	if (!cachedPolyline.polyline.visible || cachedPolyline.polyline.vertices.size() < 2 || cachedPolyline.polyline.lineWidth <= 0 || cachedPolyline.polyline.lineColor.IsTransparent())
+	{
+		return;
+	}
+
+	if (!cachedPolyline.extent.IsValid() || !cachedPolyline.extent.IsIntersects(queryWorldExtent))
+	{
+		return;
+	}
+
+	const double inversePixelSize = 1.0 / pixelSize;
+	const double viewMinX = viewExtent.minX;
+	const double viewMaxY = viewExtent.maxY;
+	const auto ToScreenPoint = [inversePixelSize, viewMinX, viewMaxY](const GB_Point2d& point) -> QPointF
+		{
+			return QPointF((point.x - viewMinX) * inversePixelSize, (viewMaxY - point.y) * inversePixelSize);
+		};
+
+	QPen pen(ToQColor(cachedPolyline.polyline.lineColor), std::max(1, cachedPolyline.polyline.lineWidth), Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+	painter.setPen(pen);
+	painter.setBrush(Qt::NoBrush);
+
+	QPolygonF currentPart;
+	currentPart.reserve(GetSafeVectorReserveCount(cachedPolyline.polyline.vertices.size()));
+
+	const auto FlushCurrentPart = [&painter, &currentPart]()
+		{
+			if (currentPart.size() >= 2)
 			{
-				if (polygonExtent.IsValid() && polygonExtent.IsIntersects(clippedWorldRect))
+				painter.drawPolyline(currentPart);
+			}
+			currentPart.clear();
+		};
+
+	for (size_t vertexIndex = 1; vertexIndex < cachedPolyline.polyline.vertices.size(); vertexIndex++)
+	{
+		GB_Point2d clippedStart;
+		GB_Point2d clippedEnd;
+		if (!ClipSegmentToRectangle(cachedPolyline.polyline.vertices[vertexIndex - 1], cachedPolyline.polyline.vertices[vertexIndex], queryWorldExtent, clippedStart, clippedEnd))
+		{
+			FlushCurrentPart();
+			continue;
+		}
+
+		const QPointF screenStart = ToScreenPoint(clippedStart);
+		const QPointF screenEnd = ToScreenPoint(clippedEnd);
+		if (!std::isfinite(screenStart.x()) || !std::isfinite(screenStart.y()) || !std::isfinite(screenEnd.x()) || !std::isfinite(screenEnd.y()))
+		{
+			FlushCurrentPart();
+			continue;
+		}
+
+		if (currentPart.isEmpty())
+		{
+			currentPart << screenStart << screenEnd;
+		}
+		else if (AreScreenPointsNearlyEqual(currentPart.back(), screenStart))
+		{
+			if (!AreScreenPointsNearlyEqual(currentPart.back(), screenEnd))
+			{
+				currentPart << screenEnd;
+			}
+		}
+		else
+		{
+			FlushCurrentPart();
+			currentPart << screenStart << screenEnd;
+		}
+
+		if (currentPart.size() >= MaxVectorBatchPointCount)
+		{
+			const QPointF lastPoint = currentPart.back();
+			painter.drawPolyline(currentPart);
+			currentPart.clear();
+			currentPart << lastPoint;
+		}
+	}
+
+	FlushCurrentPart();
+}
+
+void QMainCanvas::DrawCachedPolygonDrawable(QPainter& painter, const CachedPolygonDrawable& cachedPolygon, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const
+{
+	Q_UNUSED(exposedRect);
+	if (!cachedPolygon.polygon.visible || cachedPolygon.polygon.vertices.size() < 3 || !cachedPolygon.extent.IsValid() || !cachedPolygon.extent.IsIntersects(queryWorldExtent))
+	{
+		return;
+	}
+
+	const bool canFill = !cachedPolygon.polygon.fillColor.IsTransparent();
+	const bool canDrawBorder = cachedPolygon.polygon.borderWidth > 0 && !cachedPolygon.polygon.borderColor.IsTransparent();
+	if (!canFill && !canDrawBorder)
+	{
+		return;
+	}
+
+	const double inversePixelSize = 1.0 / pixelSize;
+	const double viewMinX = viewExtent.minX;
+	const double viewMaxY = viewExtent.maxY;
+	const auto ToScreenPoint = [inversePixelSize, viewMinX, viewMaxY](const GB_Point2d& point) -> QPointF
+		{
+			return QPointF((point.x - viewMinX) * inversePixelSize, (viewMaxY - point.y) * inversePixelSize);
+		};
+
+	if (canFill)
+	{
+		std::vector<GB_Point2d> clippedPolygon;
+		std::vector<GB_Point2d> clippedPolygonScratch;
+		if (ClipPolygonToRectangle(cachedPolygon.polygon.vertices, queryWorldExtent, clippedPolygon, clippedPolygonScratch))
+		{
+			QPolygonF screenPolygon;
+			screenPolygon.reserve(GetSafeVectorReserveCount(clippedPolygon.size()));
+			for (const GB_Point2d& point : clippedPolygon)
+			{
+				const QPointF screenPoint = ToScreenPoint(point);
+				if (std::isfinite(screenPoint.x()) && std::isfinite(screenPoint.y()))
 				{
-					mayIntersectCrsPolygon = true;
-					break;
+					screenPolygon << screenPoint;
 				}
 			}
 
-			if (!mayIntersectCrsPolygon)
+			if (screenPolygon.size() >= 3)
 			{
+				painter.setPen(Qt::NoPen);
+				painter.setBrush(ToQColor(cachedPolygon.polygon.fillColor));
+				painter.drawPolygon(screenPolygon, Qt::WindingFill);
+			}
+		}
+	}
+
+	if (canDrawBorder)
+	{
+		QPen pen(ToQColor(cachedPolygon.polygon.borderColor), std::max(1, cachedPolygon.polygon.borderWidth), Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+		painter.setPen(pen);
+		painter.setBrush(Qt::NoBrush);
+
+		QPolygonF currentPart;
+		currentPart.reserve(GetSafeVectorReserveCount(cachedPolygon.polygon.vertices.size()));
+
+		const auto FlushCurrentPart = [&painter, &currentPart]()
+			{
+				if (currentPart.size() >= 2)
+				{
+					painter.drawPolyline(currentPart);
+				}
+				currentPart.clear();
+			};
+
+		const size_t vertexCount = cachedPolygon.polygon.vertices.size();
+		for (size_t vertexIndex = 0; vertexIndex < vertexCount; vertexIndex++)
+		{
+			const GB_Point2d& sourceStart = cachedPolygon.polygon.vertices[vertexIndex];
+			const GB_Point2d& sourceEnd = cachedPolygon.polygon.vertices[(vertexIndex + 1) % vertexCount];
+
+			GB_Point2d clippedStart;
+			GB_Point2d clippedEnd;
+			if (!ClipSegmentToRectangle(sourceStart, sourceEnd, queryWorldExtent, clippedStart, clippedEnd))
+			{
+				FlushCurrentPart();
 				continue;
+			}
+
+			const QPointF screenStart = ToScreenPoint(clippedStart);
+			const QPointF screenEnd = ToScreenPoint(clippedEnd);
+			if (!std::isfinite(screenStart.x()) || !std::isfinite(screenStart.y()) || !std::isfinite(screenEnd.x()) || !std::isfinite(screenEnd.y()))
+			{
+				FlushCurrentPart();
+				continue;
+			}
+
+			if (currentPart.isEmpty())
+			{
+				currentPart << screenStart << screenEnd;
+			}
+			else if (AreScreenPointsNearlyEqual(currentPart.back(), screenStart))
+			{
+				if (!AreScreenPointsNearlyEqual(currentPart.back(), screenEnd))
+				{
+					currentPart << screenEnd;
+				}
+			}
+			else
+			{
+				FlushCurrentPart();
+				currentPart << screenStart << screenEnd;
+			}
+
+			if (currentPart.size() >= MaxVectorBatchPointCount)
+			{
+				const QPointF lastPoint = currentPart.back();
+				painter.drawPolyline(currentPart);
+				currentPart.clear();
+				currentPart << lastPoint;
 			}
 		}
 
-		const QRectF targetRect(
-			(clippedWorldRect.minX - viewMinX) * inversePixelSize,
-			(viewMaxY - clippedWorldRect.maxY) * inversePixelSize,
-			clippedWorldRect.Width() * inversePixelSize,
-			clippedWorldRect.Height() * inversePixelSize);
-
-		if (!targetRect.isValid() || targetRect.isEmpty() || !targetRect.intersects(safeExposedRect))
-		{
-			continue;
-		}
-
-		const QRectF sourceRect(
-			(clippedWorldRect.minX - cachedTile.tile.extent.minX) * cachedTile.inverseTileExtentWidth * cachedTile.pixmapWidth,
-			(cachedTile.tile.extent.maxY - clippedWorldRect.maxY) * cachedTile.inverseTileExtentHeight * cachedTile.pixmapHeight,
-			clippedWorldRect.Width() * cachedTile.inverseTileExtentWidth * cachedTile.pixmapWidth,
-			clippedWorldRect.Height() * cachedTile.inverseTileExtentHeight * cachedTile.pixmapHeight);
-
-		if (!sourceRect.isValid() || sourceRect.isEmpty())
-		{
-			continue;
-		}
-
-		const bool needsSmoothTransform = std::abs(targetRect.width() - sourceRect.width()) > 0.25 ||
-			std::abs(targetRect.height() - sourceRect.height()) > 0.25;
-		if (needsSmoothTransform != lastSmoothPixmapTransform)
-		{
-			painter.setRenderHint(QPainter::SmoothPixmapTransform, needsSmoothTransform);
-			lastSmoothPixmapTransform = needsSmoothTransform;
-		}
-
-		painter.drawPixmap(targetRect, cachedTile.pixmap, sourceRect);
-	}
-
-	if (lastSmoothPixmapTransform)
-	{
-		painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
-	}
-
-	if (hasPreciseCrsClip)
-	{
-		painter.restore();
+		FlushCurrentPart();
 	}
 }
 
 void QMainCanvas::DrawMapContent(QPainter& painter, const QRectF& exposedRect) const
 {
 	DrawBackground(painter);
-	DrawMapTiles(painter, exposedRect);
+	DrawDrawables(painter, exposedRect);
 	DrawCoordinateAxes(painter);
 	DrawCrsValidArea(painter);
 }
@@ -2592,6 +4026,38 @@ bool QMainCanvas::HasVisibleMapTileIntersectingExtent(const GB_Rectangle& extent
 	return false;
 }
 
+GB_Rectangle QMainCanvas::CalculateVisibleVectorDrawableExtent() const
+{
+	GB_Rectangle result;
+	result.Reset();
+
+	for (const CachedPointDrawable& item : pointDrawables)
+	{
+		if (item.point.visible && item.extent.IsValid())
+		{
+			result.Expand(item.extent);
+		}
+	}
+
+	for (const CachedPolylineDrawable& item : polylineDrawables)
+	{
+		if (item.polyline.visible && item.extent.IsValid())
+		{
+			result.Expand(item.extent);
+		}
+	}
+
+	for (const CachedPolygonDrawable& item : polygonDrawables)
+	{
+		if (item.polygon.visible && item.extent.IsValid())
+		{
+			result.Expand(item.extent);
+		}
+	}
+
+	return result;
+}
+
 GB_Rectangle QMainCanvas::CalculateAllDrawableExtent() const
 {
 	if (!allDrawableExtentCacheDirty)
@@ -2610,25 +4076,11 @@ GB_Rectangle QMainCanvas::CalculateAllDrawableExtent() const
 		}
 	}
 
-	//for (const VectorDrawable& item : vectorDrawables)
-	//{
-	//	if (item.visible)
-	//	{
-	//		const GB_Rectangle extent = item.CalculateExtent();
-	//		if (extent.IsValid())
-	//		{
-	//			result.Expand(extent);
-	//		}
-	//	}
-	//}
-
-	//for (const ExtentMarkerDrawable& item : extentMarkerDrawables)
-	//{
-	//	if (item.visible && item.extent.IsValid())
-	//	{
-	//		result.Expand(item.extent);
-	//	}
-	//}
+	const GB_Rectangle vectorDrawableExtent = CalculateVisibleVectorDrawableExtent();
+	if (vectorDrawableExtent.IsValid())
+	{
+		result.Expand(vectorDrawableExtent);
+	}
 
 	allDrawableExtentCache = result;
 	allDrawableExtentCacheDirty = false;
