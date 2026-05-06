@@ -136,7 +136,7 @@ void ThreadFunc()
 int main(int argc, char* argv[])
 {
 	const GB_Rectangle testExtent(-10000000.0, -10000000.0, 10000000.0, 10000000.0);
-	polygons = CreateRandomPolygonDrawables(20000, testExtent);
+	polygons = CreateRandomPolygonDrawables(5000000, testExtent);
 
 
 	QApplication app(argc, argv);

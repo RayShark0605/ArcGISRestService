@@ -32,6 +32,21 @@ class QPainterPath;
 class QResizeEvent;
 class QWheelEvent;
 
+
+struct QMainCanvasSpatialIndexNode
+{
+	GB_Rectangle extent;
+	std::vector<size_t> drawableIndices;
+	int firstChildIndex = -1;
+};
+
+struct QMainCanvasSpatialIndex
+{
+	GB_Rectangle extent;
+	std::vector<QMainCanvasSpatialIndexNode> nodes;
+	bool isValid = false;
+};
+
 class QMainCanvas : public QWidget
 {
 	Q_OBJECT
@@ -220,18 +235,15 @@ private:
 	mutable std::vector<size_t> mapTileVisibleIndexScratch;
 
 	mutable bool pointDrawableSpatialIndexDirty = true;
-	mutable std::vector<size_t> pointDrawableMinXOrderCache;
-	mutable std::vector<size_t> pointDrawableMaxXOrderCache;
+	mutable QMainCanvasSpatialIndex pointDrawableSpatialIndexCache;
 	mutable std::vector<size_t> pointDrawableVisibleIndexScratch;
 
 	mutable bool polylineDrawableSpatialIndexDirty = true;
-	mutable std::vector<size_t> polylineDrawableMinXOrderCache;
-	mutable std::vector<size_t> polylineDrawableMaxXOrderCache;
+	mutable QMainCanvasSpatialIndex polylineDrawableSpatialIndexCache;
 	mutable std::vector<size_t> polylineDrawableVisibleIndexScratch;
 
 	mutable bool polygonDrawableSpatialIndexDirty = true;
-	mutable std::vector<size_t> polygonDrawableMinXOrderCache;
-	mutable std::vector<size_t> polygonDrawableMaxXOrderCache;
+	mutable QMainCanvasSpatialIndex polygonDrawableSpatialIndexCache;
 	mutable std::vector<size_t> polygonDrawableVisibleIndexScratch;
 
 	mutable std::vector<VisibleDrawableReference> visibleDrawableReferenceScratch;
@@ -309,6 +321,8 @@ private:
 	void DrawCachedPointDrawable(QPainter& painter, const CachedPointDrawable& cachedPoint, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const;
 	void DrawCachedPolylineDrawable(QPainter& painter, const CachedPolylineDrawable& cachedPolyline, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const;
 	void DrawCachedPolygonDrawable(QPainter& painter, const CachedPolygonDrawable& cachedPolygon, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const;
+	void DrawVisibleDrawableReferencesExact(QPainter& painter, const QRectF& exposedRect, const GB_Rectangle& mapTileQueryWorldExtent, const GB_Rectangle& pointDrawQueryWorldExtent, const GB_Rectangle& polylineDrawQueryWorldExtent, const GB_Rectangle& polygonDrawQueryWorldExtent, const QPainterPath* crsClipPath, bool hasPreciseCrsClip, bool canUseCrsPolygonExtents) const;
+	void DrawVectorDrawablesFastLod(QPainter& painter, const QRectF& exposedRect, const GB_Rectangle& pointDrawQueryWorldExtent, const GB_Rectangle& polylineDrawQueryWorldExtent, const GB_Rectangle& polygonDrawQueryWorldExtent, const std::vector<size_t>& pointIndices, const std::vector<size_t>& polylineIndices, const std::vector<size_t>& polygonIndices) const;
 	void DrawCoordinateAxes(QPainter& painter) const;
 	void DrawCrsValidArea(QPainter& painter) const;
 	void DrawMapContent(QPainter& painter, const QRectF& exposedRect) const;
