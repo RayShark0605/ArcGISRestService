@@ -166,14 +166,17 @@
     <ClInclude Include="GeoBase\GB_Utility.h" />
     <ClInclude Include="GeoBase\GB_Variant.h" />
     <ClInclude Include="GeoBase\Geometry\GB_GeometryInterface.h" />
+    <ClInclude Include="GeoBase\Geometry\GB_LineSegment.h" />
     <ClInclude Include="GeoBase\Geometry\GB_Matrix3x3.h" />
     <ClInclude Include="GeoBase\Geometry\GB_Point2d.h" />
+    <ClInclude Include="GeoBase\Geometry\GB_Polyline.h" />
     <ClInclude Include="GeoBase\Geometry\GB_Rectangle.h" />
     <ClInclude Include="GeoBase\Geometry\GB_Vector2d.h" />
     <ClInclude Include="GeoBoundingBox.h" />
     <ClInclude Include="GeoCrs.h" />
     <ClInclude Include="GeoCrsManager.h" />
     <ClInclude Include="GeoCrsTransform.h" />
+    <ClInclude Include="GeoVectorGeometry.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="ArcGISRestCapabilities.cpp" />
@@ -195,14 +198,17 @@
     <ClCompile Include="GeoBase\GB_Utility.cpp" />
     <ClCompile Include="GeoBase\GB_Variant.cpp" />
     <ClCompile Include="GeoBase\Geometry\GB_GeometryInterface.cpp" />
+    <ClCompile Include="GeoBase\Geometry\GB_LineSegment.cpp" />
     <ClCompile Include="GeoBase\Geometry\GB_Matrix3x3.cpp" />
     <ClCompile Include="GeoBase\Geometry\GB_Point2d.cpp" />
+    <ClCompile Include="GeoBase\Geometry\GB_Polyline.cpp" />
     <ClCompile Include="GeoBase\Geometry\GB_Rectangle.cpp" />
     <ClCompile Include="GeoBase\Geometry\GB_Vector2d.cpp" />
     <ClCompile Include="GeoBoundingBox.cpp" />
     <ClCompile Include="GeoCrs.cpp" />
     <ClCompile Include="GeoCrsManager.cpp" />
     <ClCompile Include="GeoCrsTransform.cpp" />
+    <ClCompile Include="GeoVectorGeometry.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

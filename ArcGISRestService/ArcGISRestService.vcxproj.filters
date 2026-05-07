@@ -120,6 +120,15 @@
     <ClInclude Include="GeoBase\CV\GB_Image.h">
       <Filter>头文件\GeoBase\CV</Filter>
     </ClInclude>
+    <ClInclude Include="GeoBase\Geometry\GB_LineSegment.h">
+      <Filter>头文件\GeoBase\Geometry</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoBase\Geometry\GB_Polyline.h">
+      <Filter>头文件\GeoBase\Geometry</Filter>
+    </ClInclude>
+    <ClInclude Include="GeoVectorGeometry.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="GeoBase\GB_Config.cpp">
@@ -202,6 +211,15 @@
     </ClCompile>
     <ClCompile Include="GeoBase\CV\GB_Image.cpp">
       <Filter>源文件\GeoBase\CV</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBase\Geometry\GB_LineSegment.cpp">
+      <Filter>源文件\GeoBase\Geometry</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoBase\Geometry\GB_Polyline.cpp">
+      <Filter>源文件\GeoBase\Geometry</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoVectorGeometry.cpp">
+      <Filter>源文件</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>
