@@ -18,6 +18,8 @@
 #include <QPainterPath>
 #include <QPaintEvent>
 #include <QPixmap>
+#include <QOpenGLShaderProgram>
+#include <QVector2D>
 #include <QMetaObject>
 #include <QThread>
 #include <QPen>
@@ -32,6 +34,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <stack>
 #include <unordered_set>
 #include <utility>
@@ -55,9 +58,13 @@ namespace
 	constexpr size_t MaxExactVectorDrawableCount = 30000;
 	constexpr size_t MaxFastLodDrawnDrawableCount = 24000;
 	constexpr int FastLodGridCellSizePixels = 8;
-	constexpr unsigned char FastLodMaxDrawCountPerCell = 1;
+	constexpr double FastLodTargetDensityMultiplier = 1.15;
+	constexpr size_t MinimumFastLodTargetDrawableCount = 256;
 	constexpr double MinimumFastLodScreenRectSizePixels = 1.25;
 	constexpr double MinimumVectorPaintMarginPixels = 1.0;
+	constexpr size_t MaxOpenGLVectorChunkVertexCount = 262144;
+	constexpr size_t MaxOpenGLVectorChunkDrawableCount = 8192;
+	constexpr int MaxOpenGLPolygonEarClipVertexCount = 2048;
 	const std::string CrsValidAreaDrawableUid = "__QMainCanvas_CrsValidArea__";
 
 	QColor ToQColor(const GB_ColorRGBA& color)
@@ -824,6 +831,19 @@ namespace
 		}
 	}
 
+	template <typename TContainer, typename TGetExtent, typename TIsVisible>
+	size_t CountVisibleDrawableIndicesBySpatialIndexTree(const TContainer& drawables, const QMainCanvasSpatialIndex& spatialIndex,
+		const GB_Rectangle& queryWorldExtent, TGetExtent getExtent, TIsVisible isVisible)
+	{
+		size_t count = 0;
+		ForEachVisibleDrawableIndexBySpatialIndexTree(drawables, spatialIndex, queryWorldExtent, getExtent, isVisible, [&count](size_t) -> bool
+			{
+				count++;
+				return true;
+			});
+		return count;
+	}
+
 	class VectorLodPaintGrid
 	{
 	public:
@@ -1117,9 +1137,277 @@ namespace
 		}
 		return value.toInt(defaultValue);
 	}
+
+	float ColorChannelToFloat(unsigned char value)
+	{
+		return static_cast<float>(value) / 255.0f;
+	}
+
+	std::uint64_t MixUInt64(std::uint64_t value)
+	{
+		value += 0x9E3779B97F4A7C15ull;
+		value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ull;
+		value = (value ^ (value >> 27)) * 0x94D049BB133111EBull;
+		return value ^ (value >> 31);
+	}
+
+	std::uint64_t CombineHash(std::uint64_t seed, std::uint64_t value)
+	{
+		return MixUInt64(seed ^ (value + 0x9E3779B97F4A7C15ull + (seed << 6) + (seed >> 2)));
+	}
+
+	double HashToUnitDouble(std::uint64_t hashValue)
+	{
+		return static_cast<double>(hashValue >> 11) * (1.0 / 9007199254740992.0);
+	}
+
+	size_t CalculateFastLodTargetDrawableCount(const QRectF& exposedRect, size_t candidateCount)
+	{
+		if (candidateCount == 0)
+		{
+			return 0;
+		}
+
+		const double safeWidth = std::max(1.0, exposedRect.isValid() ? exposedRect.width() : 1.0);
+		const double safeHeight = std::max(1.0, exposedRect.isValid() ? exposedRect.height() : 1.0);
+		const double targetByArea = std::ceil(safeWidth * safeHeight / static_cast<double>(FastLodGridCellSizePixels * FastLodGridCellSizePixels) * FastLodTargetDensityMultiplier);
+		const size_t screenTarget = static_cast<size_t>(std::max<double>(static_cast<double>(MinimumFastLodTargetDrawableCount), targetByArea));
+		return std::min(candidateCount, std::min(MaxFastLodDrawnDrawableCount, screenTarget));
+	}
+
+	bool ShouldAcceptFastLodDrawable(size_t drawableIndex, std::uint64_t insertionSequence, std::uint64_t salt, size_t candidateCount, size_t targetCount)
+	{
+		if (targetCount >= candidateCount)
+		{
+			return true;
+		}
+
+		if (targetCount == 0 || candidateCount == 0)
+		{
+			return false;
+		}
+
+		std::uint64_t hashValue = MixUInt64(salt);
+		hashValue = CombineHash(hashValue, static_cast<std::uint64_t>(drawableIndex));
+		hashValue = CombineHash(hashValue, insertionSequence);
+		return HashToUnitDouble(hashValue) < static_cast<double>(targetCount) / static_cast<double>(candidateCount);
+	}
+
+	float GetOpenGLPointShape(PointDrawable::SymbolShape shape)
+	{
+		switch (shape)
+		{
+		case PointDrawable::SymbolShape::Circle:
+			return 0.0f;
+		case PointDrawable::SymbolShape::Square:
+			return 1.0f;
+		case PointDrawable::SymbolShape::Triangle:
+			return 2.0f;
+		case PointDrawable::SymbolShape::Cross:
+			return 3.0f;
+		case PointDrawable::SymbolShape::X:
+			return 4.0f;
+		case PointDrawable::SymbolShape::Star:
+			return 5.0f;
+		case PointDrawable::SymbolShape::FivePointStar:
+			return 6.0f;
+		case PointDrawable::SymbolShape::Diamond:
+			return 7.0f;
+		default:
+			return 0.0f;
+		}
+	}
+
+	double CalculateSignedArea(const std::vector<GB_Point2d>& points)
+	{
+		if (points.size() < 3)
+		{
+			return 0.0;
+		}
+
+		double area = 0.0;
+		const size_t pointCount = points.size();
+		for (size_t i = 0; i < pointCount; i++)
+		{
+			const GB_Point2d& currentPoint = points[i];
+			const GB_Point2d& nextPoint = points[(i + 1) % pointCount];
+			area += currentPoint.x * nextPoint.y - nextPoint.x * currentPoint.y;
+		}
+		return area * 0.5;
+	}
+
+	double Cross(const GB_Point2d& a, const GB_Point2d& b, const GB_Point2d& c)
+	{
+		return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+	}
+
+	bool IsPointInTriangleInclusive(const GB_Point2d& point, const GB_Point2d& a, const GB_Point2d& b, const GB_Point2d& c)
+	{
+		const double c1 = Cross(a, b, point);
+		const double c2 = Cross(b, c, point);
+		const double c3 = Cross(c, a, point);
+		const bool hasNegative = c1 < -GB_Epsilon || c2 < -GB_Epsilon || c3 < -GB_Epsilon;
+		const bool hasPositive = c1 > GB_Epsilon || c2 > GB_Epsilon || c3 > GB_Epsilon;
+		return !(hasNegative && hasPositive);
+	}
+
+	bool IsConvexPolygon(const std::vector<GB_Point2d>& points)
+	{
+		if (points.size() < 3)
+		{
+			return false;
+		}
+
+		int sign = 0;
+		const size_t pointCount = points.size();
+		for (size_t i = 0; i < pointCount; i++)
+		{
+			const double crossValue = Cross(points[i], points[(i + 1) % pointCount], points[(i + 2) % pointCount]);
+			if (std::abs(crossValue) <= GB_Epsilon)
+			{
+				continue;
+			}
+
+			const int currentSign = crossValue > 0.0 ? 1 : -1;
+			if (sign == 0)
+			{
+				sign = currentSign;
+			}
+			else if (sign != currentSign)
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool BuildSimplePolygonTriangles(const std::vector<GB_Point2d>& sourceVertices, std::vector<GB_Point2d>& outTriangleVertices)
+	{
+		outTriangleVertices.clear();
+		std::vector<GB_Point2d> vertices;
+		vertices.reserve(sourceVertices.size());
+		for (const GB_Point2d& point : sourceVertices)
+		{
+			if (!IsPointFinite(point))
+			{
+				outTriangleVertices.clear();
+				return false;
+			}
+			AppendPointIfUseful(vertices, point);
+		}
+
+		RemoveClosingDuplicatePoint(vertices);
+		if (vertices.size() < 3)
+		{
+			return false;
+		}
+
+		double signedArea = CalculateSignedArea(vertices);
+		if (std::abs(signedArea) <= GB_Epsilon)
+		{
+			return false;
+		}
+
+		if (signedArea < 0.0)
+		{
+			std::reverse(vertices.begin(), vertices.end());
+			signedArea = -signedArea;
+		}
+
+		if (vertices.size() > static_cast<size_t>(MaxOpenGLPolygonEarClipVertexCount))
+		{
+			if (!IsConvexPolygon(vertices))
+			{
+				return false;
+			}
+
+			outTriangleVertices.reserve((vertices.size() - 2) * 3);
+			for (size_t i = 1; i + 1 < vertices.size(); i++)
+			{
+				outTriangleVertices.push_back(vertices[0]);
+				outTriangleVertices.push_back(vertices[i]);
+				outTriangleVertices.push_back(vertices[i + 1]);
+			}
+			return !outTriangleVertices.empty();
+		}
+
+		std::vector<size_t> indices;
+		indices.reserve(vertices.size());
+		for (size_t i = 0; i < vertices.size(); i++)
+		{
+			indices.push_back(i);
+		}
+
+		outTriangleVertices.reserve((vertices.size() - 2) * 3);
+		size_t guard = 0;
+		while (indices.size() > 3 && guard < vertices.size() * vertices.size())
+		{
+			bool clippedEar = false;
+			const size_t indexCount = indices.size();
+			for (size_t i = 0; i < indexCount; i++)
+			{
+				const size_t previousIndex = indices[(i + indexCount - 1) % indexCount];
+				const size_t currentIndex = indices[i];
+				const size_t nextIndex = indices[(i + 1) % indexCount];
+				const GB_Point2d& previousPoint = vertices[previousIndex];
+				const GB_Point2d& currentPoint = vertices[currentIndex];
+				const GB_Point2d& nextPoint = vertices[nextIndex];
+
+				if (Cross(previousPoint, currentPoint, nextPoint) <= GB_Epsilon)
+				{
+					continue;
+				}
+
+				bool containsOtherPoint = false;
+				for (size_t testPosition = 0; testPosition < indexCount; testPosition++)
+				{
+					const size_t testIndex = indices[testPosition];
+					if (testIndex == previousIndex || testIndex == currentIndex || testIndex == nextIndex)
+					{
+						continue;
+					}
+
+					if (IsPointInTriangleInclusive(vertices[testIndex], previousPoint, currentPoint, nextPoint))
+					{
+						containsOtherPoint = true;
+						break;
+					}
+				}
+
+				if (containsOtherPoint)
+				{
+					continue;
+				}
+
+				outTriangleVertices.push_back(previousPoint);
+				outTriangleVertices.push_back(currentPoint);
+				outTriangleVertices.push_back(nextPoint);
+				indices.erase(indices.begin() + static_cast<std::ptrdiff_t>(i));
+				clippedEar = true;
+				break;
+			}
+
+			if (!clippedEar)
+			{
+				outTriangleVertices.clear();
+				return false;
+			}
+			guard++;
+		}
+
+		if (indices.size() == 3)
+		{
+			outTriangleVertices.push_back(vertices[indices[0]]);
+			outTriangleVertices.push_back(vertices[indices[1]]);
+			outTriangleVertices.push_back(vertices[indices[2]]);
+		}
+
+		return !outTriangleVertices.empty();
+	}
+
 }
 
-QMainCanvas::QMainCanvas(QWidget* parent) : QWidget(parent)
+QMainCanvas::QMainCanvas(QWidget* parent) : QOpenGLWidget(parent)
 {
 	qRegisterMetaType<GB_Rectangle>("GB_Rectangle");
 	qRegisterMetaType<GB_Point2d>("GB_Point2d");
@@ -1130,6 +1418,7 @@ QMainCanvas::QMainCanvas(QWidget* parent) : QWidget(parent)
 	setAcceptDrops(true);
 	setAutoFillBackground(false);
 	setAttribute(Qt::WA_OpaquePaintEvent, true);
+	setUpdateBehavior(QOpenGLWidget::NoPartialUpdate);
 
 	viewStateChangedDebounceTimer.setSingleShot(true);
 	viewStateChangedDebounceTimer.setTimerType(Qt::PreciseTimer);
@@ -1147,6 +1436,12 @@ QMainCanvas::QMainCanvas(QWidget* parent) : QWidget(parent)
 
 QMainCanvas::~QMainCanvas()
 {
+	if (openGLInitialized)
+	{
+		makeCurrent();
+		DestroyOpenGLResources();
+		doneCurrent();
+	}
 }
 
 QString QMainCanvas::GetServiceNodeMimeType()
@@ -2160,6 +2455,7 @@ void QMainCanvas::SetDrawablesVisible(const std::vector<std::string>& drawablesU
 
 	if (hasChanged)
 	{
+		InvalidateOpenGLVectorCache();
 		InvalidateAllDrawableExtentCache();
 		InvalidateMapContentCache();
 		update();
@@ -2223,18 +2519,77 @@ void QMainCanvas::SetDrawablesLayerNumber(const std::vector<std::string>& drawab
 			std::sort(mapTiles.begin(), mapTiles.end(), IsCachedMapTilePaintOrderLess);
 			InvalidateMapTileSpatialIndex();
 		}
+		InvalidateOpenGLVectorCache();
 		InvalidateMapContentCache();
 		update();
 	}
 }
 
-void QMainCanvas::paintEvent(QPaintEvent* event)
+void QMainCanvas::SetRenderBackend(QMainCanvasRenderBackend backend)
 {
-	const QRectF exposedRect = event ? QRectF(event->rect()) : QRectF(rect());
+	if (renderBackend == backend)
+	{
+		return;
+	}
+
+	renderBackend = backend;
+	InvalidateMapContentCache();
+	update();
+}
+
+QMainCanvasRenderBackend QMainCanvas::GetRenderBackend() const
+{
+	return renderBackend;
+}
+
+bool QMainCanvas::IsOpenGLRenderBackendUsable() const
+{
+	return openGLInitialized && !openGLProgramsFailed;
+}
+
+void QMainCanvas::initializeGL()
+{
+	initializeOpenGLFunctions();
+	openGLInitialized = true;
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_CULL_FACE);
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+}
+
+void QMainCanvas::resizeGL(int width, int height)
+{
+	if (width > 0 && height > 0)
+	{
+		glViewport(0, 0, width, height);
+	}
+}
+
+void QMainCanvas::paintGL()
+{
+	const QRectF exposedRect(rect());
+	glViewport(0, 0, std::max(1, width()), std::max(1, height()));
+	glDisable(GL_SCISSOR_TEST);
+	glDisable(GL_DEPTH_TEST);
+	glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
 
 	QPainter painter(this);
 	painter.setClipRect(exposedRect);
 
+	if (renderBackend == QMainCanvasRenderBackend::OpenGL && openGLInitialized && EnsureOpenGLPrograms())
+	{
+		RenderWithOpenGLBackend(painter, exposedRect);
+	}
+	else
+	{
+		RenderWithQPainter(painter, exposedRect);
+	}
+}
+
+void QMainCanvas::RenderWithQPainter(QPainter& painter, const QRectF& exposedRect) const
+{
 	if (isPanning && hasPanPreview && !panPreviewPixmap.isNull() && viewExtent.IsValid() && panPreviewViewExtent.IsValid() && AreNearlyEqual(pixelSize, panPreviewPixelSize))
 	{
 		DrawBackground(painter);
@@ -2258,12 +2613,11 @@ void QMainCanvas::paintEvent(QPaintEvent* event)
 			DrawMapContent(painter, exposedRect);
 		}
 	}
-
 }
 
 void QMainCanvas::resizeEvent(QResizeEvent* event)
 {
-	QWidget::resizeEvent(event);
+	QOpenGLWidget::resizeEvent(event);
 	InvalidateMapContentCache();
 	hasPanPreview = false;
 	panPreviewPixmap = QPixmap();
@@ -2293,9 +2647,17 @@ void QMainCanvas::mousePressEvent(QMouseEvent* event)
 
 	if (event->button() == Qt::LeftButton || event->button() == Qt::MiddleButton)
 	{
-		EnsureMapContentCache();
-		panPreviewPixmap = mapContentCache;
-		hasPanPreview = !panPreviewPixmap.isNull() && viewExtent.IsValid() && IsFinitePositive(pixelSize);
+		if (renderBackend == QMainCanvasRenderBackend::OpenGL && IsOpenGLRenderBackendUsable())
+		{
+			panPreviewPixmap = QPixmap();
+			hasPanPreview = false;
+		}
+		else
+		{
+			EnsureMapContentCache();
+			panPreviewPixmap = mapContentCache;
+			hasPanPreview = !panPreviewPixmap.isNull() && viewExtent.IsValid() && IsFinitePositive(pixelSize);
+		}
 		panPreviewViewExtent = viewExtent;
 		panPreviewPixelSize = pixelSize;
 
@@ -2306,7 +2668,7 @@ void QMainCanvas::mousePressEvent(QMouseEvent* event)
 		return;
 	}
 
-	QWidget::mousePressEvent(event);
+	QOpenGLWidget::mousePressEvent(event);
 }
 
 void QMainCanvas::mouseMoveEvent(QMouseEvent* event)
@@ -2365,7 +2727,7 @@ void QMainCanvas::mouseMoveEvent(QMouseEvent* event)
 
 	Q_UNUSED(mousePositionChanged);
 
-	QWidget::mouseMoveEvent(event);
+	QOpenGLWidget::mouseMoveEvent(event);
 }
 
 void QMainCanvas::mouseReleaseEvent(QMouseEvent* event)
@@ -2390,7 +2752,7 @@ void QMainCanvas::mouseReleaseEvent(QMouseEvent* event)
 		return;
 	}
 
-	QWidget::mouseReleaseEvent(event);
+	QOpenGLWidget::mouseReleaseEvent(event);
 }
 
 
@@ -2422,7 +2784,7 @@ void QMainCanvas::wheelEvent(QWheelEvent* event)
 			return;
 		}
 
-		QWidget::wheelEvent(event);
+		QOpenGLWidget::wheelEvent(event);
 		return;
 	}
 
@@ -2488,7 +2850,7 @@ void QMainCanvas::wheelEvent(QWheelEvent* event)
 void QMainCanvas::leaveEvent(QEvent* event)
 {
 	ClearMousePosition();
-	QWidget::leaveEvent(event);
+	QOpenGLWidget::leaveEvent(event);
 }
 
 void QMainCanvas::dragEnterEvent(QDragEnterEvent* event)
@@ -2499,7 +2861,7 @@ void QMainCanvas::dragEnterEvent(QDragEnterEvent* event)
 		return;
 	}
 
-	QWidget::dragEnterEvent(event);
+	QOpenGLWidget::dragEnterEvent(event);
 }
 
 void QMainCanvas::dragMoveEvent(QDragMoveEvent* event)
@@ -2510,14 +2872,14 @@ void QMainCanvas::dragMoveEvent(QDragMoveEvent* event)
 		return;
 	}
 
-	QWidget::dragMoveEvent(event);
+	QOpenGLWidget::dragMoveEvent(event);
 }
 
 void QMainCanvas::dropEvent(QDropEvent* event)
 {
 	if (!event || !event->mimeData() || !event->mimeData()->hasFormat(GetServiceNodeMimeType()))
 	{
-		QWidget::dropEvent(event);
+		QOpenGLWidget::dropEvent(event);
 		return;
 	}
 
@@ -3048,6 +3410,7 @@ void QMainCanvas::InvalidatePointDrawableSpatialIndex() const
 	pointDrawableSpatialIndexDirty = true;
 	ClearDrawableSpatialIndex(pointDrawableSpatialIndexCache);
 	pointDrawableVisibleIndexScratch.clear();
+	InvalidateOpenGLVectorCache();
 }
 
 void QMainCanvas::CollectVisiblePointDrawableIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const
@@ -3097,6 +3460,7 @@ void QMainCanvas::InvalidatePolylineDrawableSpatialIndex() const
 	polylineDrawableSpatialIndexDirty = true;
 	ClearDrawableSpatialIndex(polylineDrawableSpatialIndexCache);
 	polylineDrawableVisibleIndexScratch.clear();
+	InvalidateOpenGLVectorCache();
 }
 
 void QMainCanvas::CollectVisiblePolylineDrawableIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const
@@ -3146,6 +3510,7 @@ void QMainCanvas::InvalidatePolygonDrawableSpatialIndex() const
 	polygonDrawableSpatialIndexDirty = true;
 	ClearDrawableSpatialIndex(polygonDrawableSpatialIndexCache);
 	polygonDrawableVisibleIndexScratch.clear();
+	InvalidateOpenGLVectorCache();
 }
 
 void QMainCanvas::CollectVisiblePolygonDrawableIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const
@@ -3259,6 +3624,904 @@ double QMainCanvas::GetMaxPolygonDrawableScreenMarginPixels() const
 void QMainCanvas::DrawBackground(QPainter& painter) const
 {
 	painter.fillRect(rect(), Qt::white);
+}
+
+
+bool QMainCanvas::EnsureOpenGLPrograms()
+{
+	if (openGLProgramsReady)
+	{
+		return true;
+	}
+
+	if (openGLProgramsFailed || !openGLInitialized)
+	{
+		return false;
+	}
+
+	const char* pointVertexShader =
+		"attribute vec2 aCenter;\n"
+		"attribute vec2 aLocalOffset;\n"
+		"attribute vec4 aParams0;\n"
+		"attribute vec4 aFillColor;\n"
+		"attribute vec4 aBorderColor;\n"
+		"uniform vec2 uOriginScreen;\n"
+		"uniform float uInvPixelSize;\n"
+		"uniform vec2 uViewportSize;\n"
+		"varying vec2 vLocalOffset;\n"
+		"varying vec4 vParams0;\n"
+		"varying vec4 vFillColor;\n"
+		"varying vec4 vBorderColor;\n"
+		"void main()\n"
+		"{\n"
+		"    vec2 centerScreen = vec2(uOriginScreen.x + aCenter.x * uInvPixelSize, uOriginScreen.y - aCenter.y * uInvPixelSize);\n"
+		"    vec2 screenPosition = centerScreen + aLocalOffset;\n"
+		"    vec2 clipPosition = vec2(screenPosition.x / uViewportSize.x * 2.0 - 1.0, 1.0 - screenPosition.y / uViewportSize.y * 2.0);\n"
+		"    gl_Position = vec4(clipPosition, 0.0, 1.0);\n"
+		"    vLocalOffset = aLocalOffset;\n"
+		"    vParams0 = aParams0;\n"
+		"    vFillColor = aFillColor;\n"
+		"    vBorderColor = aBorderColor;\n"
+		"}\n";
+
+	const char* pointFragmentShader =
+		"#ifdef GL_ES\n"
+		"precision mediump float;\n"
+		"#endif\n"
+		"varying vec2 vLocalOffset;\n"
+		"varying vec4 vParams0;\n"
+		"varying vec4 vFillColor;\n"
+		"varying vec4 vBorderColor;\n"
+		"float sdCircle(vec2 p, float r) { return length(p) - r; }\n"
+		"float sdBox(vec2 p, float r) { vec2 d = abs(p) - vec2(r, r); return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0); }\n"
+		"float sdDiamond(vec2 p, float r) { return (abs(p.x) + abs(p.y) - r) * 0.70710678; }\n"
+		"float sdTriangle(vec2 p, float r)\n"
+		"{\n"
+		"    vec2 a = vec2(0.0, -r);\n"
+		"    vec2 b = vec2(r, r);\n"
+		"    vec2 c = vec2(-r, r);\n"
+		"    float d1 = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);\n"
+		"    float d2 = (c.x - b.x) * (p.y - b.y) - (c.y - b.y) * (p.x - b.x);\n"
+		"    float d3 = (a.x - c.x) * (p.y - c.y) - (a.y - c.y) * (p.x - c.x);\n"
+		"    float outside = max(max(-d1, -d2), -d3) / max(r * 2.0, 1.0);\n"
+		"    return outside;\n"
+		"}\n"
+		"void main()\n"
+		"{\n"
+		"    float symbolSize = max(vParams0.x, 1.0);\n"
+		"    float borderWidth = max(vParams0.y, 0.0);\n"
+		"    float shape = vParams0.z;\n"
+		"    float filled = vParams0.w;\n"
+		"    vec2 p = vLocalOffset;\n"
+		"    float halfSymbolSize = symbolSize * 0.5;\n"
+		"    float distanceValue = 0.0;\n"
+		"    bool lineSymbol = false;\n"
+		"    if (shape < 0.5)\n"
+		"    {\n"
+		"        distanceValue = sdCircle(p, halfSymbolSize);\n"
+		"    }\n"
+		"    else if (shape < 1.5)\n"
+		"    {\n"
+		"        distanceValue = sdBox(p, halfSymbolSize);\n"
+		"    }\n"
+		"    else if (shape < 2.5)\n"
+		"    {\n"
+		"        distanceValue = sdTriangle(p, halfSymbolSize);\n"
+		"    }\n"
+		"    else if (shape < 3.5)\n"
+		"    {\n"
+		"        float lineHalfWidth = max(borderWidth, 1.0) * 0.5;\n"
+		"        float bar = max(abs(p.x) - lineHalfWidth, abs(p.y) - halfSymbolSize);\n"
+		"        float bar2 = max(abs(p.y) - lineHalfWidth, abs(p.x) - halfSymbolSize);\n"
+		"        distanceValue = min(bar, bar2);\n"
+		"        lineSymbol = true;\n"
+		"    }\n"
+		"    else if (shape < 4.5)\n"
+		"    {\n"
+		"        float lineHalfWidth = max(borderWidth, 1.0) * 0.5;\n"
+		"        float d1 = abs(p.x - p.y) * 0.70710678 - lineHalfWidth;\n"
+		"        float d2 = abs(p.x + p.y) * 0.70710678 - lineHalfWidth;\n"
+		"        float clip = max(abs(p.x), abs(p.y)) - halfSymbolSize;\n"
+		"        distanceValue = max(min(d1, d2), clip);\n"
+		"        lineSymbol = true;\n"
+		"    }\n"
+		"    else if (shape < 5.5)\n"
+		"    {\n"
+		"        float lineHalfWidth = max(borderWidth, 1.0) * 0.5;\n"
+		"        float bar = max(abs(p.x) - lineHalfWidth, abs(p.y) - halfSymbolSize);\n"
+		"        float bar2 = max(abs(p.y) - lineHalfWidth, abs(p.x) - halfSymbolSize);\n"
+		"        float d1 = abs(p.x - p.y) * 0.70710678 - lineHalfWidth;\n"
+		"        float d2 = abs(p.x + p.y) * 0.70710678 - lineHalfWidth;\n"
+		"        float clip = max(abs(p.x), abs(p.y)) - halfSymbolSize;\n"
+		"        distanceValue = min(min(bar, bar2), max(min(d1, d2), clip));\n"
+		"        lineSymbol = true;\n"
+		"    }\n"
+		"    else if (shape < 6.5)\n"
+		"    {\n"
+		"        float angle = atan(p.y, p.x);\n"
+		"        float radius = length(p);\n"
+		"        float k = cos(5.0 * angle);\n"
+		"        float targetRadius = halfSymbolSize * mix(0.45, 1.0, step(0.0, k));\n"
+		"        distanceValue = radius - targetRadius;\n"
+		"    }\n"
+		"    else\n"
+		"    {\n"
+		"        distanceValue = sdDiamond(p, halfSymbolSize);\n"
+		"    }\n"
+		"    float alphaEdge = 1.0 - smoothstep(0.0, 1.0, distanceValue);\n"
+		"    if (alphaEdge <= 0.0) discard;\n"
+		"    vec4 color = vFillColor;\n"
+		"    if (lineSymbol)\n"
+		"    {\n"
+		"        color = (borderWidth > 0.0 && vBorderColor.a > 0.0) ? vBorderColor : vFillColor;\n"
+		"    }\n"
+		"    else\n"
+		"    {\n"
+		"        bool useBorder = borderWidth > 0.0 && distanceValue > -borderWidth;\n"
+		"        if (filled < 0.5 && !useBorder) discard;\n"
+		"        color = useBorder ? vBorderColor : vFillColor;\n"
+		"    }\n"
+		"    if (color.a <= 0.0) discard;\n"
+		"    gl_FragColor = vec4(color.rgb, color.a * alphaEdge);\n"
+		"}\n";
+
+	const char* lineVertexShader =
+		"attribute vec4 aStartEnd0;\n"
+		"attribute vec4 aParams;\n"
+		"attribute vec4 aColor;\n"
+		"uniform vec2 uOriginScreen;\n"
+		"uniform float uInvPixelSize;\n"
+		"uniform vec2 uViewportSize;\n"
+		"varying vec4 vColor;\n"
+		"void main()\n"
+		"{\n"
+		"    vec2 startScreen = vec2(uOriginScreen.x + aStartEnd0.x * uInvPixelSize, uOriginScreen.y - aStartEnd0.y * uInvPixelSize);\n"
+		"    vec2 endScreen = vec2(uOriginScreen.x + aStartEnd0.z * uInvPixelSize, uOriginScreen.y - aStartEnd0.w * uInvPixelSize);\n"
+		"    vec2 dir = endScreen - startScreen;\n"
+		"    float len = max(length(dir), 0.0001);\n"
+		"    vec2 normal = vec2(-dir.y / len, dir.x / len);\n"
+		"    vec2 screenPosition = mix(startScreen, endScreen, aParams.y) + normal * aParams.x * aParams.z * 0.5;\n"
+		"    vec2 clipPosition = vec2(screenPosition.x / uViewportSize.x * 2.0 - 1.0, 1.0 - screenPosition.y / uViewportSize.y * 2.0);\n"
+		"    gl_Position = vec4(clipPosition, 0.0, 1.0);\n"
+		"    vColor = aColor;\n"
+		"}\n";
+
+	const char* lineFragmentShader =
+		"#ifdef GL_ES\n"
+		"precision mediump float;\n"
+		"#endif\n"
+		"varying vec4 vColor;\n"
+		"void main()\n"
+		"{\n"
+		"    gl_FragColor = vColor;\n"
+		"}\n";
+
+	const char* polygonVertexShader =
+		"attribute vec2 aPosition;\n"
+		"attribute vec4 aColor;\n"
+		"uniform vec2 uOriginScreen;\n"
+		"uniform float uInvPixelSize;\n"
+		"uniform vec2 uViewportSize;\n"
+		"varying vec4 vColor;\n"
+		"void main()\n"
+		"{\n"
+		"    vec2 screenPosition = vec2(uOriginScreen.x + aPosition.x * uInvPixelSize, uOriginScreen.y - aPosition.y * uInvPixelSize);\n"
+		"    vec2 clipPosition = vec2(screenPosition.x / uViewportSize.x * 2.0 - 1.0, 1.0 - screenPosition.y / uViewportSize.y * 2.0);\n"
+		"    gl_Position = vec4(clipPosition, 0.0, 1.0);\n"
+		"    vColor = aColor;\n"
+		"}\n";
+
+	const char* polygonFragmentShader =
+		"#ifdef GL_ES\n"
+		"precision mediump float;\n"
+		"#endif\n"
+		"varying vec4 vColor;\n"
+		"void main()\n"
+		"{\n"
+		"    gl_FragColor = vColor;\n"
+		"}\n";
+
+	openGLPointProgram.reset(new QOpenGLShaderProgram());
+	openGLLineProgram.reset(new QOpenGLShaderProgram());
+	openGLPolygonProgram.reset(new QOpenGLShaderProgram());
+
+	const bool pointOk = openGLPointProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, pointVertexShader) &&
+		openGLPointProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, pointFragmentShader) &&
+		openGLPointProgram->link();
+	const bool lineOk = openGLLineProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, lineVertexShader) &&
+		openGLLineProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, lineFragmentShader) &&
+		openGLLineProgram->link();
+	const bool polygonOk = openGLPolygonProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, polygonVertexShader) &&
+		openGLPolygonProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, polygonFragmentShader) &&
+		openGLPolygonProgram->link();
+
+	if (!pointOk || !lineOk || !polygonOk)
+	{
+		openGLProgramsFailed = true;
+		openGLPointProgram.reset();
+		openGLLineProgram.reset();
+		openGLPolygonProgram.reset();
+		return false;
+	}
+
+	openGLProgramsReady = true;
+	return true;
+}
+
+void QMainCanvas::InvalidateOpenGLVectorCache() const
+{
+	openGLVectorCacheDirty = true;
+	openGLVectorChunkSpatialIndexDirty = true;
+	ClearDrawableSpatialIndex(openGLVectorChunkSpatialIndexCache);
+	openGLVectorChunkVisibleIndexScratch.clear();
+}
+
+void QMainCanvas::DestroyOpenGLVectorBuffers()
+{
+	if (!openGLInitialized)
+	{
+		return;
+	}
+
+	for (const GpuVectorChunk& chunk : openGLVectorChunks)
+	{
+		if (chunk.pointBufferId != 0)
+		{
+			glDeleteBuffers(1, &chunk.pointBufferId);
+			chunk.pointBufferId = 0;
+		}
+		if (chunk.polylineBufferId != 0)
+		{
+			glDeleteBuffers(1, &chunk.polylineBufferId);
+			chunk.polylineBufferId = 0;
+		}
+		if (chunk.polygonFillBufferId != 0)
+		{
+			glDeleteBuffers(1, &chunk.polygonFillBufferId);
+			chunk.polygonFillBufferId = 0;
+		}
+		if (chunk.polygonBorderBufferId != 0)
+		{
+			glDeleteBuffers(1, &chunk.polygonBorderBufferId);
+			chunk.polygonBorderBufferId = 0;
+		}
+		chunk.buffersUploaded = false;
+	}
+}
+
+void QMainCanvas::DestroyOpenGLResources()
+{
+	DestroyOpenGLVectorBuffers();
+	openGLVectorChunks.clear();
+	ClearDrawableSpatialIndex(openGLVectorChunkSpatialIndexCache);
+	openGLPointProgram.reset();
+	openGLLineProgram.reset();
+	openGLPolygonProgram.reset();
+	openGLProgramsReady = false;
+	openGLProgramsFailed = false;
+}
+
+bool QMainCanvas::EnsureOpenGLVectorCache()
+{
+	if (!openGLVectorCacheDirty)
+	{
+		return true;
+	}
+
+	if (!openGLInitialized)
+	{
+		return false;
+	}
+
+	DestroyOpenGLVectorBuffers();
+	openGLVectorChunks.clear();
+	ClearDrawableSpatialIndex(openGLVectorChunkSpatialIndexCache);
+	openGLVectorChunkVisibleIndexScratch.clear();
+
+	struct BuildReference
+	{
+		CachedDrawableKind kind = CachedDrawableKind::Point;
+		size_t index = 0;
+		double layerNumber = 0.0;
+		std::uint64_t insertionSequence = 0;
+		GB_Rectangle extent;
+	};
+
+	std::vector<BuildReference> references;
+	references.reserve(pointDrawables.size() + polylineDrawables.size() + polygonDrawables.size());
+	for (size_t i = 0; i < pointDrawables.size(); i++)
+	{
+		const CachedPointDrawable& item = pointDrawables[i];
+		if (item.point.visible && item.extent.IsValid())
+		{
+			references.push_back(BuildReference{ CachedDrawableKind::Point, i, item.point.layerNumber, item.insertionSequence, item.extent });
+		}
+	}
+	for (size_t i = 0; i < polylineDrawables.size(); i++)
+	{
+		const CachedPolylineDrawable& item = polylineDrawables[i];
+		if (item.polyline.visible && item.extent.IsValid() && item.polyline.vertices.size() >= 2 && item.polyline.lineWidth > 0 && !item.polyline.lineColor.IsTransparent())
+		{
+			references.push_back(BuildReference{ CachedDrawableKind::Polyline, i, item.polyline.layerNumber, item.insertionSequence, item.extent });
+		}
+	}
+	for (size_t i = 0; i < polygonDrawables.size(); i++)
+	{
+		const CachedPolygonDrawable& item = polygonDrawables[i];
+		const bool canFill = !item.polygon.fillColor.IsTransparent();
+		const bool canDrawBorder = item.polygon.borderWidth > 0 && !item.polygon.borderColor.IsTransparent();
+		if (item.polygon.visible && item.extent.IsValid() && item.polygon.vertices.size() >= 3 && (canFill || canDrawBorder))
+		{
+			references.push_back(BuildReference{ CachedDrawableKind::Polygon, i, item.polygon.layerNumber, item.insertionSequence, item.extent });
+		}
+	}
+
+	std::sort(references.begin(), references.end(), [](const BuildReference& firstReference, const BuildReference& secondReference) -> bool
+		{
+			return QMainCanvas::IsCachedDrawablePaintOrderLess(firstReference.layerNumber, firstReference.insertionSequence, secondReference.layerNumber, secondReference.insertionSequence);
+		});
+
+	GpuVectorChunk* currentChunk = nullptr;
+	size_t currentChunkDrawableCount = 0;
+	std::vector<GB_Point2d> triangleVertices;
+
+	const auto FinishChunkIfEmpty = [this]()
+		{
+			if (!openGLVectorChunks.empty())
+			{
+				const GpuVectorChunk& chunk = openGLVectorChunks.back();
+				if (chunk.pointVertices.empty() && chunk.polylineVertices.empty() && chunk.polygonFillVertices.empty() && chunk.polygonBorderVertices.empty())
+				{
+					openGLVectorChunks.pop_back();
+				}
+			}
+		};
+
+	const auto StartNewChunk = [this, &currentChunk, &currentChunkDrawableCount](const BuildReference& reference)
+		{
+			GpuVectorChunk chunk;
+			chunk.layerNumber = reference.layerNumber;
+			chunk.insertionSequence = reference.insertionSequence;
+			chunk.originX = reference.extent.minX;
+			chunk.originY = reference.extent.minY;
+			chunk.extent = reference.extent;
+			openGLVectorChunks.push_back(std::move(chunk));
+			currentChunk = &openGLVectorChunks.back();
+			currentChunkDrawableCount = 0;
+		};
+
+	const auto GetChunkVertexCount = [](const GpuVectorChunk& chunk) -> size_t
+		{
+			return chunk.pointVertices.size() + chunk.polylineVertices.size() + chunk.polygonFillVertices.size() + chunk.polygonBorderVertices.size();
+		};
+
+	const auto EnsureChunk = [&FinishChunkIfEmpty, &StartNewChunk, &currentChunk, &currentChunkDrawableCount, &GetChunkVertexCount](const BuildReference& reference, size_t additionalVertexCount)
+		{
+			if (currentChunk == nullptr || currentChunk->layerNumber != reference.layerNumber || currentChunkDrawableCount >= MaxOpenGLVectorChunkDrawableCount || GetChunkVertexCount(*currentChunk) + additionalVertexCount > MaxOpenGLVectorChunkVertexCount)
+			{
+				FinishChunkIfEmpty();
+				StartNewChunk(reference);
+			}
+		};
+
+	const auto SetColor = [](const GB_ColorRGBA& color, float& outR, float& outG, float& outB, float& outA)
+		{
+			outR = ColorChannelToFloat(color.r);
+			outG = ColorChannelToFloat(color.g);
+			outB = ColorChannelToFloat(color.b);
+			outA = ColorChannelToFloat(color.a);
+		};
+
+	const auto AppendLineSegment = [&SetColor](GpuVectorChunk& chunk, const GB_Point2d& startPoint, const GB_Point2d& endPoint, const GB_ColorRGBA& color, int width)
+		{
+			if (!IsPointFinite(startPoint) || !IsPointFinite(endPoint) || startPoint.IsNearEqual(endPoint, GB_Epsilon))
+			{
+				return;
+			}
+
+			GpuLineVertex vertex;
+			vertex.startX = static_cast<float>(startPoint.x - chunk.originX);
+			vertex.startY = static_cast<float>(startPoint.y - chunk.originY);
+			vertex.endX = static_cast<float>(endPoint.x - chunk.originX);
+			vertex.endY = static_cast<float>(endPoint.y - chunk.originY);
+			vertex.width = static_cast<float>(std::max(1, width));
+			SetColor(color, vertex.colorR, vertex.colorG, vertex.colorB, vertex.colorA);
+
+			const float sides[6] = { -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f };
+			const float endpoints[6] = { 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f };
+			for (int i = 0; i < 6; i++)
+			{
+				GpuLineVertex outVertex = vertex;
+				outVertex.side = sides[i];
+				outVertex.endpoint = endpoints[i];
+				chunk.polylineVertices.push_back(outVertex);
+			}
+		};
+
+	for (const BuildReference& reference : references)
+	{
+		size_t estimatedVertexCount = 6;
+		if (reference.kind == CachedDrawableKind::Polyline && reference.index < polylineDrawables.size())
+		{
+			estimatedVertexCount = std::max<size_t>(1, (polylineDrawables[reference.index].polyline.vertices.size() - 1) * 6);
+		}
+		else if (reference.kind == CachedDrawableKind::Polygon && reference.index < polygonDrawables.size())
+		{
+			const size_t vertexCount = polygonDrawables[reference.index].polygon.vertices.size();
+			estimatedVertexCount = std::max<size_t>(1, vertexCount * 6 + (vertexCount >= 3 ? (vertexCount - 2) * 3 : 0));
+		}
+
+		EnsureChunk(reference, estimatedVertexCount);
+		if (currentChunk == nullptr)
+		{
+			continue;
+		}
+
+		currentChunk->extent.Expand(reference.extent);
+		currentChunkDrawableCount++;
+
+		if (reference.kind == CachedDrawableKind::Point && reference.index < pointDrawables.size())
+		{
+			const CachedPointDrawable& cachedPoint = pointDrawables[reference.index];
+			const bool hasFill = cachedPoint.point.symbolFilled && !cachedPoint.point.fillColor.IsTransparent();
+			const bool hasBorder = cachedPoint.point.borderWidth > 0 && !cachedPoint.point.borderColor.IsTransparent();
+			if (!hasFill && !hasBorder)
+			{
+				continue;
+			}
+
+			GpuPointVertex vertex;
+			vertex.centerX = static_cast<float>(cachedPoint.point.position.x - currentChunk->originX);
+			vertex.centerY = static_cast<float>(cachedPoint.point.position.y - currentChunk->originY);
+			vertex.size = static_cast<float>(std::max(1, cachedPoint.point.symbolSize));
+			vertex.borderWidth = static_cast<float>(std::max(0, cachedPoint.point.borderWidth));
+			vertex.shape = GetOpenGLPointShape(cachedPoint.point.symbolShape);
+			vertex.filled = cachedPoint.point.symbolFilled ? 1.0f : 0.0f;
+			SetColor(cachedPoint.point.fillColor, vertex.fillR, vertex.fillG, vertex.fillB, vertex.fillA);
+			SetColor(cachedPoint.point.borderColor, vertex.borderR, vertex.borderG, vertex.borderB, vertex.borderA);
+
+			const float renderHalfSize = std::max(1.0f, vertex.size + vertex.borderWidth * 2.0f + 2.0f) * 0.5f;
+			const float localOffsets[12] =
+			{
+				-renderHalfSize, -renderHalfSize,
+				renderHalfSize, -renderHalfSize,
+				-renderHalfSize, renderHalfSize,
+				-renderHalfSize, renderHalfSize,
+				renderHalfSize, -renderHalfSize,
+				renderHalfSize, renderHalfSize
+			};
+
+			for (int i = 0; i < 6; i++)
+			{
+				GpuPointVertex outVertex = vertex;
+				outVertex.localX = localOffsets[i * 2];
+				outVertex.localY = localOffsets[i * 2 + 1];
+				currentChunk->pointVertices.push_back(outVertex);
+			}
+		}
+		else if (reference.kind == CachedDrawableKind::Polyline && reference.index < polylineDrawables.size())
+		{
+			const CachedPolylineDrawable& cachedPolyline = polylineDrawables[reference.index];
+			for (size_t vertexIndex = 1; vertexIndex < cachedPolyline.polyline.vertices.size(); vertexIndex++)
+			{
+				AppendLineSegment(*currentChunk, cachedPolyline.polyline.vertices[vertexIndex - 1], cachedPolyline.polyline.vertices[vertexIndex], cachedPolyline.polyline.lineColor, cachedPolyline.polyline.lineWidth);
+			}
+		}
+		else if (reference.kind == CachedDrawableKind::Polygon && reference.index < polygonDrawables.size())
+		{
+			const CachedPolygonDrawable& cachedPolygon = polygonDrawables[reference.index];
+			if (!cachedPolygon.polygon.fillColor.IsTransparent() && BuildSimplePolygonTriangles(cachedPolygon.polygon.vertices, triangleVertices))
+			{
+				for (const GB_Point2d& point : triangleVertices)
+				{
+					GpuPolygonVertex vertex;
+					vertex.x = static_cast<float>(point.x - currentChunk->originX);
+					vertex.y = static_cast<float>(point.y - currentChunk->originY);
+					SetColor(cachedPolygon.polygon.fillColor, vertex.colorR, vertex.colorG, vertex.colorB, vertex.colorA);
+					currentChunk->polygonFillVertices.push_back(vertex);
+				}
+			}
+
+			if (cachedPolygon.polygon.borderWidth > 0 && !cachedPolygon.polygon.borderColor.IsTransparent())
+			{
+				const size_t vertexCount = cachedPolygon.polygon.vertices.size();
+				for (size_t vertexIndex = 0; vertexIndex < vertexCount; vertexIndex++)
+				{
+					AppendLineSegment(*currentChunk, cachedPolygon.polygon.vertices[vertexIndex], cachedPolygon.polygon.vertices[(vertexIndex + 1) % vertexCount], cachedPolygon.polygon.borderColor, cachedPolygon.polygon.borderWidth);
+				}
+			}
+		}
+	}
+
+	FinishChunkIfEmpty();
+	openGLVectorCacheDirty = false;
+	openGLVectorChunkSpatialIndexDirty = true;
+	return true;
+}
+
+void QMainCanvas::EnsureOpenGLVectorChunkSpatialIndex() const
+{
+	if (!openGLVectorChunkSpatialIndexDirty)
+	{
+		return;
+	}
+
+	RebuildDrawableSpatialIndexTree(openGLVectorChunks, openGLVectorChunkSpatialIndexCache, [](const GpuVectorChunk& item) -> const GB_Rectangle&
+		{
+			return item.extent;
+		});
+	openGLVectorChunkSpatialIndexDirty = false;
+}
+
+void QMainCanvas::CollectVisibleOpenGLVectorChunkIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const
+{
+	EnsureOpenGLVectorChunkSpatialIndex();
+	CollectVisibleDrawableIndicesBySpatialIndexTree(openGLVectorChunks, openGLVectorChunkSpatialIndexCache, queryWorldExtent, outIndices,
+		[](const GpuVectorChunk& item) -> const GB_Rectangle&
+		{
+			return item.extent;
+		},
+		[](const GpuVectorChunk& item) -> bool
+		{
+			return !item.pointVertices.empty() || !item.polylineVertices.empty() || !item.polygonFillVertices.empty() || !item.polygonBorderVertices.empty();
+		});
+}
+
+void QMainCanvas::UploadOpenGLVectorChunk(const GpuVectorChunk& chunk)
+{
+	if (chunk.buffersUploaded || !openGLInitialized)
+	{
+		return;
+	}
+
+	const auto UploadBuffer = [this](GLuint& bufferId, const void* data, size_t byteCount)
+		{
+			if (byteCount == 0 || data == nullptr)
+			{
+				return;
+			}
+			if (bufferId == 0)
+			{
+				glGenBuffers(1, &bufferId);
+			}
+			glBindBuffer(GL_ARRAY_BUFFER, bufferId);
+			glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(byteCount), data, GL_STATIC_DRAW);
+		};
+
+	UploadBuffer(chunk.pointBufferId, chunk.pointVertices.empty() ? nullptr : &chunk.pointVertices[0], chunk.pointVertices.size() * sizeof(GpuPointVertex));
+	UploadBuffer(chunk.polylineBufferId, chunk.polylineVertices.empty() ? nullptr : &chunk.polylineVertices[0], chunk.polylineVertices.size() * sizeof(GpuLineVertex));
+	UploadBuffer(chunk.polygonFillBufferId, chunk.polygonFillVertices.empty() ? nullptr : &chunk.polygonFillVertices[0], chunk.polygonFillVertices.size() * sizeof(GpuPolygonVertex));
+	UploadBuffer(chunk.polygonBorderBufferId, chunk.polygonBorderVertices.empty() ? nullptr : &chunk.polygonBorderVertices[0], chunk.polygonBorderVertices.size() * sizeof(GpuLineVertex));
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	chunk.buffersUploaded = true;
+}
+
+void QMainCanvas::DrawOpenGLVectorChunk(const GpuVectorChunk& chunk)
+{
+	UploadOpenGLVectorChunk(chunk);
+	DrawOpenGLPolygonFillChunk(chunk);
+	DrawOpenGLPolylineChunk(chunk);
+	DrawOpenGLPolygonBorderChunk(chunk);
+	DrawOpenGLPointChunk(chunk);
+}
+
+void QMainCanvas::DrawOpenGLPointChunk(const GpuVectorChunk& chunk)
+{
+	if (!openGLPointProgram || chunk.pointBufferId == 0 || chunk.pointVertices.empty())
+	{
+		return;
+	}
+
+	openGLPointProgram->bind();
+	const float invPixelSize = static_cast<float>(1.0 / pixelSize);
+	const float originScreenX = static_cast<float>((chunk.originX - viewExtent.minX) / pixelSize);
+	const float originScreenY = static_cast<float>((viewExtent.maxY - chunk.originY) / pixelSize);
+	openGLPointProgram->setUniformValue("uOriginScreen", QVector2D(originScreenX, originScreenY));
+	openGLPointProgram->setUniformValue("uInvPixelSize", invPixelSize);
+	openGLPointProgram->setUniformValue("uViewportSize", QVector2D(static_cast<float>(std::max(1, width())), static_cast<float>(std::max(1, height()))));
+
+	glBindBuffer(GL_ARRAY_BUFFER, chunk.pointBufferId);
+	const int centerLocation = openGLPointProgram->attributeLocation("aCenter");
+	const int localOffsetLocation = openGLPointProgram->attributeLocation("aLocalOffset");
+	const int params0Location = openGLPointProgram->attributeLocation("aParams0");
+	const int fillColorLocation = openGLPointProgram->attributeLocation("aFillColor");
+	const int borderColorLocation = openGLPointProgram->attributeLocation("aBorderColor");
+	if (centerLocation < 0 || localOffsetLocation < 0 || params0Location < 0 || fillColorLocation < 0 || borderColorLocation < 0)
+	{
+		glBindBuffer(GL_ARRAY_BUFFER, 0);
+		openGLPointProgram->release();
+		return;
+	}
+	const GLsizei stride = static_cast<GLsizei>(sizeof(GpuPointVertex));
+	glEnableVertexAttribArray(centerLocation);
+	glVertexAttribPointer(centerLocation, 2, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<const void*>(offsetof(GpuPointVertex, centerX)));
+	glEnableVertexAttribArray(localOffsetLocation);
+	glVertexAttribPointer(localOffsetLocation, 2, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<const void*>(offsetof(GpuPointVertex, localX)));
+	glEnableVertexAttribArray(params0Location);
+	glVertexAttribPointer(params0Location, 4, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<const void*>(offsetof(GpuPointVertex, size)));
+	glEnableVertexAttribArray(fillColorLocation);
+	glVertexAttribPointer(fillColorLocation, 4, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<const void*>(offsetof(GpuPointVertex, fillR)));
+	glEnableVertexAttribArray(borderColorLocation);
+	glVertexAttribPointer(borderColorLocation, 4, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<const void*>(offsetof(GpuPointVertex, borderR)));
+	glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(chunk.pointVertices.size()));
+	glDisableVertexAttribArray(centerLocation);
+	glDisableVertexAttribArray(localOffsetLocation);
+	glDisableVertexAttribArray(params0Location);
+	glDisableVertexAttribArray(fillColorLocation);
+	glDisableVertexAttribArray(borderColorLocation);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	openGLPointProgram->release();
+}
+
+void QMainCanvas::DrawOpenGLPolylineChunk(const GpuVectorChunk& chunk)
+{
+	if (!openGLLineProgram || chunk.polylineBufferId == 0 || chunk.polylineVertices.empty())
+	{
+		return;
+	}
+
+	openGLLineProgram->bind();
+	const float invPixelSize = static_cast<float>(1.0 / pixelSize);
+	const float originScreenX = static_cast<float>((chunk.originX - viewExtent.minX) / pixelSize);
+	const float originScreenY = static_cast<float>((viewExtent.maxY - chunk.originY) / pixelSize);
+	openGLLineProgram->setUniformValue("uOriginScreen", QVector2D(originScreenX, originScreenY));
+	openGLLineProgram->setUniformValue("uInvPixelSize", invPixelSize);
+	openGLLineProgram->setUniformValue("uViewportSize", QVector2D(static_cast<float>(std::max(1, width())), static_cast<float>(std::max(1, height()))));
+
+	glBindBuffer(GL_ARRAY_BUFFER, chunk.polylineBufferId);
+	const int startEndLocation = openGLLineProgram->attributeLocation("aStartEnd0");
+	const int paramsLocation = openGLLineProgram->attributeLocation("aParams");
+	const int colorLocation = openGLLineProgram->attributeLocation("aColor");
+	if (startEndLocation < 0 || paramsLocation < 0 || colorLocation < 0)
+	{
+		glBindBuffer(GL_ARRAY_BUFFER, 0);
+		openGLLineProgram->release();
+		return;
+	}
+	const GLsizei stride = static_cast<GLsizei>(sizeof(GpuLineVertex));
+	glEnableVertexAttribArray(startEndLocation);
+	glVertexAttribPointer(startEndLocation, 4, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<const void*>(offsetof(GpuLineVertex, startX)));
+	glEnableVertexAttribArray(paramsLocation);
+	glVertexAttribPointer(paramsLocation, 4, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<const void*>(offsetof(GpuLineVertex, side)));
+	glEnableVertexAttribArray(colorLocation);
+	glVertexAttribPointer(colorLocation, 4, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<const void*>(offsetof(GpuLineVertex, colorR)));
+	glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(chunk.polylineVertices.size()));
+	glDisableVertexAttribArray(startEndLocation);
+	glDisableVertexAttribArray(paramsLocation);
+	glDisableVertexAttribArray(colorLocation);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	openGLLineProgram->release();
+}
+
+void QMainCanvas::DrawOpenGLPolygonFillChunk(const GpuVectorChunk& chunk)
+{
+	if (!openGLPolygonProgram || chunk.polygonFillBufferId == 0 || chunk.polygonFillVertices.empty())
+	{
+		return;
+	}
+
+	openGLPolygonProgram->bind();
+	const float invPixelSize = static_cast<float>(1.0 / pixelSize);
+	const float originScreenX = static_cast<float>((chunk.originX - viewExtent.minX) / pixelSize);
+	const float originScreenY = static_cast<float>((viewExtent.maxY - chunk.originY) / pixelSize);
+	openGLPolygonProgram->setUniformValue("uOriginScreen", QVector2D(originScreenX, originScreenY));
+	openGLPolygonProgram->setUniformValue("uInvPixelSize", invPixelSize);
+	openGLPolygonProgram->setUniformValue("uViewportSize", QVector2D(static_cast<float>(std::max(1, width())), static_cast<float>(std::max(1, height()))));
+
+	glBindBuffer(GL_ARRAY_BUFFER, chunk.polygonFillBufferId);
+	const int positionLocation = openGLPolygonProgram->attributeLocation("aPosition");
+	const int colorLocation = openGLPolygonProgram->attributeLocation("aColor");
+	if (positionLocation < 0 || colorLocation < 0)
+	{
+		glBindBuffer(GL_ARRAY_BUFFER, 0);
+		openGLPolygonProgram->release();
+		return;
+	}
+	const GLsizei stride = static_cast<GLsizei>(sizeof(GpuPolygonVertex));
+	glEnableVertexAttribArray(positionLocation);
+	glVertexAttribPointer(positionLocation, 2, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<const void*>(offsetof(GpuPolygonVertex, x)));
+	glEnableVertexAttribArray(colorLocation);
+	glVertexAttribPointer(colorLocation, 4, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<const void*>(offsetof(GpuPolygonVertex, colorR)));
+	glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(chunk.polygonFillVertices.size()));
+	glDisableVertexAttribArray(positionLocation);
+	glDisableVertexAttribArray(colorLocation);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	openGLPolygonProgram->release();
+}
+
+void QMainCanvas::DrawOpenGLPolygonBorderChunk(const GpuVectorChunk& chunk)
+{
+	if (!openGLLineProgram || chunk.polygonBorderBufferId == 0 || chunk.polygonBorderVertices.empty())
+	{
+		return;
+	}
+
+	openGLLineProgram->bind();
+	const float invPixelSize = static_cast<float>(1.0 / pixelSize);
+	const float originScreenX = static_cast<float>((chunk.originX - viewExtent.minX) / pixelSize);
+	const float originScreenY = static_cast<float>((viewExtent.maxY - chunk.originY) / pixelSize);
+	openGLLineProgram->setUniformValue("uOriginScreen", QVector2D(originScreenX, originScreenY));
+	openGLLineProgram->setUniformValue("uInvPixelSize", invPixelSize);
+	openGLLineProgram->setUniformValue("uViewportSize", QVector2D(static_cast<float>(std::max(1, width())), static_cast<float>(std::max(1, height()))));
+
+	glBindBuffer(GL_ARRAY_BUFFER, chunk.polygonBorderBufferId);
+	const int startEndLocation = openGLLineProgram->attributeLocation("aStartEnd0");
+	const int paramsLocation = openGLLineProgram->attributeLocation("aParams");
+	const int colorLocation = openGLLineProgram->attributeLocation("aColor");
+	if (startEndLocation < 0 || paramsLocation < 0 || colorLocation < 0)
+	{
+		glBindBuffer(GL_ARRAY_BUFFER, 0);
+		openGLLineProgram->release();
+		return;
+	}
+	const GLsizei stride = static_cast<GLsizei>(sizeof(GpuLineVertex));
+	glEnableVertexAttribArray(startEndLocation);
+	glVertexAttribPointer(startEndLocation, 4, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<const void*>(offsetof(GpuLineVertex, startX)));
+	glEnableVertexAttribArray(paramsLocation);
+	glVertexAttribPointer(paramsLocation, 4, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<const void*>(offsetof(GpuLineVertex, side)));
+	glEnableVertexAttribArray(colorLocation);
+	glVertexAttribPointer(colorLocation, 4, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<const void*>(offsetof(GpuLineVertex, colorR)));
+	glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(chunk.polygonBorderVertices.size()));
+	glDisableVertexAttribArray(startEndLocation);
+	glDisableVertexAttribArray(paramsLocation);
+	glDisableVertexAttribArray(colorLocation);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	openGLLineProgram->release();
+}
+
+void QMainCanvas::RenderWithOpenGLBackend(QPainter& painter, const QRectF& exposedRect)
+{
+	if (!viewExtent.IsValid() || !IsFinitePositive(pixelSize))
+	{
+		DrawBackground(painter);
+		return;
+	}
+
+	DrawBackground(painter);
+
+	const QRectF widgetRect = QRectF(rect());
+	QRectF safeExposedRect = exposedRect.isValid() ? exposedRect.intersected(widgetRect) : widgetRect;
+	if (!safeExposedRect.isValid() || safeExposedRect.isEmpty())
+	{
+		DrawCoordinateAxes(painter);
+		DrawCrsValidArea(painter);
+		return;
+	}
+
+	const double viewMinX = viewExtent.minX;
+	const double viewMaxY = viewExtent.maxY;
+	GB_Rectangle baseQueryWorldExtent;
+	baseQueryWorldExtent.Set(viewMinX + safeExposedRect.left() * pixelSize,
+		viewMaxY - safeExposedRect.bottom() * pixelSize,
+		viewMinX + safeExposedRect.right() * pixelSize,
+		viewMaxY - safeExposedRect.top() * pixelSize);
+	baseQueryWorldExtent = baseQueryWorldExtent.Intersected(viewExtent);
+	if (!baseQueryWorldExtent.IsValid() || baseQueryWorldExtent.Width() <= 0.0 || baseQueryWorldExtent.Height() <= 0.0)
+	{
+		DrawCoordinateAxes(painter);
+		DrawCrsValidArea(painter);
+		return;
+	}
+
+	GB_Rectangle mapTileQueryWorldExtent = baseQueryWorldExtent;
+	GB_Rectangle crsClipWorldExtent;
+	const QPainterPath* crsClipPath = nullptr;
+	bool hasPreciseCrsClip = false;
+	bool hasRectangularCrsClip = false;
+
+	if (clipMapTilesToCrsValidArea && !mapTiles.empty())
+	{
+		if (EnsureCrsValidAreaPolygonsCache() && !crsValidAreaPolygonsCache.empty())
+		{
+			hasPreciseCrsClip = TryGetCrsValidAreaScreenPathCache(crsClipPath, crsClipWorldExtent);
+			if (hasPreciseCrsClip)
+			{
+				mapTileQueryWorldExtent = mapTileQueryWorldExtent.Intersected(crsClipWorldExtent);
+			}
+			else
+			{
+				mapTileQueryWorldExtent.Reset();
+			}
+		}
+		else if (TryGetCrsValidArea(crsClipWorldExtent))
+		{
+			crsClipWorldExtent = crsClipWorldExtent.Intersected(viewExtent);
+			hasRectangularCrsClip = crsClipWorldExtent.IsValid() && crsClipWorldExtent.Width() > 0.0 && crsClipWorldExtent.Height() > 0.0;
+			if (hasRectangularCrsClip)
+			{
+				mapTileQueryWorldExtent = mapTileQueryWorldExtent.Intersected(crsClipWorldExtent);
+			}
+			else
+			{
+				mapTileQueryWorldExtent.Reset();
+			}
+		}
+	}
+
+	const bool canUseCrsPolygonExtents = hasPreciseCrsClip && crsValidAreaPolygonExtentsCache.size() == crsValidAreaPolygonsCache.size();
+	if (!mapTiles.empty() && mapTileQueryWorldExtent.IsValid() && mapTileQueryWorldExtent.Width() > 0.0 && mapTileQueryWorldExtent.Height() > 0.0)
+	{
+		CollectVisibleMapTileIndices(mapTileQueryWorldExtent, mapTileVisibleIndexScratch);
+	}
+	else
+	{
+		mapTileVisibleIndexScratch.clear();
+	}
+
+	openGLPaintReferenceScratch.clear();
+	openGLPaintReferenceScratch.reserve(mapTileVisibleIndexScratch.size());
+	for (size_t mapTileIndex : mapTileVisibleIndexScratch)
+	{
+		if (mapTileIndex < mapTiles.size())
+		{
+			openGLPaintReferenceScratch.push_back(OpenGLPaintReference{ CachedDrawableKind::MapTile, mapTileIndex, mapTiles[mapTileIndex].tile.layerNumber, mapTiles[mapTileIndex].insertionSequence });
+		}
+	}
+
+	const GB_Rectangle pointDrawQueryWorldExtent = ExpandedWorldQueryExtent(baseQueryWorldExtent, GetMaxPointDrawableScreenMarginPixels(), pixelSize);
+	const GB_Rectangle polylineDrawQueryWorldExtent = ExpandedWorldQueryExtent(baseQueryWorldExtent, GetMaxPolylineDrawableScreenMarginPixels(), pixelSize);
+	const GB_Rectangle polygonDrawQueryWorldExtent = ExpandedWorldQueryExtent(baseQueryWorldExtent, GetMaxPolygonDrawableScreenMarginPixels(), pixelSize);
+	GB_Rectangle vectorQueryWorldExtent = baseQueryWorldExtent;
+	if (pointDrawQueryWorldExtent.IsValid())
+	{
+		vectorQueryWorldExtent.Expand(pointDrawQueryWorldExtent);
+	}
+	if (polylineDrawQueryWorldExtent.IsValid())
+	{
+		vectorQueryWorldExtent.Expand(polylineDrawQueryWorldExtent);
+	}
+	if (polygonDrawQueryWorldExtent.IsValid())
+	{
+		vectorQueryWorldExtent.Expand(polygonDrawQueryWorldExtent);
+	}
+
+	if (EnsureOpenGLVectorCache() && vectorQueryWorldExtent.IsValid())
+	{
+		CollectVisibleOpenGLVectorChunkIndices(vectorQueryWorldExtent, openGLVectorChunkVisibleIndexScratch);
+		openGLPaintReferenceScratch.reserve(openGLPaintReferenceScratch.size() + openGLVectorChunkVisibleIndexScratch.size());
+		for (size_t chunkIndex : openGLVectorChunkVisibleIndexScratch)
+		{
+			if (chunkIndex < openGLVectorChunks.size())
+			{
+				const GpuVectorChunk& chunk = openGLVectorChunks[chunkIndex];
+				openGLPaintReferenceScratch.push_back(OpenGLPaintReference{ CachedDrawableKind::Point, chunkIndex, chunk.layerNumber, chunk.insertionSequence });
+			}
+		}
+	}
+
+	std::sort(openGLPaintReferenceScratch.begin(), openGLPaintReferenceScratch.end(), [](const OpenGLPaintReference& firstReference, const OpenGLPaintReference& secondReference) -> bool
+		{
+			return QMainCanvas::IsCachedDrawablePaintOrderLess(firstReference.layerNumber, firstReference.insertionSequence, secondReference.layerNumber, secondReference.insertionSequence);
+		});
+
+	for (const OpenGLPaintReference& reference : openGLPaintReferenceScratch)
+	{
+		if (reference.kind == CachedDrawableKind::MapTile)
+		{
+			if (reference.index < mapTiles.size())
+			{
+				DrawCachedMapTile(painter, mapTiles[reference.index], mapTileQueryWorldExtent, safeExposedRect, crsClipPath, hasPreciseCrsClip, canUseCrsPolygonExtents);
+			}
+		}
+		else
+		{
+			if (reference.index < openGLVectorChunks.size())
+			{
+				painter.beginNativePainting();
+				glViewport(0, 0, std::max(1, width()), std::max(1, height()));
+				glDisable(GL_DEPTH_TEST);
+				glEnable(GL_BLEND);
+				glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+				DrawOpenGLVectorChunk(openGLVectorChunks[reference.index]);
+				glBindBuffer(GL_ARRAY_BUFFER, 0);
+				painter.endNativePainting();
+				painter.setClipRect(safeExposedRect);
+			}
+		}
+	}
+
+	DrawCoordinateAxes(painter);
+	DrawCrsValidArea(painter);
 }
 
 bool QMainCanvas::TryGetCrsValidArea(GB_Rectangle& outValidArea) const
@@ -3827,11 +5090,25 @@ void QMainCanvas::DrawVectorDrawablesFastLod(QPainter& painter, const QRectF& ex
 			return rect;
 		};
 
+	const bool oldAntialiasing = painter.testRenderHint(QPainter::Antialiasing);
+	painter.setRenderHint(QPainter::Antialiasing, true);
+	painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
+
 	if (!polygonDrawables.empty() && polygonDrawQueryWorldExtent.IsValid())
 	{
 		EnsurePolygonDrawableSpatialIndex();
-		VectorLodPaintGrid polygonLodGrid(exposedRect, FastLodGridCellSizePixels, FastLodMaxDrawCountPerCell);
+		const size_t candidateCount = CountVisibleDrawableIndicesBySpatialIndexTree(polygonDrawables, polygonDrawableSpatialIndexCache, polygonDrawQueryWorldExtent,
+			[](const CachedPolygonDrawable& item) -> const GB_Rectangle&
+			{
+				return item.extent;
+			},
+			[](const CachedPolygonDrawable& item) -> bool
+			{
+				return item.polygon.visible;
+			});
+		const size_t targetCount = CalculateFastLodTargetDrawableCount(exposedRect, candidateCount);
 		size_t drawnPolygonCount = 0;
+
 		ForEachVisibleDrawableIndexBySpatialIndexTree(polygonDrawables, polygonDrawableSpatialIndexCache, polygonDrawQueryWorldExtent,
 			[](const CachedPolygonDrawable& item) -> const GB_Rectangle&
 			{
@@ -3841,9 +5118,9 @@ void QMainCanvas::DrawVectorDrawablesFastLod(QPainter& painter, const QRectF& ex
 			{
 				return item.polygon.visible;
 			},
-			[this, &painter, &exposedRect, &polygonDrawQueryWorldExtent, &polygonLodGrid, &drawnPolygonCount, &MakeUsableScreenRect](size_t polygonIndex) -> bool
+			[this, &painter, &exposedRect, &polygonDrawQueryWorldExtent, &drawnPolygonCount, candidateCount, targetCount, &MakeUsableScreenRect](size_t polygonIndex) -> bool
 			{
-				if (polygonLodGrid.IsFullySaturated() || drawnPolygonCount >= MaxFastLodDrawnDrawableCount)
+				if (drawnPolygonCount >= targetCount || drawnPolygonCount >= MaxFastLodDrawnDrawableCount)
 				{
 					return false;
 				}
@@ -3854,29 +5131,44 @@ void QMainCanvas::DrawVectorDrawablesFastLod(QPainter& painter, const QRectF& ex
 				}
 
 				const CachedPolygonDrawable& cachedPolygon = polygonDrawables[polygonIndex];
+				if (!ShouldAcceptFastLodDrawable(polygonIndex, cachedPolygon.insertionSequence, 0x7A4D3C29B13F81E5ull, candidateCount, targetCount))
+				{
+					return true;
+				}
+
 				const GB_Rectangle clippedExtent = cachedPolygon.extent.Intersected(polygonDrawQueryWorldExtent);
 				if (!clippedExtent.IsValid())
 				{
 					return true;
 				}
 
-				QRectF screenRect = MakeUsableScreenRect(WorldRectangleToScreenRectangle(clippedExtent).adjusted(-cachedPolygon.screenMarginPixels, -cachedPolygon.screenMarginPixels, cachedPolygon.screenMarginPixels, cachedPolygon.screenMarginPixels));
-				if (!polygonLodGrid.TryAccept(screenRect))
+				const QRectF screenRect = MakeUsableScreenRect(WorldRectangleToScreenRectangle(clippedExtent).adjusted(-cachedPolygon.screenMarginPixels, -cachedPolygon.screenMarginPixels, cachedPolygon.screenMarginPixels, cachedPolygon.screenMarginPixels));
+				if (!screenRect.isValid() || screenRect.isEmpty() || !screenRect.intersects(exposedRect))
 				{
 					return true;
 				}
 
 				DrawCachedPolygonDrawableFastLod(painter, cachedPolygon, polygonDrawQueryWorldExtent, exposedRect);
 				drawnPolygonCount++;
-				return !(polygonLodGrid.IsFullySaturated() || drawnPolygonCount >= MaxFastLodDrawnDrawableCount);
+				return drawnPolygonCount < targetCount && drawnPolygonCount < MaxFastLodDrawnDrawableCount;
 			});
 	}
 
 	if (!polylineDrawables.empty() && polylineDrawQueryWorldExtent.IsValid())
 	{
 		EnsurePolylineDrawableSpatialIndex();
-		VectorLodPaintGrid polylineLodGrid(exposedRect, FastLodGridCellSizePixels, FastLodMaxDrawCountPerCell);
+		const size_t candidateCount = CountVisibleDrawableIndicesBySpatialIndexTree(polylineDrawables, polylineDrawableSpatialIndexCache, polylineDrawQueryWorldExtent,
+			[](const CachedPolylineDrawable& item) -> const GB_Rectangle&
+			{
+				return item.extent;
+			},
+			[](const CachedPolylineDrawable& item) -> bool
+			{
+				return item.polyline.visible;
+			});
+		const size_t targetCount = CalculateFastLodTargetDrawableCount(exposedRect, candidateCount);
 		size_t drawnPolylineCount = 0;
+
 		ForEachVisibleDrawableIndexBySpatialIndexTree(polylineDrawables, polylineDrawableSpatialIndexCache, polylineDrawQueryWorldExtent,
 			[](const CachedPolylineDrawable& item) -> const GB_Rectangle&
 			{
@@ -3886,9 +5178,9 @@ void QMainCanvas::DrawVectorDrawablesFastLod(QPainter& painter, const QRectF& ex
 			{
 				return item.polyline.visible;
 			},
-			[this, &painter, &exposedRect, &polylineDrawQueryWorldExtent, &polylineLodGrid, &drawnPolylineCount, &MakeUsableScreenRect](size_t polylineIndex) -> bool
+			[this, &painter, &exposedRect, &polylineDrawQueryWorldExtent, &drawnPolylineCount, candidateCount, targetCount, &MakeUsableScreenRect](size_t polylineIndex) -> bool
 			{
-				if (polylineLodGrid.IsFullySaturated() || drawnPolylineCount >= MaxFastLodDrawnDrawableCount)
+				if (drawnPolylineCount >= targetCount || drawnPolylineCount >= MaxFastLodDrawnDrawableCount)
 				{
 					return false;
 				}
@@ -3899,29 +5191,44 @@ void QMainCanvas::DrawVectorDrawablesFastLod(QPainter& painter, const QRectF& ex
 				}
 
 				const CachedPolylineDrawable& cachedPolyline = polylineDrawables[polylineIndex];
+				if (!ShouldAcceptFastLodDrawable(polylineIndex, cachedPolyline.insertionSequence, 0xB70A8F1D65C2E437ull, candidateCount, targetCount))
+				{
+					return true;
+				}
+
 				const GB_Rectangle clippedExtent = cachedPolyline.extent.Intersected(polylineDrawQueryWorldExtent);
 				if (!clippedExtent.IsValid())
 				{
 					return true;
 				}
 
-				QRectF screenRect = MakeUsableScreenRect(WorldRectangleToScreenRectangle(clippedExtent).adjusted(-cachedPolyline.screenMarginPixels, -cachedPolyline.screenMarginPixels, cachedPolyline.screenMarginPixels, cachedPolyline.screenMarginPixels));
-				if (!polylineLodGrid.TryAccept(screenRect))
+				const QRectF screenRect = MakeUsableScreenRect(WorldRectangleToScreenRectangle(clippedExtent).adjusted(-cachedPolyline.screenMarginPixels, -cachedPolyline.screenMarginPixels, cachedPolyline.screenMarginPixels, cachedPolyline.screenMarginPixels));
+				if (!screenRect.isValid() || screenRect.isEmpty() || !screenRect.intersects(exposedRect))
 				{
 					return true;
 				}
 
 				DrawCachedPolylineDrawableFastLod(painter, cachedPolyline, polylineDrawQueryWorldExtent, exposedRect);
 				drawnPolylineCount++;
-				return !(polylineLodGrid.IsFullySaturated() || drawnPolylineCount >= MaxFastLodDrawnDrawableCount);
+				return drawnPolylineCount < targetCount && drawnPolylineCount < MaxFastLodDrawnDrawableCount;
 			});
 	}
 
 	if (!pointDrawables.empty() && pointDrawQueryWorldExtent.IsValid())
 	{
 		EnsurePointDrawableSpatialIndex();
-		VectorLodPaintGrid pointLodGrid(exposedRect, FastLodGridCellSizePixels, FastLodMaxDrawCountPerCell);
+		const size_t candidateCount = CountVisibleDrawableIndicesBySpatialIndexTree(pointDrawables, pointDrawableSpatialIndexCache, pointDrawQueryWorldExtent,
+			[](const CachedPointDrawable& item) -> const GB_Rectangle&
+			{
+				return item.extent;
+			},
+			[](const CachedPointDrawable& item) -> bool
+			{
+				return item.point.visible;
+			});
+		const size_t targetCount = CalculateFastLodTargetDrawableCount(exposedRect, candidateCount);
 		size_t drawnPointCount = 0;
+
 		ForEachVisibleDrawableIndexBySpatialIndexTree(pointDrawables, pointDrawableSpatialIndexCache, pointDrawQueryWorldExtent,
 			[](const CachedPointDrawable& item) -> const GB_Rectangle&
 			{
@@ -3931,9 +5238,9 @@ void QMainCanvas::DrawVectorDrawablesFastLod(QPainter& painter, const QRectF& ex
 			{
 				return item.point.visible;
 			},
-			[this, &painter, &exposedRect, &pointDrawQueryWorldExtent, &pointLodGrid, &drawnPointCount, &MakeUsableScreenRect](size_t pointIndex) -> bool
+			[this, &painter, &exposedRect, &pointDrawQueryWorldExtent, &drawnPointCount, candidateCount, targetCount, &MakeUsableScreenRect](size_t pointIndex) -> bool
 			{
-				if (pointLodGrid.IsFullySaturated() || drawnPointCount >= MaxFastLodDrawnDrawableCount)
+				if (drawnPointCount >= targetCount || drawnPointCount >= MaxFastLodDrawnDrawableCount)
 				{
 					return false;
 				}
@@ -3944,6 +5251,11 @@ void QMainCanvas::DrawVectorDrawablesFastLod(QPainter& painter, const QRectF& ex
 				}
 
 				const CachedPointDrawable& cachedPoint = pointDrawables[pointIndex];
+				if (!ShouldAcceptFastLodDrawable(pointIndex, cachedPoint.insertionSequence, 0x25D4E937A71CB5B9ull, candidateCount, targetCount))
+				{
+					return true;
+				}
+
 				const GB_Point2d screenPoint = WorldToScreen(cachedPoint.point.position);
 				if (!screenPoint.IsValid())
 				{
@@ -3951,18 +5263,19 @@ void QMainCanvas::DrawVectorDrawablesFastLod(QPainter& painter, const QRectF& ex
 				}
 
 				const double halfSize = std::max(1.0, static_cast<double>(cachedPoint.point.symbolSize) * 0.5 + cachedPoint.screenMarginPixels);
-				QRectF screenRect(screenPoint.x - halfSize, screenPoint.y - halfSize, halfSize * 2.0, halfSize * 2.0);
-				screenRect = MakeUsableScreenRect(screenRect);
-				if (!pointLodGrid.TryAccept(screenRect))
+				const QRectF screenRect = MakeUsableScreenRect(QRectF(screenPoint.x - halfSize, screenPoint.y - halfSize, halfSize * 2.0, halfSize * 2.0));
+				if (!screenRect.isValid() || screenRect.isEmpty() || !screenRect.intersects(exposedRect))
 				{
 					return true;
 				}
 
 				DrawCachedPointDrawableFastLod(painter, cachedPoint, pointDrawQueryWorldExtent, exposedRect);
 				drawnPointCount++;
-				return !(pointLodGrid.IsFullySaturated() || drawnPointCount >= MaxFastLodDrawnDrawableCount);
+				return drawnPointCount < targetCount && drawnPointCount < MaxFastLodDrawnDrawableCount;
 			});
 	}
+
+	painter.setRenderHint(QPainter::Antialiasing, oldAntialiasing);
 }
 
 void QMainCanvas::DrawCachedPointDrawableFastLod(QPainter& painter, const CachedPointDrawable& cachedPoint, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const

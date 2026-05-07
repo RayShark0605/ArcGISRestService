@@ -7,10 +7,13 @@
 #include <QRectF>
 #include <QString>
 #include <QTimer>
-#include <QWidget>
+#include <QOpenGLWidget>
+#include <QOpenGLFunctions>
+#include <QtGui/qopengl.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -29,6 +32,7 @@ class QMouseEvent;
 class QPaintEvent;
 class QPainter;
 class QPainterPath;
+class QOpenGLShaderProgram;
 class QResizeEvent;
 class QWheelEvent;
 
@@ -47,7 +51,13 @@ struct QMainCanvasSpatialIndex
 	bool isValid = false;
 };
 
-class QMainCanvas : public QWidget
+enum class QMainCanvasRenderBackend
+{
+	QPainter = 0,
+	OpenGL
+};
+
+class QMainCanvas : public QOpenGLWidget, protected QOpenGLFunctions
 {
 	Q_OBJECT
 
@@ -124,6 +134,10 @@ public:
 	void SetDrawablesVisible(const std::vector<std::string>& drawablesUids, bool visible);
 	void SetDrawablesLayerNumber(const std::vector<std::string>& drawablesUids, double layerNumber);
 
+	void SetRenderBackend(QMainCanvasRenderBackend backend);
+	QMainCanvasRenderBackend GetRenderBackend() const;
+	bool IsOpenGLRenderBackendUsable() const;
+
 signals:
 	void ViewStateChanged(const GB_Rectangle& extent, double approximateMetersPerPixel);
 	void ViewExtentDisplayChanged(const GB_Rectangle& extent);
@@ -132,7 +146,9 @@ signals:
 	void LayerDropRequested(const QString& nodeUid, const QString& url, const QString& text, int nodeType);
 
 protected:
-	virtual void paintEvent(QPaintEvent* event) override;
+	virtual void initializeGL() override;
+	virtual void resizeGL(int width, int height) override;
+	virtual void paintGL() override;
 	virtual void resizeEvent(QResizeEvent* event) override;
 	virtual void mousePressEvent(QMouseEvent* event) override;
 	virtual void mouseMoveEvent(QMouseEvent* event) override;
@@ -195,6 +211,79 @@ private:
 		size_t index = 0;
 	};
 
+
+	struct GpuPointVertex
+	{
+		float centerX = 0.0f;
+		float centerY = 0.0f;
+		float localX = 0.0f;
+		float localY = 0.0f;
+		float size = 1.0f;
+		float borderWidth = 0.0f;
+		float shape = 0.0f;
+		float filled = 1.0f;
+		float fillR = 1.0f;
+		float fillG = 0.0f;
+		float fillB = 0.0f;
+		float fillA = 1.0f;
+		float borderR = 0.0f;
+		float borderG = 0.0f;
+		float borderB = 0.0f;
+		float borderA = 1.0f;
+	};
+
+	struct GpuLineVertex
+	{
+		float startX = 0.0f;
+		float startY = 0.0f;
+		float endX = 0.0f;
+		float endY = 0.0f;
+		float side = 0.0f;
+		float endpoint = 0.0f;
+		float width = 1.0f;
+		float reserved = 0.0f;
+		float colorR = 1.0f;
+		float colorG = 0.0f;
+		float colorB = 0.0f;
+		float colorA = 1.0f;
+	};
+
+	struct GpuPolygonVertex
+	{
+		float x = 0.0f;
+		float y = 0.0f;
+		float colorR = 1.0f;
+		float colorG = 0.0f;
+		float colorB = 0.0f;
+		float colorA = 1.0f;
+	};
+
+	struct GpuVectorChunk
+	{
+		double layerNumber = 0.0;
+		std::uint64_t insertionSequence = 0;
+		GB_Rectangle extent;
+		double originX = 0.0;
+		double originY = 0.0;
+		std::vector<GpuPointVertex> pointVertices;
+		std::vector<GpuLineVertex> polylineVertices;
+		std::vector<GpuPolygonVertex> polygonFillVertices;
+		std::vector<GpuLineVertex> polygonBorderVertices;
+		mutable GLuint pointBufferId = 0;
+		mutable GLuint polylineBufferId = 0;
+		mutable GLuint polygonFillBufferId = 0;
+		mutable GLuint polygonBorderBufferId = 0;
+		mutable bool buffersUploaded = false;
+	};
+
+	struct OpenGLPaintReference
+	{
+		CachedDrawableKind kind = CachedDrawableKind::MapTile;
+		size_t index = 0;
+		double layerNumber = 0.0;
+		std::uint64_t insertionSequence = 0;
+	};
+
 	std::string crsWkt = "";
 	QString crsDisplayText;
 	GB_Rectangle viewExtent;
@@ -202,6 +291,14 @@ private:
 	bool clipMapTilesToCrsValidArea = false;
 	bool crsValidAreaVisible = false;
 	GB_ColorRGBA crsValidAreaColor = GB_ColorRGBA(255, 0, 0, 80);
+
+	QMainCanvasRenderBackend renderBackend = QMainCanvasRenderBackend::OpenGL;
+	bool openGLInitialized = false;
+	bool openGLProgramsReady = false;
+	bool openGLProgramsFailed = false;
+	std::unique_ptr<QOpenGLShaderProgram> openGLPointProgram;
+	std::unique_ptr<QOpenGLShaderProgram> openGLLineProgram;
+	std::unique_ptr<QOpenGLShaderProgram> openGLPolygonProgram;
 
 	mutable std::vector<std::vector<GB_Point2d>> crsValidAreaPolygonsCache;
 	mutable std::vector<GB_Rectangle> crsValidAreaPolygonExtentsCache;
@@ -246,7 +343,14 @@ private:
 	mutable QMainCanvasSpatialIndex polygonDrawableSpatialIndexCache;
 	mutable std::vector<size_t> polygonDrawableVisibleIndexScratch;
 
+	mutable bool openGLVectorCacheDirty = true;
+	mutable bool openGLVectorChunkSpatialIndexDirty = true;
+	mutable std::vector<GpuVectorChunk> openGLVectorChunks;
+	mutable QMainCanvasSpatialIndex openGLVectorChunkSpatialIndexCache;
+
 	mutable std::vector<VisibleDrawableReference> visibleDrawableReferenceScratch;
+	mutable std::vector<OpenGLPaintReference> openGLPaintReferenceScratch;
+	mutable std::vector<size_t> openGLVectorChunkVisibleIndexScratch;
 
 	mutable bool pointDrawableMaxScreenMarginCacheDirty = true;
 	mutable double pointDrawableMaxScreenMarginCache = 0.0;
@@ -319,7 +423,22 @@ private:
 	double GetMaxPolylineDrawableScreenMarginPixels() const;
 	double GetMaxPolygonDrawableScreenMarginPixels() const;
 	void DrawBackground(QPainter& painter) const;
+	void RenderWithQPainter(QPainter& painter, const QRectF& exposedRect) const;
+	void RenderWithOpenGLBackend(QPainter& painter, const QRectF& exposedRect);
 	void DrawDrawables(QPainter& painter, const QRectF& exposedRect) const;
+	bool EnsureOpenGLPrograms();
+	bool EnsureOpenGLVectorCache();
+	void InvalidateOpenGLVectorCache() const;
+	void DestroyOpenGLVectorBuffers();
+	void DestroyOpenGLResources();
+	void EnsureOpenGLVectorChunkSpatialIndex() const;
+	void CollectVisibleOpenGLVectorChunkIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const;
+	void UploadOpenGLVectorChunk(const GpuVectorChunk& chunk);
+	void DrawOpenGLVectorChunk(const GpuVectorChunk& chunk);
+	void DrawOpenGLPointChunk(const GpuVectorChunk& chunk);
+	void DrawOpenGLPolylineChunk(const GpuVectorChunk& chunk);
+	void DrawOpenGLPolygonFillChunk(const GpuVectorChunk& chunk);
+	void DrawOpenGLPolygonBorderChunk(const GpuVectorChunk& chunk);
 	void DrawCachedMapTile(QPainter& painter, const CachedMapTile& cachedTile, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect, const QPainterPath* crsClipPath, bool hasPreciseCrsClip, bool canUseCrsPolygonExtents) const;
 	void DrawCachedPointDrawable(QPainter& painter, const CachedPointDrawable& cachedPoint, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const;
 	void DrawCachedPolylineDrawable(QPainter& painter, const CachedPolylineDrawable& cachedPolyline, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const;
