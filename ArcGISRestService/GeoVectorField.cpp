@@ -60,7 +60,7 @@ namespace
         for (size_t i = 0; i < trimmedText.size(); i++)
         {
             const char character = ToLowerAscii(trimmedText[i]);
-            if (character == '_' || character == '-' || character == ' ' || character == '\t' || character == '\r' || character == '\n')
+            if (character == '_' || character == '-' || character == ' ' || character == '\t' || character == '\r' || character == '\n' || character == ':' || character == '.')
             {
                 continue;
             }
@@ -93,6 +93,18 @@ namespace
         return false;
     }
 
+    inline bool TryGetMapValue(const GB_VariantMap& valueMap, const std::string& key, GB_Variant& outValue)
+    {
+        const GB_VariantMap::const_iterator iter = valueMap.find(key);
+        if (iter == valueMap.end())
+        {
+            return false;
+        }
+
+        outValue = iter->second;
+        return true;
+    }
+
     inline bool TryGetMapStringValue(const GB_VariantMap& valueMap, const std::string& key, std::string& outValue)
     {
         const GB_VariantMap::const_iterator iter = valueMap.find(key);
@@ -110,6 +122,18 @@ namespace
 
         outValue = value;
         return true;
+    }
+
+    inline bool TryGetAnyMapStringValue(const GB_VariantMap& valueMap, const std::vector<std::string>& keys, std::string& outValue)
+    {
+        for (size_t i = 0; i < keys.size(); i++)
+        {
+            if (TryGetMapStringValue(valueMap, keys[i], outValue))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     inline bool TryGetMapIntValue(const GB_VariantMap& valueMap, const std::string& key, int& outValue)
@@ -131,6 +155,18 @@ namespace
         return true;
     }
 
+    inline bool TryGetAnyMapIntValue(const GB_VariantMap& valueMap, const std::vector<std::string>& keys, int& outValue)
+    {
+        for (size_t i = 0; i < keys.size(); i++)
+        {
+            if (TryGetMapIntValue(valueMap, keys[i], outValue))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     inline bool TryGetMapBoolValue(const GB_VariantMap& valueMap, const std::string& key, bool& outValue)
     {
         const GB_VariantMap::const_iterator iter = valueMap.find(key);
@@ -150,15 +186,119 @@ namespace
         return true;
     }
 
+    inline bool TryGetAnyMapBoolValue(const GB_VariantMap& valueMap, const std::vector<std::string>& keys, bool& outValue)
+    {
+        for (size_t i = 0; i < keys.size(); i++)
+        {
+            if (TryGetMapBoolValue(valueMap, keys[i], outValue))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     inline bool IsControlCharacter(const char character)
     {
         const unsigned char byteValue = static_cast<unsigned char>(character);
         return byteValue < 32 || byteValue == 127;
     }
 
+    bool IsGDALBooleanSubTypeString(const std::string& subTypeTextUtf8)
+    {
+        const std::string subTypeText = NormalizeTypeText(subTypeTextUtf8);
+        return subTypeText == "ofstboolean" || subTypeText == "boolean" || subTypeText == "bool";
+    }
+
+    bool IsGDALInt16SubTypeString(const std::string& subTypeTextUtf8)
+    {
+        const std::string subTypeText = NormalizeTypeText(subTypeTextUtf8);
+        return subTypeText == "ofstint16" || subTypeText == "int16" || subTypeText == "short" || subTypeText == "smallinteger";
+    }
+
+    bool IsGDALFloat32SubTypeString(const std::string& subTypeTextUtf8)
+    {
+        const std::string subTypeText = NormalizeTypeText(subTypeTextUtf8);
+        return subTypeText == "ofstfloat32" || subTypeText == "float32" || subTypeText == "single" || subTypeText == "float";
+    }
+
+    bool IsGDALUuidSubTypeString(const std::string& subTypeTextUtf8)
+    {
+        const std::string subTypeText = NormalizeTypeText(subTypeTextUtf8);
+        return subTypeText == "ofstuuid" || subTypeText == "uuid" || subTypeText == "guid";
+    }
+
+    bool IsGDALJsonSubTypeString(const std::string& subTypeTextUtf8)
+    {
+        const std::string subTypeText = NormalizeTypeText(subTypeTextUtf8);
+        return subTypeText == "ofstjson" || subTypeText == "json";
+    }
+
+    void ApplyGDALSubType(GeoVectorField& field)
+    {
+        if (field.sourceSubTypeTextUtf8.empty())
+        {
+            return;
+        }
+
+        if (IsGDALBooleanSubTypeString(field.sourceSubTypeTextUtf8))
+        {
+            field.type = GeoVectorFieldType::Bool;
+        }
+        else if (IsGDALInt16SubTypeString(field.sourceSubTypeTextUtf8) && field.type == GeoVectorFieldType::Int32)
+        {
+            field.type = GeoVectorFieldType::Int16;
+        }
+        else if (IsGDALFloat32SubTypeString(field.sourceSubTypeTextUtf8) && field.type == GeoVectorFieldType::Double)
+        {
+            field.type = GeoVectorFieldType::Float;
+        }
+        else if (IsGDALUuidSubTypeString(field.sourceSubTypeTextUtf8) && field.type == GeoVectorFieldType::String)
+        {
+            field.type = GeoVectorFieldType::Guid;
+        }
+        else if (IsGDALJsonSubTypeString(field.sourceSubTypeTextUtf8) && field.type == GeoVectorFieldType::String)
+        {
+            field.type = GeoVectorFieldType::String;
+        }
+    }
+
+    bool TryGetDomainName(const GB_VariantMap& fieldMap, std::string& outDomainNameUtf8)
+    {
+        if (TryGetMapStringValue(fieldMap, "domainName", outDomainNameUtf8))
+        {
+            return true;
+        }
+
+        if (TryGetMapStringValue(fieldMap, "domain", outDomainNameUtf8))
+        {
+            return true;
+        }
+
+        const GB_VariantMap::const_iterator domainIter = fieldMap.find("domain");
+        if (domainIter == fieldMap.end())
+        {
+            return false;
+        }
+
+        const GB_VariantMap* domainMap = domainIter->second.AnyCast<GB_VariantMap>();
+        if (domainMap == nullptr)
+        {
+            return false;
+        }
+
+        return TryGetMapStringValue(*domainMap, "name", outDomainNameUtf8);
+    }
+
+    inline int NormalizeNonNegativeInt(const int value)
+    {
+        return value < 0 ? 0 : value;
+    }
+
     inline bool CheckTextLength(const GeoVectorField& field, const GB_Variant& value)
     {
-        if (field.maxLength <= 0)
+        const int textLengthLimit = field.GetTextLengthLimit();
+        if (textLengthLimit <= 0)
         {
             return true;
         }
@@ -171,13 +311,13 @@ namespace
         }
 
         const size_t textLength = GB_IsUtf8(text) ? GB_GetUtf8Length(text) : text.size();
-        return textLength <= static_cast<size_t>(field.maxLength);
+        return textLength <= static_cast<size_t>(textLengthLimit);
     }
 }
 
 bool GeoVectorField::IsValid() const
 {
-    return GeoVectorFieldsHelper::IsValidFieldName(nameUtf8) && type != GeoVectorFieldType::Unknown && maxLength >= 0;
+    return GeoVectorFieldsHelper::IsValidFieldName(nameUtf8) && type != GeoVectorFieldType::Unknown && maxLength >= 0 && width >= 0 && precision >= 0;
 }
 
 bool GeoVectorField::IsStringField() const
@@ -215,6 +355,31 @@ bool GeoVectorField::IsIdField() const
     return type == GeoVectorFieldType::ObjectId || type == GeoVectorFieldType::GlobalId || type == GeoVectorFieldType::Guid;
 }
 
+bool GeoVectorField::IsBoolField() const
+{
+    return type == GeoVectorFieldType::Bool;
+}
+
+bool GeoVectorField::HasTextLengthLimit() const
+{
+    return GetTextLengthLimit() > 0;
+}
+
+int GeoVectorField::GetTextLengthLimit() const
+{
+    if (maxLength > 0)
+    {
+        return maxLength;
+    }
+
+    if (type == GeoVectorFieldType::String && width > 0)
+    {
+        return width;
+    }
+
+    return 0;
+}
+
 std::string GeoVectorField::GetDisplayNameUtf8() const
 {
     return aliasUtf8.empty() ? nameUtf8 : aliasUtf8;
@@ -244,6 +409,8 @@ GeoVectorFieldValueStorageType GeoVectorFieldsHelper::GetGeoVectorFieldValueStor
         return GeoVectorFieldValueStorageType::String;
     case GeoVectorFieldType::Blob:
         return GeoVectorFieldValueStorageType::Binary;
+    case GeoVectorFieldType::Bool:
+        return GeoVectorFieldValueStorageType::Bool;
     case GeoVectorFieldType::Unknown:
     case GeoVectorFieldType::Raster:
     case GeoVectorFieldType::Geometry:
@@ -290,6 +457,8 @@ std::string GeoVectorFieldsHelper::FieldTypeToString(const GeoVectorFieldType fi
         return "Geometry";
     case GeoVectorFieldType::Xml:
         return "Xml";
+    case GeoVectorFieldType::Bool:
+        return "Bool";
     case GeoVectorFieldType::Unknown:
     default:
         return "Unknown";
@@ -312,6 +481,8 @@ std::string GeoVectorFieldsHelper::FieldValueStorageTypeToString(const GeoVector
         return "Binary";
     case GeoVectorFieldValueStorageType::RawVariant:
         return "RawVariant";
+    case GeoVectorFieldValueStorageType::Bool:
+        return "Bool";
     case GeoVectorFieldValueStorageType::Unknown:
     default:
         return "Unknown";
@@ -333,6 +504,10 @@ GeoVectorFieldType GeoVectorFieldsHelper::FieldTypeFromArcGISString(const std::s
     if (typeText == "esrifieldtypeguid" || typeText == "guid")
     {
         return GeoVectorFieldType::Guid;
+    }
+    if (typeText == "esrifieldtypeboolean" || typeText == "boolean" || typeText == "bool")
+    {
+        return GeoVectorFieldType::Bool;
     }
     if (typeText == "esrifieldtypesmallinteger" || typeText == "smallinteger" || typeText == "int16" || typeText == "short")
     {
@@ -432,7 +607,92 @@ std::string GeoVectorFieldsHelper::FieldTypeToArcGISString(const GeoVectorFieldT
         return "esriFieldTypeGeometry";
     case GeoVectorFieldType::Xml:
         return "esriFieldTypeXML";
+    case GeoVectorFieldType::Bool:
     case GeoVectorFieldType::Unknown:
+    default:
+        return "";
+    }
+}
+
+GeoVectorFieldType GeoVectorFieldsHelper::FieldTypeFromGDALString(const std::string& fieldTypeTextUtf8)
+{
+    const std::string typeText = NormalizeTypeText(fieldTypeTextUtf8);
+
+    if (typeText == "oftinteger" || typeText == "integer" || typeText == "int" || typeText == "int32")
+    {
+        return GeoVectorFieldType::Int32;
+    }
+    if (typeText == "oftinteger64" || typeText == "integer64" || typeText == "int64" || typeText == "long" || typeText == "longlong")
+    {
+        return GeoVectorFieldType::Int64;
+    }
+    if (typeText == "oftreal" || typeText == "real" || typeText == "double" || typeText == "float64" || typeText == "numeric" || typeText == "number")
+    {
+        return GeoVectorFieldType::Double;
+    }
+    if (typeText == "oftstring" || typeText == "oftwidestring" || typeText == "string" || typeText == "widestring" || typeText == "text" || typeText == "char" || typeText == "character")
+    {
+        return GeoVectorFieldType::String;
+    }
+    if (typeText == "oftdate" || typeText == "date")
+    {
+        return GeoVectorFieldType::Date;
+    }
+    if (typeText == "ofttime" || typeText == "time")
+    {
+        return GeoVectorFieldType::Time;
+    }
+    if (typeText == "oftdatetime" || typeText == "datetime" || typeText == "timestamp")
+    {
+        return GeoVectorFieldType::DateTime;
+    }
+    if (typeText == "oftbinary" || typeText == "binary" || typeText == "blob")
+    {
+        return GeoVectorFieldType::Blob;
+    }
+    if (typeText == "bool" || typeText == "boolean" || typeText == "logical")
+    {
+        return GeoVectorFieldType::Bool;
+    }
+    if (typeText == "oftintegerlist" || typeText == "oftinteger64list" || typeText == "oftreallist" || typeText == "oftstringlist" || typeText == "oftwidestringlist")
+    {
+        return GeoVectorFieldType::Unknown;
+    }
+
+    return GeoVectorFieldType::Unknown;
+}
+
+std::string GeoVectorFieldsHelper::FieldTypeToGDALString(const GeoVectorFieldType fieldType)
+{
+    switch (fieldType)
+    {
+    case GeoVectorFieldType::Bool:
+    case GeoVectorFieldType::Int16:
+    case GeoVectorFieldType::Int32:
+        return "OFTInteger";
+    case GeoVectorFieldType::ObjectId:
+    case GeoVectorFieldType::Int64:
+        return "OFTInteger64";
+    case GeoVectorFieldType::Float:
+    case GeoVectorFieldType::Double:
+        return "OFTReal";
+    case GeoVectorFieldType::GlobalId:
+    case GeoVectorFieldType::Guid:
+    case GeoVectorFieldType::String:
+    case GeoVectorFieldType::TimestampOffset:
+    case GeoVectorFieldType::Xml:
+        return "OFTString";
+    case GeoVectorFieldType::Date:
+        return "OFTDate";
+    case GeoVectorFieldType::Time:
+        return "OFTTime";
+    case GeoVectorFieldType::DateTime:
+        return "OFTDateTime";
+    case GeoVectorFieldType::Blob:
+        return "OFTBinary";
+    case GeoVectorFieldType::Unknown:
+    case GeoVectorFieldType::Raster:
+    case GeoVectorFieldType::Geometry:
     default:
         return "";
     }
@@ -704,6 +964,22 @@ GeoVectorFields GeoVectorFieldsHelper::FilterDateOrTimeFields(const GeoVectorFie
     return resultFields;
 }
 
+GeoVectorFields GeoVectorFieldsHelper::FilterBoolFields(const GeoVectorFields& fields)
+{
+    GeoVectorFields resultFields;
+    resultFields.reserve(fields.size());
+
+    for (size_t i = 0; i < fields.size(); i++)
+    {
+        if (fields[i].IsBoolField())
+        {
+            resultFields.push_back(fields[i]);
+        }
+    }
+
+    return resultFields;
+}
+
 const GeoVectorField* GeoVectorFieldsHelper::FindFirstFieldOfType(const GeoVectorFields& fields, const GeoVectorFieldType fieldType)
 {
     for (size_t i = 0; i < fields.size(); i++)
@@ -846,6 +1122,18 @@ bool GeoVectorFieldsHelper::ValidateFields(const GeoVectorFields& fields, const 
             return false;
         }
 
+        if (fields[i].width < 0)
+        {
+            SET_ERROR_MESSAGE(GB_STR("字段 width 不能为负数。"));
+            return false;
+        }
+
+        if (fields[i].precision < 0)
+        {
+            SET_ERROR_MESSAGE(GB_STR("字段 precision 不能为负数。"));
+            return false;
+        }
+
         if (!allowUnknownType && fields[i].type == GeoVectorFieldType::Unknown)
         {
             SET_ERROR_MESSAGE(GB_STR("字段类型不能为 Unknown。"));
@@ -897,13 +1185,29 @@ bool GeoVectorFieldsHelper::TryParseArcGISField(const GB_VariantMap& fieldMap, G
 {
     GeoVectorField field;
     field.rawJsonMap = fieldMap;
+    field.rawSourceMap = fieldMap;
 
     TryGetMapStringValue(fieldMap, "name", field.nameUtf8);
     TryGetMapStringValue(fieldMap, "alias", field.aliasUtf8);
     TryGetMapStringValue(fieldMap, "type", field.sourceTypeTextUtf8);
     TryGetMapIntValue(fieldMap, "length", field.maxLength);
     TryGetMapIntValue(fieldMap, "maxLength", field.maxLength);
+    TryGetMapIntValue(fieldMap, "width", field.width);
+    TryGetMapIntValue(fieldMap, "precision", field.precision);
     TryGetMapBoolValue(fieldMap, "nullable", field.nullable);
+    TryGetMapBoolValue(fieldMap, "editable", field.editable);
+    TryGetMapBoolValue(fieldMap, "unique", field.unique);
+    TryGetMapBoolValue(fieldMap, "ignored", field.ignored);
+    TryGetDomainName(fieldMap, field.domainNameUtf8);
+    TryGetMapStringValue(fieldMap, "comment", field.commentUtf8);
+    TryGetMapStringValue(fieldMap, "description", field.commentUtf8);
+
+    GB_Variant defaultValue;
+    if (TryGetMapValue(fieldMap, "defaultValue", defaultValue))
+    {
+        field.hasDefaultValue = true;
+        field.defaultValue = defaultValue;
+    }
 
     field.type = FieldTypeFromArcGISString(field.sourceTypeTextUtf8);
 
@@ -912,15 +1216,19 @@ bool GeoVectorFieldsHelper::TryParseArcGISField(const GB_VariantMap& fieldMap, G
         field.aliasUtf8 = field.nameUtf8;
     }
 
+    field.maxLength = NormalizeNonNegativeInt(field.maxLength);
+    field.width = NormalizeNonNegativeInt(field.width);
+    field.precision = NormalizeNonNegativeInt(field.precision);
+
+    if (field.width == 0 && field.maxLength > 0)
+    {
+        field.width = field.maxLength;
+    }
+
     if (!IsValidFieldName(field.nameUtf8))
     {
         outField = GeoVectorField();
         return false;
-    }
-
-    if (field.maxLength < 0)
-    {
-        field.maxLength = 0;
     }
 
     outField = std::move(field);
@@ -959,6 +1267,104 @@ GeoVectorFields GeoVectorFieldsHelper::ParseArcGISFields(const GB_VariantList& f
     {
         GeoVectorField field;
         if (TryParseArcGISField(fieldList[i], field))
+        {
+            fields.push_back(std::move(field));
+        }
+    }
+
+    return fields;
+}
+
+bool GeoVectorFieldsHelper::TryParseGDALField(const GB_VariantMap& fieldMap, GeoVectorField& outField)
+{
+    GeoVectorField field;
+    field.rawSourceMap = fieldMap;
+
+    TryGetAnyMapStringValue(fieldMap, { "name", "fieldName", "sourceName" }, field.nameUtf8);
+    TryGetAnyMapStringValue(fieldMap, { "alias", "aliasName", "displayName" }, field.aliasUtf8);
+    TryGetAnyMapStringValue(fieldMap, { "type", "sourceType", "sourceTypeText", "gdalType", "ogrType", "fieldType" }, field.sourceTypeTextUtf8);
+    TryGetAnyMapStringValue(fieldMap, { "subType", "sourceSubType", "sourceSubTypeText", "gdalSubType", "ogrSubType", "fieldSubType" }, field.sourceSubTypeTextUtf8);
+    TryGetAnyMapIntValue(fieldMap, { "width", "fieldWidth" }, field.width);
+    TryGetAnyMapIntValue(fieldMap, { "precision", "fieldPrecision" }, field.precision);
+    TryGetAnyMapIntValue(fieldMap, { "maxLength", "length" }, field.maxLength);
+    TryGetAnyMapBoolValue(fieldMap, { "nullable", "isNullable" }, field.nullable);
+    TryGetAnyMapBoolValue(fieldMap, { "editable", "isEditable" }, field.editable);
+    TryGetAnyMapBoolValue(fieldMap, { "unique", "isUnique" }, field.unique);
+    TryGetAnyMapBoolValue(fieldMap, { "ignored", "isIgnored" }, field.ignored);
+    TryGetDomainName(fieldMap, field.domainNameUtf8);
+    TryGetAnyMapStringValue(fieldMap, { "comment", "description", "alternativeName" }, field.commentUtf8);
+
+    GB_Variant defaultValue;
+    if (TryGetMapValue(fieldMap, "defaultValue", defaultValue) || TryGetMapValue(fieldMap, "default", defaultValue))
+    {
+        field.hasDefaultValue = true;
+        field.defaultValue = defaultValue;
+    }
+
+    field.type = FieldTypeFromGDALString(field.sourceTypeTextUtf8);
+    if (field.type == GeoVectorFieldType::Unknown)
+    {
+        field.type = FieldTypeFromArcGISString(field.sourceTypeTextUtf8);
+    }
+
+    ApplyGDALSubType(field);
+
+    field.maxLength = NormalizeNonNegativeInt(field.maxLength);
+    field.width = NormalizeNonNegativeInt(field.width);
+    field.precision = NormalizeNonNegativeInt(field.precision);
+
+    if (field.maxLength == 0 && field.type == GeoVectorFieldType::String && field.width > 0)
+    {
+        field.maxLength = field.width;
+    }
+
+    if (field.aliasUtf8.empty())
+    {
+        field.aliasUtf8 = field.nameUtf8;
+    }
+
+    if (!IsValidFieldName(field.nameUtf8))
+    {
+        outField = GeoVectorField();
+        return false;
+    }
+
+    outField = std::move(field);
+    return true;
+}
+
+bool GeoVectorFieldsHelper::TryParseGDALField(const GB_Variant& fieldVariant, GeoVectorField& outField)
+{
+    const GB_VariantMap* fieldMap = fieldVariant.AnyCast<GB_VariantMap>();
+    if (fieldMap == nullptr)
+    {
+        outField = GeoVectorField();
+        return false;
+    }
+
+    return TryParseGDALField(*fieldMap, outField);
+}
+
+GeoVectorFields GeoVectorFieldsHelper::ParseGDALFields(const GB_Variant& fieldsVariant)
+{
+    const GB_VariantList* fieldList = fieldsVariant.AnyCast<GB_VariantList>();
+    if (fieldList == nullptr)
+    {
+        return GeoVectorFields();
+    }
+
+    return ParseGDALFields(*fieldList);
+}
+
+GeoVectorFields GeoVectorFieldsHelper::ParseGDALFields(const GB_VariantList& fieldList)
+{
+    GeoVectorFields fields;
+    fields.reserve(fieldList.size());
+
+    for (size_t i = 0; i < fieldList.size(); i++)
+    {
+        GeoVectorField field;
+        if (TryParseGDALField(fieldList[i], field))
         {
             fields.push_back(std::move(field));
         }
@@ -1034,6 +1440,18 @@ bool GeoVectorFieldsHelper::TryConvertValueToStorageType(const GeoVectorFieldTyp
     {
         bool ok = false;
         const GB_ByteBuffer value = inputValue.ToBinary(&ok);
+        if (!ok)
+        {
+            return false;
+        }
+
+        outValue = value;
+        return true;
+    }
+    case GeoVectorFieldValueStorageType::Bool:
+    {
+        bool ok = false;
+        const bool value = inputValue.ToBool(&ok);
         if (!ok)
         {
             return false;

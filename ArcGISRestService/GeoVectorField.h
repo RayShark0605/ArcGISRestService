@@ -11,25 +11,41 @@
 
 /**
  * @brief GIS 矢量图层字段类型。
- * 
+ *
+ * 该枚举描述字段在本项目中的统一逻辑类型，而不是某个具体数据源的原始类型。
+ *
  * 对应关系示例：
- * - esriFieldTypeOID              -> ObjectId
- * - esriFieldTypeGlobalID         -> GlobalId
- * - esriFieldTypeGUID             -> Guid
- * - esriFieldTypeSmallInteger     -> Int16
- * - esriFieldTypeInteger          -> Int32
- * - esriFieldTypeBigInteger       -> Int64
- * - esriFieldTypeSingle           -> Float
- * - esriFieldTypeDouble           -> Double
- * - esriFieldTypeString           -> String
- * - esriFieldTypeDate             -> DateTime
- * - esriFieldTypeDateOnly         -> Date
- * - esriFieldTypeTimeOnly         -> Time
- * - esriFieldTypeTimestampOffset  -> TimestampOffset
- * - esriFieldTypeBlob             -> Blob
- * - esriFieldTypeRaster           -> Raster
- * - esriFieldTypeGeometry         -> Geometry
- * - esriFieldTypeXML              -> Xml
+ * - ArcGIS esriFieldTypeOID              -> ObjectId
+ * - ArcGIS esriFieldTypeGlobalID         -> GlobalId
+ * - ArcGIS esriFieldTypeGUID             -> Guid
+ * - ArcGIS esriFieldTypeSmallInteger     -> Int16
+ * - ArcGIS esriFieldTypeInteger          -> Int32
+ * - ArcGIS esriFieldTypeBigInteger       -> Int64
+ * - ArcGIS esriFieldTypeSingle           -> Float
+ * - ArcGIS esriFieldTypeDouble           -> Double
+ * - ArcGIS esriFieldTypeString           -> String
+ * - ArcGIS esriFieldTypeDate             -> DateTime
+ * - ArcGIS esriFieldTypeDateOnly         -> Date
+ * - ArcGIS esriFieldTypeTimeOnly         -> Time
+ * - ArcGIS esriFieldTypeTimestampOffset  -> TimestampOffset
+ * - ArcGIS esriFieldTypeBlob             -> Blob
+ * - ArcGIS esriFieldTypeRaster           -> Raster
+ * - ArcGIS esriFieldTypeGeometry         -> Geometry
+ * - ArcGIS esriFieldTypeXML              -> Xml
+ *
+ * GDAL / OGR 对应关系示例：
+ * - OFTInteger                           -> Int32
+ * - OFTInteger + OFSTBoolean             -> Bool
+ * - OFTInteger + OFSTInt16               -> Int16
+ * - OFTInteger64                         -> Int64
+ * - OFTReal                              -> Double
+ * - OFTReal + OFSTFloat32                -> Float
+ * - OFTString                            -> String
+ * - OFTString + OFSTUUID                 -> Guid
+ * - OFTDate                              -> Date
+ * - OFTTime                              -> Time
+ * - OFTDateTime                          -> DateTime
+ * - OFTBinary                            -> Blob
  */
 enum class GeoVectorFieldType
 {
@@ -50,11 +66,15 @@ enum class GeoVectorFieldType
     Blob,
     Raster,
     Geometry,
-    Xml
+    Xml,
+    Bool
 };
 
 /**
  * @brief 字段值的推荐存储类型。
+ *
+ * GeoVectorFeature::attributes 中的 GB_Variant 值建议按照该枚举对应的类型保存，
+ * 以便属性表查询、统计、渲染分类时减少运行时类型分支。
  */
 enum class GeoVectorFieldValueStorageType
 {
@@ -76,7 +96,10 @@ enum class GeoVectorFieldValueStorageType
     Binary,
 
     /** @brief 保留原始 GB_Variant，用于 Unknown / Raster / Geometry 等暂不统一展开的类型。 */
-    RawVariant
+    RawVariant,
+
+    /** @brief 布尔值，用于 Bool。 */
+    Bool
 };
 
 #ifdef _MSC_VER
@@ -90,22 +113,72 @@ enum class GeoVectorFieldValueStorageType
  * 设计约定：
  * - nameUtf8 是字段真实名称，应在同一字段集合中保持唯一；
  * - aliasUtf8 是展示名称，可为空；为空时 UI 可退化显示 nameUtf8；
- * - sourceTypeTextUtf8 保留数据源原始字段类型文本，例如 "esriFieldTypeString"；
- * - maxLength 主要用于 String / Guid / GlobalId / Xml 等文本类字段，0 表示未知或不限制；
+ * - sourceTypeTextUtf8 保留数据源原始字段类型文本，例如 "esriFieldTypeString"、"OFTString"；
+ * - sourceSubTypeTextUtf8 保留数据源原始字段子类型文本，例如 "OFSTBoolean"、"OFSTUUID"；
+ * - maxLength 是面向项目内部文本语义的长度上限；
+ * - width / precision 是面向外部数据源字段定义的宽度和精度，尤其用于 DBF / OGRFieldDefn；
  * - nullable 表示属性值是否允许为空；
- * - rawJsonMap 可保留 ArcGIS fields[] 中的完整原始对象，便于后续扩展 domain/defaultValue/editable 等信息。
+ * - editable / unique / ignored / defaultValue / domainNameUtf8 / commentUtf8 用于兼容 ArcGIS、GDAL 以及后续数据库型数据源；
+ * - rawJsonMap 保留 ArcGIS fields[] 中的完整原始对象；
+ * - rawSourceMap 保留 GDAL / DBF / 其它通用数据源的原始字段元数据。
  */
 struct ARCGIS_RESTSERVICE_PORT GeoVectorField
 {
+    /** @brief 字段真实名称，UTF-8 编码。 */
     std::string nameUtf8 = "";
+
+    /** @brief 统一后的字段逻辑类型。 */
     GeoVectorFieldType type = GeoVectorFieldType::Unknown;
+
+    /** @brief 字段展示名称，UTF-8 编码。为空时展示 nameUtf8。 */
     std::string aliasUtf8 = "";
+
+    /** @brief 源数据字段类型文本，例如 "esriFieldTypeString"、"OFTString"、"DBF:N"。 */
     std::string sourceTypeTextUtf8 = "";
+
+    /** @brief 源数据字段子类型文本，例如 "OFSTBoolean"、"OFSTInt16"、"OFSTUUID"。 */
+    std::string sourceSubTypeTextUtf8 = "";
+
+    /** @brief 文本类字段最大字符长度。0 表示未知或不限制。 */
     int maxLength = 0;
+
+    /** @brief 源字段宽度。对 Shapefile / DBF 来说通常是 DBF 字段宽度。0 表示未知或不适用。 */
+    int width = 0;
+
+    /** @brief 源字段精度。对 Real / Numeric 字段通常表示小数位数。0 表示未知、整数或不适用。 */
+    int precision = 0;
+
+    /** @brief 字段是否允许空值。 */
     bool nullable = true;
+
+    /** @brief 字段是否可编辑。对只读数据源该值仅表示源字段定义语义，不表示当前数据源一定可写。 */
+    bool editable = true;
+
+    /** @brief 字段值是否应唯一。并非所有数据源都会提供该信息。 */
+    bool unique = false;
+
+    /** @brief 字段是否被源数据源标记为忽略。主要用于兼容 GDAL ignored field。 */
+    bool ignored = false;
+
+    /** @brief 源字段是否提供默认值。 */
+    bool hasDefaultValue = false;
+
+    /** @brief 字段默认值。只有 hasDefaultValue=true 时有效。 */
+    GB_Variant defaultValue;
+
+    /** @brief 字段所属域名称。为空表示未知或无域。 */
+    std::string domainNameUtf8 = "";
+
+    /** @brief 字段注释或描述。为空表示未知或无注释。 */
+    std::string commentUtf8 = "";
+
+    /** @brief ArcGIS fields[] 中的完整原始字段对象。 */
     GB_VariantMap rawJsonMap;
 
-    /** @brief 判断字段定义是否可用。要求字段名非空、字段类型不是 Unknown，且 maxLength 非负。 */
+    /** @brief GDAL / DBF / 其它通用数据源的原始字段元数据。 */
+    GB_VariantMap rawSourceMap;
+
+    /** @brief 判断字段定义是否可用。要求字段名非空、字段类型不是 Unknown，且长度、宽度、精度非负。 */
     bool IsValid() const;
 
     /** @brief 是否是以文本形式表达或存储的字段。 */
@@ -128,6 +201,15 @@ struct ARCGIS_RESTSERVICE_PORT GeoVectorField
 
     /** @brief 是否是 ObjectId / GlobalId / Guid 这类标识字段。 */
     bool IsIdField() const;
+
+    /** @brief 是否是布尔字段。 */
+    bool IsBoolField() const;
+
+    /** @brief 字段是否具有有效文本长度限制。 */
+    bool HasTextLengthLimit() const;
+
+    /** @brief 获取文本长度限制。优先返回 maxLength；当 maxLength 无效时对 String 字段回退使用 width。 */
+    int GetTextLengthLimit() const;
 
     /** @brief 获取展示名称。aliasUtf8 非空时返回 aliasUtf8，否则返回 nameUtf8。 */
     std::string GetDisplayNameUtf8() const;
@@ -153,8 +235,14 @@ public:
     /** @brief 根据 ArcGIS 字段类型字符串解析字段类型。比较时不区分 ASCII 大小写。 */
     static GeoVectorFieldType FieldTypeFromArcGISString(const std::string& fieldTypeTextUtf8);
 
-    /** @brief 将字段类型转为 ArcGIS 字段类型字符串。Unknown 返回空字符串。 */
+    /** @brief 将字段类型转为 ArcGIS 字段类型字符串。Unknown / Bool 返回空字符串。 */
     static std::string FieldTypeToArcGISString(GeoVectorFieldType fieldType);
+
+    /** @brief 根据 GDAL / OGR 字段类型字符串解析字段类型。比较时不区分 ASCII 大小写。 */
+    static GeoVectorFieldType FieldTypeFromGDALString(const std::string& fieldTypeTextUtf8);
+
+    /** @brief 将字段类型转为 GDAL / OGR 字段类型字符串。Unknown / Raster / Geometry 返回空字符串。 */
+    static std::string FieldTypeToGDALString(GeoVectorFieldType fieldType);
 
     /** @brief 判断字段名是否非空且不包含控制字符。 */
     static bool IsValidFieldName(const std::string& fieldNameUtf8);
@@ -218,6 +306,9 @@ public:
     /** @brief 筛选日期或时间类字段。 */
     static GeoVectorFields FilterDateOrTimeFields(const GeoVectorFields& fields);
 
+    /** @brief 筛选布尔字段。 */
+    static GeoVectorFields FilterBoolFields(const GeoVectorFields& fields);
+
     /** @brief 查找第一个指定类型的字段；不存在时返回 nullptr。 */
     static const GeoVectorField* FindFirstFieldOfType(const GeoVectorFields& fields, GeoVectorFieldType fieldType);
 
@@ -273,13 +364,31 @@ public:
     static GeoVectorFields ParseArcGISFields(const GB_VariantList& fieldList);
 
     /**
+     * @brief 尝试将 GDAL / OGR 字段元数据解析为 GeoVectorField。
+     *
+     * 该接口不依赖 GDAL 头文件。调用方可把 OGRFieldDefn 中的信息转换为 GB_VariantMap 后传入。
+     * 推荐键名：name、type、subType、width、precision、nullable、unique、ignored、defaultValue、domainName、comment。
+     */
+    static bool TryParseGDALField(const GB_VariantMap& fieldMap, GeoVectorField& outField);
+
+    /** @brief 尝试将 GB_Variant 中保存的 GDAL / OGR 字段元数据解析为 GeoVectorField。要求实际类型为 GB_VariantMap。 */
+    static bool TryParseGDALField(const GB_Variant& fieldVariant, GeoVectorField& outField);
+
+    /** @brief 解析 GDAL / OGR 字段元数据列表。要求 fieldsVariant 实际类型为 GB_VariantList。非法项会被跳过。 */
+    static GeoVectorFields ParseGDALFields(const GB_Variant& fieldsVariant);
+
+    /** @brief 解析 GDAL / OGR 字段元数据列表。非法项会被跳过。 */
+    static GeoVectorFields ParseGDALFields(const GB_VariantList& fieldList);
+
+    /**
      * @brief 按字段类型将属性值转换为推荐存储类型。
      *
      * 说明：
      * - inputValue 为空时，outValue 也置为空并返回 true；
      * - Unknown / Raster / Geometry 会直接保留原始 GB_Variant；
      * - Int16 会额外检查 [-32768, 32767] 范围；
-     * - Float / Double 均转为 double，以减少属性表计算时的分支。
+     * - Float / Double 均转为 double，以减少属性表计算时的分支；
+     * - Bool 转为 bool。
      */
     static bool TryConvertValueToStorageType(GeoVectorFieldType fieldType, const GB_Variant& inputValue, GB_Variant& outValue);
 

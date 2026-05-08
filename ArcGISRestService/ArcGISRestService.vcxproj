@@ -176,6 +176,7 @@
     <ClInclude Include="GeoCrs.h" />
     <ClInclude Include="GeoCrsManager.h" />
     <ClInclude Include="GeoCrsTransform.h" />
+    <ClInclude Include="GeoIO.h" />
     <ClInclude Include="GeoVectorFeature.h" />
     <ClInclude Include="GeoVectorField.h" />
     <ClInclude Include="GeoVectorGeometry.h" />
@@ -210,6 +211,7 @@
     <ClCompile Include="GeoCrs.cpp" />
     <ClCompile Include="GeoCrsManager.cpp" />
     <ClCompile Include="GeoCrsTransform.cpp" />
+    <ClCompile Include="GeoIO.cpp" />
     <ClCompile Include="GeoVectorFeature.cpp" />
     <ClCompile Include="GeoVectorField.cpp" />
     <ClCompile Include="GeoVectorGeometry.cpp" />

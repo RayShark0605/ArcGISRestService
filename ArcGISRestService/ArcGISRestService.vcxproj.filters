@@ -135,6 +135,9 @@
     <ClInclude Include="GeoVectorFeature.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="GeoIO.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="GeoBase\GB_Config.cpp">
@@ -231,6 +234,9 @@
       <Filter>源文件</Filter>
     </ClCompile>
     <ClCompile Include="GeoVectorFeature.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="GeoIO.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
   </ItemGroup>
