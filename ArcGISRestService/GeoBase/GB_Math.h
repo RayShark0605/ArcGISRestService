@@ -1,5 +1,5 @@
-﻿#ifndef GEOBASE_MATH_H_H
-#define GEOBASE_MATH_H_H
+﻿#ifndef GLOBALBASE_MATH_H_H
+#define GLOBALBASE_MATH_H_H
 
 #include "../ArcGISRestServicePort.h"
 #include <cmath>
@@ -205,6 +205,13 @@ ARCGIS_RESTSERVICE_PORT std::string GB_RandomString(size_t length, const std::ve
 
 // 使用默认字符池生成随机字符串（a-z, A-Z, 0-9, '_', '-'）
 ARCGIS_RESTSERVICE_PORT std::string GB_RandomString(size_t length);
+
+/**
+ * @brief 生成标准 UUID/GUID 文本。
+ * @return 返回小写 UUID/GUID 字符串，格式为 xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx；生成失败时返回空字符串。
+ * @note 当前实现生成随机型 UUID（UUIDv4），并按标准设置 version 与 variant 位。
+ */
+ARCGIS_RESTSERVICE_PORT std::string GB_GenerateUuid();
 
 /**
  * @brief 将字符串按十进制解析为 int。

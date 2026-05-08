@@ -14,7 +14,7 @@
 /**
  * @brief GIS 矢量要素几何类型。
  */
-enum class ARCGIS_RESTSERVICE_PORT GeoVectorGeometryType
+enum class GeoVectorGeometryType
 {
     Unknown = 0,
     Point,

@@ -46,7 +46,6 @@ namespace
                 return false;
             }
         }
-
         return true;
     }
 
@@ -59,7 +58,6 @@ namespace
                 return false;
             }
         }
-
         return true;
     }
 

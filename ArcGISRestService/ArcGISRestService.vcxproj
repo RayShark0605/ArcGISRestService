@@ -176,6 +176,8 @@
     <ClInclude Include="GeoCrs.h" />
     <ClInclude Include="GeoCrsManager.h" />
     <ClInclude Include="GeoCrsTransform.h" />
+    <ClInclude Include="GeoVectorFeature.h" />
+    <ClInclude Include="GeoVectorField.h" />
     <ClInclude Include="GeoVectorGeometry.h" />
   </ItemGroup>
   <ItemGroup>
@@ -208,6 +210,8 @@
     <ClCompile Include="GeoCrs.cpp" />
     <ClCompile Include="GeoCrsManager.cpp" />
     <ClCompile Include="GeoCrsTransform.cpp" />
+    <ClCompile Include="GeoVectorFeature.cpp" />
+    <ClCompile Include="GeoVectorField.cpp" />
     <ClCompile Include="GeoVectorGeometry.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
