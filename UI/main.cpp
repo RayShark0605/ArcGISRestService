@@ -3,7 +3,9 @@
 #include "GeoCrsManager.h"
 #include <thread>
 #include "GeoBase/GB_Math.h"
+#include "GeoBase/GB_Utf8String.h"
 #include "DataDef.h"
+#include "GeoIO.h"
 
 #include <algorithm>
 #include <cmath>
