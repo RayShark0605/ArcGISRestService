@@ -790,7 +790,22 @@ namespace
         return result;
     }
 
-    GeoIO_Shp::LayerSpatialInfo ReadSpatialInfo(OGRLayer* layer)
+    void SetSpatialInfoExtent(GeoIO_Shp::LayerSpatialInfo& spatialInfo, const GB_Rectangle& extent)
+    {
+        if (!extent.IsValid())
+        {
+            return;
+        }
+
+        spatialInfo.extent = extent;
+        spatialInfo.hasExtent = true;
+        if (spatialInfo.hasCrs)
+        {
+            spatialInfo.boundingBox.Set(spatialInfo.crsWktUtf8, spatialInfo.extent);
+        }
+    }
+
+    GeoIO_Shp::LayerSpatialInfo ReadSpatialInfo(OGRLayer* layer, const bool forceExtentCalculation)
     {
         GeoIO_Shp::LayerSpatialInfo spatialInfo;
         if (layer == nullptr)
@@ -807,20 +822,12 @@ namespace
         }
 
         OGREnvelope envelope;
-        OGRErr extentError = layer->GetExtent(&envelope, FALSE);
-        if (extentError != OGRERR_NONE)
-        {
-            extentError = layer->GetExtent(&envelope, TRUE);
-        }
-
+        const OGRErr extentError = layer->GetExtent(&envelope, forceExtentCalculation ? TRUE : FALSE);
         if (extentError == OGRERR_NONE)
         {
-            spatialInfo.extent.Set(envelope.MinX, envelope.MinY, envelope.MaxX, envelope.MaxY);
-            spatialInfo.hasExtent = spatialInfo.extent.IsValid();
-            if (spatialInfo.hasExtent && spatialInfo.hasCrs)
-            {
-                spatialInfo.boundingBox.Set(spatialInfo.crsWktUtf8, spatialInfo.extent);
-            }
+            GB_Rectangle extent;
+            extent.Set(envelope.MinX, envelope.MinY, envelope.MaxX, envelope.MaxY);
+            SetSpatialInfoExtent(spatialInfo, extent);
         }
 
         return spatialInfo;
@@ -1087,6 +1094,9 @@ namespace
         if (geometryInfo.geometryType == GeoVectorGeometryType::Unknown && geoGeometryType != GeoVectorGeometryType::Unknown)
         {
             geometryInfo.geometryType = geoGeometryType;
+            geometryInfo.shapefileGeometryKind = GetShapefileGeometryKind(ogrGeometryType);
+            geometryInfo.sourceWkbGeometryTypeCode = static_cast<int>(ogrGeometryType);
+            geometryInfo.sourceWkbGeometryTypeNameUtf8 = OGRGeometryTypeToName(ogrGeometryType);
         }
 
         switch (geoGeometryType)
@@ -1289,7 +1299,7 @@ namespace
     {
         if (dataset == nullptr)
         {
-            SetErrorMessage(errorMessageUtf8, GB_STR("GDAL 数据集为空。 "));
+            SetErrorMessage(errorMessageUtf8, GB_STR("GDAL 数据集为空。"));
             return nullptr;
         }
 
@@ -1312,6 +1322,40 @@ namespace
         }
 
         return dataset->GetLayer(options.layerIndex);
+    }
+
+    int FindLayerIndex(GDALDataset* dataset, OGRLayer* targetLayer)
+    {
+        if (dataset == nullptr || targetLayer == nullptr)
+        {
+            return -1;
+        }
+
+        const int layerCount = dataset->GetLayerCount();
+        for (int layerIndex = 0; layerIndex < layerCount; layerIndex++)
+        {
+            if (dataset->GetLayer(layerIndex) == targetLayer)
+            {
+                return layerIndex;
+            }
+        }
+
+        return -1;
+    }
+
+    std::size_t GetFeatureReserveCount(const long long reportedFeatureCount, const std::size_t maxFeatureCount)
+    {
+        if (reportedFeatureCount <= 0)
+        {
+            return 0;
+        }
+
+        std::size_t reserveCount = static_cast<std::size_t>(reportedFeatureCount);
+        if (maxFeatureCount > 0)
+        {
+            reserveCount = std::min(reserveCount, maxFeatureCount);
+        }
+        return reserveCount;
     }
 
     OGRFieldType GetWritableOgrFieldType(const GeoVectorField& field, bool& isSupported)
@@ -1723,6 +1767,10 @@ namespace
             }
             if (points.size() == 1)
             {
+                if (!points[0].IsValid())
+                {
+                    return nullptr;
+                }
                 return WrapSingleGeometryAsMultiIfNeeded(new OGRPoint(points[0].x, points[0].y), targetGeometryType);
             }
 
@@ -1839,17 +1887,17 @@ namespace
         return outYear > 0 && daysInMonth > 0 && outDay >= 1 && outDay <= daysInMonth;
     }
 
-    void SetOgrFieldValue(OGRFeature* ogrFeature, const int targetFieldIndex, const OGRFieldDefn* targetFieldDefn, const GB_Variant& value)
+    bool SetOgrFieldValue(OGRFeature* ogrFeature, const int targetFieldIndex, const OGRFieldDefn* targetFieldDefn, const GB_Variant& value)
     {
         if (ogrFeature == nullptr || targetFieldDefn == nullptr)
         {
-            return;
+            return false;
         }
 
         if (value.IsEmpty())
         {
             ogrFeature->SetFieldNull(targetFieldIndex);
-            return;
+            return true;
         }
 
         bool ok = false;
@@ -1858,41 +1906,32 @@ namespace
         case OFTInteger:
         {
             const int intValue = value.ToInt(&ok);
-            if (ok)
+            if (!ok)
             {
-                ogrFeature->SetField(targetFieldIndex, intValue);
+                return false;
             }
-            else
-            {
-                ogrFeature->SetFieldNull(targetFieldIndex);
-            }
-            break;
+            ogrFeature->SetField(targetFieldIndex, intValue);
+            return true;
         }
         case OFTInteger64:
         {
             const long long int64Value = value.ToInt64(&ok);
-            if (ok)
+            if (!ok)
             {
-                ogrFeature->SetField(targetFieldIndex, static_cast<GIntBig>(int64Value));
+                return false;
             }
-            else
-            {
-                ogrFeature->SetFieldNull(targetFieldIndex);
-            }
-            break;
+            ogrFeature->SetField(targetFieldIndex, static_cast<GIntBig>(int64Value));
+            return true;
         }
         case OFTReal:
         {
             const double doubleValue = value.ToDouble(&ok);
-            if (ok)
+            if (!ok)
             {
-                ogrFeature->SetField(targetFieldIndex, doubleValue);
+                return false;
             }
-            else
-            {
-                ogrFeature->SetFieldNull(targetFieldIndex);
-            }
-            break;
+            ogrFeature->SetField(targetFieldIndex, doubleValue);
+            return true;
         }
         case OFTDate:
         {
@@ -1900,30 +1939,24 @@ namespace
             int year = 0;
             int month = 0;
             int day = 0;
-            if (ok && TryParseDateString(dateText, year, month, day))
+            if (!ok || !TryParseDateString(dateText, year, month, day))
             {
-                ogrFeature->SetField(targetFieldIndex, year, month, day, 0, 0, 0.0f, 0);
+                return false;
             }
-            else
-            {
-                ogrFeature->SetFieldNull(targetFieldIndex);
-            }
-            break;
+            ogrFeature->SetField(targetFieldIndex, year, month, day, 0, 0, 0.0f, 0);
+            return true;
         }
         case OFTString:
         case OFTWideString:
         default:
         {
             const std::string textValue = value.ToString(&ok);
-            if (ok)
+            if (!ok)
             {
-                ogrFeature->SetField(targetFieldIndex, textValue.c_str());
+                return false;
             }
-            else
-            {
-                ogrFeature->SetFieldNull(targetFieldIndex);
-            }
-            break;
+            ogrFeature->SetField(targetFieldIndex, textValue.c_str());
+            return true;
         }
         }
     }
@@ -2207,7 +2240,7 @@ bool GeoIO_Shp::Read(const std::string& filePathUtf8, ShpData& outData, const Re
     data.sourceInfo.sourceType = IsStandaloneDbfPath(inputFilePathUtf8) ? SourceType::StandaloneDbf : SourceType::EsriShapefile;
     data.sourceInfo.driverNameUtf8 = dataset->GetDriver() == nullptr ? "" : dataset->GetDriver()->GetDescription();
     data.sourceInfo.datasetPathUtf8 = inputFilePathUtf8;
-    data.sourceInfo.layerIndex = options.layerIndex;
+    data.sourceInfo.layerIndex = FindLayerIndex(dataset.get(), layer);
     data.sourceInfo.layerNameUtf8 = layer->GetName() == nullptr ? "" : layer->GetName();
     data.layerNameUtf8 = data.sourceInfo.layerNameUtf8.empty() ? GetFileStem(inputFilePathUtf8) : data.sourceInfo.layerNameUtf8;
     data.displayNameUtf8 = data.layerNameUtf8;
@@ -2218,7 +2251,7 @@ bool GeoIO_Shp::Read(const std::string& filePathUtf8, ShpData& outData, const Re
     }
 
     data.geometryInfo = ReadLayerGeometryInfo(layer);
-    data.spatialInfo = ReadSpatialInfo(layer);
+    data.spatialInfo = ReadSpatialInfo(layer, !options.loadFeatures);
     data.sourceInfo.encodingInfo = ReadEncodingInfo(layer, data.sourceInfo.sourceFiles, options);
 
     if (options.loadMetadata)
@@ -2260,15 +2293,18 @@ bool GeoIO_Shp::Read(const std::string& filePathUtf8, ShpData& outData, const Re
         return true;
     }
 
-    if (totalFeatureCount > 0)
+    const std::size_t featureReserveCount = GetFeatureReserveCount(data.statistics.featureCount, options.maxFeatureCount);
+    if (featureReserveCount > 0)
     {
-        data.features.reserve(totalFeatureCount);
+        data.features.reserve(featureReserveCount);
     }
 
     layer->ResetReading();
     std::size_t processedFeatureCount = 0;
     bool hasSinglePartGeometry = false;
     bool hasMultipartGeometry = false;
+    GB_Rectangle calculatedFeatureExtent;
+    bool hasCalculatedFeatureExtent = false;
     while (true)
     {
         if (options.maxFeatureCount > 0 && processedFeatureCount >= options.maxFeatureCount)
@@ -2337,6 +2373,20 @@ bool GeoIO_Shp::Read(const std::string& filePathUtf8, ShpData& outData, const Re
 
         if (!geometry.IsEmpty())
         {
+            const GB_Rectangle featureExtent = geometry.BoundingRectangle();
+            if (featureExtent.IsValid())
+            {
+                if (hasCalculatedFeatureExtent)
+                {
+                    calculatedFeatureExtent.Expand(featureExtent);
+                }
+                else
+                {
+                    calculatedFeatureExtent = featureExtent;
+                    hasCalculatedFeatureExtent = true;
+                }
+            }
+
             if (IsOgrMultipartGeometry(ogrGeometry))
             {
                 hasMultipartGeometry = true;
@@ -2350,6 +2400,11 @@ bool GeoIO_Shp::Read(const std::string& filePathUtf8, ShpData& outData, const Re
 
         feature.geometry = std::move(geometry);
         data.features.push_back(std::move(feature));
+    }
+
+    if (!data.spatialInfo.hasExtent && hasCalculatedFeatureExtent)
+    {
+        SetSpatialInfoExtent(data.spatialInfo, calculatedFeatureExtent);
     }
 
     data.statistics.loadedFeatureCount = data.features.size();
@@ -2521,7 +2576,13 @@ bool GeoIO_Shp::Write(const std::string& filePathUtf8, const ShpData& data, cons
 
             const OGRFieldDefn* targetFieldDefn = layerDefn->GetFieldDefn(targetFieldIndex);
             const GB_Variant value = sourceFeature.GetAttribute(sourceFieldIndex);
-            SetOgrFieldValue(ogrFeature.get(), targetFieldIndex, targetFieldDefn, value);
+            if (!SetOgrFieldValue(ogrFeature.get(), targetFieldIndex, targetFieldDefn, value))
+            {
+                std::ostringstream stream;
+                stream << GB_STR("写入字段值失败。要素下标：") << featureIndex << GB_STR("，字段名：") << data.fields[sourceFieldIndex].nameUtf8;
+                SetErrorMessage(errorMessageUtf8, stream.str());
+                return false;
+            }
         }
 
         std::unique_ptr<OGRGeometry, OgrGeometryDeleter> ogrGeometry(CreateOgrGeometryFromGeoGeometry(sourceFeature.geometry, options.organizePolygonRingsOnWrite, ogrLayerGeometryType));

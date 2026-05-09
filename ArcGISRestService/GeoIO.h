@@ -329,7 +329,7 @@ public:
      */
     struct ReadOptions
     {
-        ReadOptions();
+        ARCGIS_RESTSERVICE_PORT ReadOptions();
 
         /** @brief 要读取的图层下标。普通 .shp 文件通常只有 0 号图层。 */
         int layerIndex;
@@ -376,7 +376,7 @@ public:
      */
     struct WriteOptions
     {
-        WriteOptions();
+        ARCGIS_RESTSERVICE_PORT WriteOptions();
 
         /** @brief 目标文件存在时是否允许覆盖。 */
         bool overwrite;
