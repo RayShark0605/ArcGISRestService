@@ -9,6 +9,7 @@
 #include "GeoBase/GB_Variant.h"
 #include "GeoBase/Geometry/GB_Rectangle.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -230,6 +231,9 @@ public:
         /** @brief 是否存在单部件与多部件混合。 */
         bool hasMixedSingleAndMultipartGeometry = false;
 
+        /** @brief 是否在 Polygon 中发现内环。当前 GeoVectorGeometry 会以独立闭合环保存，写出时会尝试重组洞关系。 */
+        bool hasInteriorRing = false;
+
         /** @brief 是否由于 GeoVectorGeometry 当前只支持二维而丢弃了 Z。 */
         bool droppedZ = false;
 
@@ -304,28 +308,28 @@ public:
     };
 #pragma endregion
 
+#pragma region Progress
+    /**
+     * @brief Shapefile 读写进度。
+     *
+     * @details
+     * - currentProgress：当前正在处理的要素下标，按 0 开始计数；处理完成后会被置为 totalProgress。
+     * - totalProgress：本次读写的总工作量；若设置 maxFeatureCount，则为本次实际计划读取数量。
+     */
+    struct ReadWriteProgress
+    {
+        std::atomic_size_t currentProgress{ 0 };
+        std::atomic_size_t totalProgress{ 0 };
+    };
+#pragma endregion
+
 #pragma region Options
     /**
      * @brief Shapefile 读取选项。
      */
     struct ReadOptions
     {
-        ReadOptions()
-            : layerIndex(0),
-            layerNameUtf8(""),
-            overrideEncodingUtf8(""),
-            recodeTextToUtf8(true),
-            organizePolygons(false),
-            loadFields(true),
-            loadFeatures(true),
-            includeNullGeometryFeatures(true),
-            skipUnsupportedGeometries(true),
-            loadMetadata(true),
-            collectSourceFiles(true),
-            useGdalFeatureIdAsFid(true),
-            maxFeatureCount(0)
-        {
-        }
+        ReadOptions();
 
         /** @brief 要读取的图层下标。普通 .shp 文件通常只有 0 号图层。 */
         int layerIndex;
@@ -372,20 +376,7 @@ public:
      */
     struct WriteOptions
     {
-        WriteOptions()
-            : overwrite(true),
-            layerNameUtf8(""),
-            crsWktUtf8(""),
-            geometryType(GeoVectorGeometryType::Unknown),
-            encodingUtf8("UTF-8"),
-            writeCpgFile(true),
-            skipUnsupportedFields(true),
-            approximateFieldDefinition(true),
-            skipEmptyGeometryFeatures(false),
-            preserveFeatureId(false),
-            createSpatialIndex(false)
-        {
-        }
+        WriteOptions();
 
         /** @brief 目标文件存在时是否允许覆盖。 */
         bool overwrite;
@@ -419,6 +410,9 @@ public:
 
         /** @brief 是否在写出后创建 .qix 空间索引。 */
         bool createSpatialIndex;
+
+        /** @brief 写出 Polygon 多环时是否尝试按环方向和包含关系重组外环/内环，以尽量保留 Shapefile 洞关系。 */
+        bool organizePolygonRingsOnWrite;
     };
 #pragma endregion
 
@@ -442,9 +436,10 @@ public:
      * @param outData 输出数据。成功时被替换为读取结果；失败时被重置。
      * @param options 读取选项。
      * @param errorMessageUtf8 可选错误信息。
+     * @param progress 可选读写进度。非空且两个原子指针均非空时，会更新总工作量和当前读取位置。
      * @return true 表示读取成功；false 表示打开、解析或读取过程失败。
      */
-    static bool Read(const std::string& filePathUtf8, ShpData& outData, const ReadOptions& options = ReadOptions(), std::string* errorMessageUtf8 = nullptr);
+    static bool Read(const std::string& filePathUtf8, ShpData& outData, const ReadOptions& options = ReadOptions(), std::string* errorMessageUtf8 = nullptr, ReadWriteProgress* progress = nullptr);
 
     /**
      * @brief 将 ShpData 写出为 Shapefile。
@@ -453,9 +448,10 @@ public:
      * @param data 待写出的图层数据。
      * @param options 写出选项。
      * @param errorMessageUtf8 可选错误信息。
+     * @param progress 可选读写进度。非空且两个原子指针均非空时，会更新总工作量和当前写出位置。
      * @return true 表示写出成功；false 表示创建数据源、字段、几何或要素失败。
      */
-    static bool Write(const std::string& filePathUtf8, const ShpData& data, const WriteOptions& options = WriteOptions(), std::string* errorMessageUtf8 = nullptr);
+    static bool Write(const std::string& filePathUtf8, const ShpData& data, const WriteOptions& options = WriteOptions(), std::string* errorMessageUtf8 = nullptr, ReadWriteProgress* progress = nullptr);
 };
 
 #endif
