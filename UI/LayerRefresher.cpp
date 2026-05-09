@@ -7,7 +7,9 @@
 #include "GeoCrsTransform.h"
 #include "GeoCrsManager.h"
 #include "TileImageCache.h"
+#include "GeoVectorGeometry.h"
 #include "GeoBase/GB_Crypto.h"
+#include "GeoBase/GB_FormatParser.h"
 #include "GeoBase/GB_Network.h"
 #include "GeoBase/GB_Utf8String.h"
 #include "GeoBase/GB_Timer.h"
@@ -48,6 +50,10 @@ namespace
 	constexpr int DynamicExportVirtualTileSize = 512;
 	constexpr int DynamicExportMaxVirtualLevel = 30;
 	constexpr long long MaxCalculatedRequestItemCount = 200000;
+	constexpr int DefaultFeatureQueryPageSize = 2000;
+	constexpr int MaxFeatureQueryPageSize = 5000;
+	constexpr size_t MaxFeatureQueryPageCount = 64;
+	constexpr size_t MaxFeatureDrawableCountPerRefresh = 100000;
 
 	std::string TrimmedStdString(const std::string& text)
 	{
@@ -147,6 +153,39 @@ namespace
 	{
 		return request.serviceNodeType == ArcGISRestServiceTreeNode::NodeType::MapService ||
 			request.serviceNodeType == ArcGISRestServiceTreeNode::NodeType::ImageService;
+	}
+
+	bool CanImportNodeAsVector(const LayerImportRequestInfo& request)
+	{
+		if (request.serviceNodeType != ArcGISRestServiceTreeNode::NodeType::FeatureService)
+		{
+			return false;
+		}
+
+		switch (request.nodeType)
+		{
+		case ArcGISRestServiceTreeNode::NodeType::FeatureService:
+		case ArcGISRestServiceTreeNode::NodeType::AllLayers:
+		case ArcGISRestServiceTreeNode::NodeType::UnknownVectorLayer:
+		case ArcGISRestServiceTreeNode::NodeType::PointVectorLayer:
+		case ArcGISRestServiceTreeNode::NodeType::LineVectorLayer:
+		case ArcGISRestServiceTreeNode::NodeType::PolygonVectorLayer:
+			return true;
+		case ArcGISRestServiceTreeNode::NodeType::Unknown:
+		case ArcGISRestServiceTreeNode::NodeType::Root:
+		case ArcGISRestServiceTreeNode::NodeType::Folder:
+		case ArcGISRestServiceTreeNode::NodeType::MapService:
+		case ArcGISRestServiceTreeNode::NodeType::ImageService:
+		case ArcGISRestServiceTreeNode::NodeType::RasterLayer:
+		case ArcGISRestServiceTreeNode::NodeType::Table:
+		default:
+			return false;
+		}
+	}
+
+	bool CanImportNodeAsDrawable(const LayerImportRequestInfo& request)
+	{
+		return CanImportNodeAsImage(request) || CanImportNodeAsVector(request);
 	}
 
 	std::string GetServiceFallbackWkt(const ArcGISRestServiceInfo& serviceInfo)
@@ -1319,6 +1358,487 @@ namespace
 		return CalculateDynamicImageRequestItems(input);
 	}
 
+
+	const GB_Variant* FindVariantValue(const GB_VariantMap& valueMap, const std::string& key)
+	{
+		const auto iter = valueMap.find(key);
+		return iter == valueMap.end() ? nullptr : &iter->second;
+	}
+
+	const GB_VariantMap* TryGetVariantMap(const GB_Variant& value)
+	{
+		return value.AnyCast<GB_VariantMap>();
+	}
+
+	const GB_VariantList* TryGetVariantList(const GB_Variant& value)
+	{
+		return value.AnyCast<GB_VariantList>();
+	}
+
+	std::string GetStringValue(const GB_VariantMap& valueMap, const std::string& key, const std::string& defaultValue = std::string())
+	{
+		const GB_Variant* value = FindVariantValue(valueMap, key);
+		if (value == nullptr)
+		{
+			return defaultValue;
+		}
+
+		bool ok = false;
+		const std::string text = value->ToString(&ok);
+		return ok ? text : defaultValue;
+	}
+
+	bool TryGetDoubleValue(const GB_VariantMap& valueMap, const std::string& key, double& outValue)
+	{
+		outValue = GB_QuietNan;
+		const GB_Variant* value = FindVariantValue(valueMap, key);
+		if (value == nullptr)
+		{
+			return false;
+		}
+
+		bool ok = false;
+		const double number = value->ToDouble(&ok);
+		if (!ok || !std::isfinite(number))
+		{
+			return false;
+		}
+
+		outValue = number;
+		return true;
+	}
+
+	bool TryGetBoolValue(const GB_VariantMap& valueMap, const std::string& key, bool& outValue)
+	{
+		outValue = false;
+		const GB_Variant* value = FindVariantValue(valueMap, key);
+		if (value == nullptr)
+		{
+			return false;
+		}
+
+		bool ok = false;
+		const bool booleanValue = value->ToBool(&ok);
+		if (!ok)
+		{
+			return false;
+		}
+
+		outValue = booleanValue;
+		return true;
+	}
+
+	int GetIntValue(const GB_VariantMap& valueMap, const std::string& key, int defaultValue = 0)
+	{
+		const GB_Variant* value = FindVariantValue(valueMap, key);
+		if (value == nullptr)
+		{
+			return defaultValue;
+		}
+
+		bool ok = false;
+		const int number = value->ToInt(&ok);
+		return ok ? number : defaultValue;
+	}
+
+	bool HasArcGISRestError(const GB_VariantMap& rootMap)
+	{
+		const GB_Variant* errorValue = FindVariantValue(rootMap, "error");
+		if (errorValue == nullptr)
+		{
+			return false;
+		}
+
+		const GB_VariantMap* errorMap = TryGetVariantMap(*errorValue);
+		return errorMap != nullptr && !errorMap->empty();
+	}
+
+	std::vector<std::string> SplitLayerIds(const std::string& layerIdsText)
+	{
+		std::vector<std::string> layerIds;
+		size_t beginIndex = 0;
+		while (beginIndex <= layerIdsText.size())
+		{
+			const size_t delimiterIndex = layerIdsText.find(',', beginIndex);
+			const size_t endIndex = (delimiterIndex == std::string::npos) ? layerIdsText.size() : delimiterIndex;
+			std::string layerId = TrimmedStdString(layerIdsText.substr(beginIndex, endIndex - beginIndex));
+			if (!layerId.empty())
+			{
+				layerIds.push_back(std::move(layerId));
+			}
+
+			if (delimiterIndex == std::string::npos)
+			{
+				break;
+			}
+			beginIndex = delimiterIndex + 1;
+		}
+		return layerIds;
+	}
+
+	const ArcGISRestLayerOrTableInfo* FindLayerOrTableInfoById(const ArcGISRestServiceInfo& serviceInfo, const std::string& layerId)
+	{
+		for (const ArcGISRestLayerOrTableInfo& layerInfo : serviceInfo.allLayers)
+		{
+			if (layerInfo.id == layerId)
+			{
+				return &layerInfo;
+			}
+		}
+
+		for (const ArcGISRestLayerOrTableInfo& tableInfo : serviceInfo.allTables)
+		{
+			if (tableInfo.id == layerId)
+			{
+				return &tableInfo;
+			}
+		}
+
+		if (serviceInfo.layerOrTable.id == layerId)
+		{
+			return &serviceInfo.layerOrTable;
+		}
+		return nullptr;
+	}
+
+	const ArcGISMapServiceLayerEntry* FindSummaryLayerById(const ArcGISRestServiceInfo& serviceInfo, const std::string& layerId)
+	{
+		for (const ArcGISMapServiceLayerEntry& layerEntry : serviceInfo.layers)
+		{
+			if (layerEntry.id == layerId)
+			{
+				return &layerEntry;
+			}
+		}
+		return nullptr;
+	}
+
+	bool IsLayerEntryImportableVector(const ArcGISMapServiceLayerEntry& layerEntry)
+	{
+		const std::string geometryType = ToLowerAscii(layerEntry.geometryType);
+		return geometryType == "esrigeometrypoint" || geometryType == "esrigeometrymultipoint" ||
+			geometryType == "esrigeometrypolyline" || geometryType == "esrigeometrypolygon";
+	}
+
+	std::vector<std::string> ResolveVectorLayerIds(const LayerImportRequestInfo& request, const ArcGISRestServiceInfo& serviceInfo)
+	{
+		std::vector<std::string> layerIds = SplitLayerIds(request.layerId);
+		if (!layerIds.empty())
+		{
+			return layerIds;
+		}
+
+		if (!serviceInfo.layerOrTable.id.empty() && !serviceInfo.layerOrTable.geometryType.empty())
+		{
+			layerIds.push_back(serviceInfo.layerOrTable.id);
+			return layerIds;
+		}
+
+		for (const ArcGISMapServiceLayerEntry& layerEntry : serviceInfo.layers)
+		{
+			if (!layerEntry.id.empty() && IsLayerEntryImportableVector(layerEntry))
+			{
+				layerIds.push_back(layerEntry.id);
+			}
+		}
+		return layerIds;
+	}
+
+	GeoVectorGeometryType GeometryTypeFromArcGISStringForRefresh(const std::string& geometryTypeText)
+	{
+		const std::string geometryType = ToLowerAscii(TrimmedStdString(geometryTypeText));
+		if (geometryType == "esrigeometrypoint" || geometryType == "esrigeometrymultipoint")
+		{
+			return GeoVectorGeometryType::Point;
+		}
+		if (geometryType == "esrigeometrypolyline")
+		{
+			return GeoVectorGeometryType::Polyline;
+		}
+		if (geometryType == "esrigeometrypolygon")
+		{
+			return GeoVectorGeometryType::Polygon;
+		}
+		return GeoVectorGeometryType::Unknown;
+	}
+
+	std::string GetVectorGeometryTypeText(const ArcGISRestServiceInfo& serviceInfo, const std::string& layerId)
+	{
+		const ArcGISRestLayerOrTableInfo* layerInfo = FindLayerOrTableInfoById(serviceInfo, layerId);
+		if (layerInfo != nullptr && !layerInfo->geometryType.empty())
+		{
+			return layerInfo->geometryType;
+		}
+
+		const ArcGISMapServiceLayerEntry* layerEntry = FindSummaryLayerById(serviceInfo, layerId);
+		if (layerEntry != nullptr && !layerEntry->geometryType.empty())
+		{
+			return layerEntry->geometryType;
+		}
+
+		if (!serviceInfo.layerOrTable.geometryType.empty())
+		{
+			return serviceInfo.layerOrTable.geometryType;
+		}
+		return std::string();
+	}
+
+	std::string SpatialReferenceToWktOrDefinition(const ArcGISRestSpatialReference& spatialReference)
+	{
+		if (!spatialReference.wkt.empty())
+		{
+			return spatialReference.wkt;
+		}
+		if (spatialReference.latestWkid > 0)
+		{
+			return std::string("EPSG:") + std::to_string(spatialReference.latestWkid);
+		}
+		if (spatialReference.wkid > 0)
+		{
+			return std::string("EPSG:") + std::to_string(spatialReference.wkid);
+		}
+		return std::string();
+	}
+
+	std::string GetVectorRequestWkt(const ArcGISRestServiceInfo& serviceInfo, const std::string& layerId)
+	{
+		const ArcGISRestLayerOrTableInfo* layerInfo = FindLayerOrTableInfoById(serviceInfo, layerId);
+		if (layerInfo != nullptr)
+		{
+			if (layerInfo->hasSourceSpatialReference)
+			{
+				const std::string sourceWkt = SpatialReferenceToWktOrDefinition(layerInfo->sourceSpatialReference);
+				if (!sourceWkt.empty())
+				{
+					return sourceWkt;
+				}
+			}
+
+			if (layerInfo->hasExtent)
+			{
+				const std::string extentWkt = SpatialReferenceToWktOrDefinition(layerInfo->extent.spatialReference);
+				if (!extentWkt.empty())
+				{
+					return extentWkt;
+				}
+			}
+		}
+
+		return GetServiceFallbackWkt(serviceInfo);
+	}
+
+	int GetPreferredLayerSpatialReferenceCode(const ArcGISRestServiceInfo& serviceInfo, const std::string& layerId)
+	{
+		const ArcGISRestLayerOrTableInfo* layerInfo = FindLayerOrTableInfoById(serviceInfo, layerId);
+		if (layerInfo != nullptr)
+		{
+			if (layerInfo->hasSourceSpatialReference)
+			{
+				const int sourceCode = GetPreferredSpatialReferenceCode(layerInfo->sourceSpatialReference);
+				if (sourceCode > 0)
+				{
+					return sourceCode;
+				}
+			}
+
+			if (layerInfo->hasExtent)
+			{
+				const int extentCode = GetPreferredSpatialReferenceCode(layerInfo->extent.spatialReference);
+				if (extentCode > 0)
+				{
+					return extentCode;
+				}
+			}
+		}
+
+		if (serviceInfo.hasSpatialReference)
+		{
+			const int serviceCode = GetPreferredSpatialReferenceCode(serviceInfo.spatialReference);
+			if (serviceCode > 0)
+			{
+				return serviceCode;
+			}
+		}
+
+		if (serviceInfo.hasFullExtent)
+		{
+			const int fullExtentCode = GetPreferredSpatialReferenceCode(serviceInfo.fullExtent.spatialReference);
+			if (fullExtentCode > 0)
+			{
+				return fullExtentCode;
+			}
+		}
+		return 0;
+	}
+
+	bool GetLayerSupportsPagination(const ArcGISRestServiceInfo& serviceInfo, const std::string& layerId)
+	{
+		const ArcGISRestLayerOrTableInfo* layerInfo = FindLayerOrTableInfoById(serviceInfo, layerId);
+		if (layerInfo != nullptr && layerInfo->hasAdvancedQueryCapabilities)
+		{
+			return layerInfo->advancedQueryCapabilities.supportsPagination;
+		}
+		return false;
+	}
+
+	int GetLayerMaxRecordCount(const ArcGISRestServiceInfo& serviceInfo, const std::string& layerId)
+	{
+		const ArcGISRestLayerOrTableInfo* layerInfo = FindLayerOrTableInfoById(serviceInfo, layerId);
+		if (layerInfo != nullptr)
+		{
+			const int layerMaxRecordCount = GetIntValue(layerInfo->rawJsonMap, "maxRecordCount", 0);
+			if (layerMaxRecordCount > 0)
+			{
+				return layerMaxRecordCount;
+			}
+		}
+
+		return serviceInfo.maxRecordCount > 0 ? serviceInfo.maxRecordCount : DefaultFeatureQueryPageSize;
+	}
+
+	std::string BuildFeatureQueryBaseUrl(const std::string& serviceUrl, const std::string& layerId, const GB_Rectangle& requestExtent, int inputSpatialReferenceCode, bool supportsPagination, int pageSize)
+	{
+		if (serviceUrl.empty() || layerId.empty() || !requestExtent.IsValid())
+		{
+			return std::string();
+		}
+
+		std::string queryUrl = TrimTrailingSlash(serviceUrl) + "/" + layerId + "/query";
+		const std::string extentText = GB_Utf8Format("%.17g,%.17g,%.17g,%.17g", requestExtent.minX, requestExtent.minY, requestExtent.maxX, requestExtent.maxY);
+		queryUrl = GB_UrlOperator::SetUrlQueryValue(queryUrl, "where", "1=1");
+		queryUrl = GB_UrlOperator::SetUrlQueryValue(queryUrl, "outFields", "*");
+		queryUrl = GB_UrlOperator::SetUrlQueryValue(queryUrl, "returnGeometry", "true");
+		queryUrl = GB_UrlOperator::SetUrlQueryValue(queryUrl, "returnZ", "false");
+		queryUrl = GB_UrlOperator::SetUrlQueryValue(queryUrl, "returnM", "false");
+		queryUrl = GB_UrlOperator::SetUrlQueryValue(queryUrl, "geometryType", "esriGeometryEnvelope");
+		queryUrl = GB_UrlOperator::SetUrlQueryValue(queryUrl, "geometry", extentText);
+		queryUrl = GB_UrlOperator::SetUrlQueryValue(queryUrl, "spatialRel", "esriSpatialRelIntersects");
+		if (inputSpatialReferenceCode > 0)
+		{
+			queryUrl = GB_UrlOperator::SetUrlQueryValue(queryUrl, "inSR", std::to_string(inputSpatialReferenceCode));
+		}
+		if (supportsPagination && pageSize > 0)
+		{
+			queryUrl = GB_UrlOperator::SetUrlQueryValue(queryUrl, "resultRecordCount", std::to_string(pageSize));
+		}
+		queryUrl = GB_UrlOperator::SetUrlQueryValue(queryUrl, "f", "json");
+		return queryUrl;
+	}
+
+	std::string BuildLayerVectorTargetUid(const std::string& layerUid, const std::string& layerId, const std::string& requestUrl, const std::string& displayWktUtf8)
+	{
+		return GB_Md5Hash(layerUid + "|vector|" + layerId + "|" + requestUrl + "|" + displayWktUtf8);
+	}
+
+	std::string BuildVectorDrawableUid(const std::string& vectorTargetUid, const std::string& geometryKind, size_t featureIndex, size_t partIndex)
+	{
+		return GB_Md5Hash(vectorTargetUid + "|" + geometryKind + "|" + std::to_string(featureIndex) + "|" + std::to_string(partIndex));
+	}
+
+	bool TryReadPointFromArrayVariant(const GB_Variant& value, GB_Point2d& outPoint)
+	{
+		outPoint = GB_Point2d(GB_QuietNan, GB_QuietNan);
+		const GB_VariantList* coordinates = TryGetVariantList(value);
+		if (coordinates == nullptr || coordinates->size() < 2)
+		{
+			return false;
+		}
+
+		bool okX = false;
+		bool okY = false;
+		const double x = (*coordinates)[0].ToDouble(&okX);
+		const double y = (*coordinates)[1].ToDouble(&okY);
+		if (!okX || !okY || !std::isfinite(x) || !std::isfinite(y))
+		{
+			return false;
+		}
+
+		outPoint.Set(x, y);
+		return outPoint.IsValid();
+	}
+
+	bool TryReadPointFromMapVariant(const GB_VariantMap& geometryMap, GB_Point2d& outPoint)
+	{
+		double x = GB_QuietNan;
+		double y = GB_QuietNan;
+		if (!TryGetDoubleValue(geometryMap, "x", x) || !TryGetDoubleValue(geometryMap, "y", y))
+		{
+			return false;
+		}
+
+		outPoint.Set(x, y);
+		return outPoint.IsValid();
+	}
+
+	bool TransformPointsForDisplay(std::vector<GB_Point2d>& points, const std::string& sourceWktUtf8, const std::string& targetWktUtf8, bool needsReprojection)
+	{
+		if (points.empty())
+		{
+			return false;
+		}
+
+		if (!needsReprojection)
+		{
+			return true;
+		}
+
+		return GeoCrsTransform::TransformPoints(sourceWktUtf8, targetWktUtf8, points, false);
+	}
+
+	void AppendPointDrawable(std::vector<PointDrawable>& outPoints, std::vector<std::string>& outDrawableUids, const std::string& vectorTargetUid, const GB_Point2d& point, size_t featureIndex, size_t partIndex, double layerNumber)
+	{
+		if (!point.IsValid())
+		{
+			return;
+		}
+
+		PointDrawable drawable;
+		drawable.uid = BuildVectorDrawableUid(vectorTargetUid, "point", featureIndex, partIndex);
+		drawable.position = point;
+		drawable.visible = true;
+		drawable.layerNumber = layerNumber;
+		outDrawableUids.push_back(drawable.uid);
+		outPoints.push_back(std::move(drawable));
+	}
+
+	void AppendPolylineDrawable(std::vector<PolylineDrawable>& outPolylines, std::vector<std::string>& outDrawableUids, const std::string& vectorTargetUid, std::vector<GB_Point2d>&& vertices, size_t featureIndex, size_t partIndex, double layerNumber)
+	{
+		if (vertices.size() < 2)
+		{
+			return;
+		}
+
+		PolylineDrawable drawable;
+		drawable.uid = BuildVectorDrawableUid(vectorTargetUid, "polyline", featureIndex, partIndex);
+		drawable.vertices = std::move(vertices);
+		drawable.visible = true;
+		drawable.layerNumber = layerNumber;
+		outDrawableUids.push_back(drawable.uid);
+		outPolylines.push_back(std::move(drawable));
+	}
+
+	void AppendPolygonDrawable(std::vector<PolygonDrawable>& outPolygons, std::vector<std::string>& outDrawableUids, const std::string& vectorTargetUid, std::vector<GB_Point2d>&& vertices, size_t featureIndex, size_t partIndex, double layerNumber)
+	{
+		if (vertices.size() < 3)
+		{
+			return;
+		}
+
+		if (!vertices.front().IsNearEqual(vertices.back()))
+		{
+			vertices.push_back(vertices.front());
+		}
+
+		PolygonDrawable drawable;
+		drawable.uid = BuildVectorDrawableUid(vectorTargetUid, "polygon", featureIndex, partIndex);
+		drawable.vertices = std::move(vertices);
+		drawable.visible = true;
+		drawable.layerNumber = layerNumber;
+		drawable.fillColor = GB_ColorRGBA(255, 0, 0, 80);
+		outDrawableUids.push_back(drawable.uid);
+		outPolygons.push_back(std::move(drawable));
+	}
+
 	std::string BuildLayerTileUid(const std::string& layerUid, const ImageRequestItem& requestItem, const std::string& displayWktUtf8)
 	{
 		// 同一个服务请求在不同 Canvas CRS 下会生成不同的显示影像与显示范围，
@@ -1370,15 +1890,55 @@ public:
 		double layerNumber = 0.0;
 	};
 
+	enum class RefreshTaskKind
+	{
+		ImageTile = 0,
+		VectorQuery
+	};
+
+	struct VectorRequestItem
+	{
+		std::string uid = "";
+		std::string serviceUrl = "";
+		std::string layerId = "";
+		std::string requestUrl = "";
+		GB_Rectangle queryExtent;
+		std::string geometryTypeText = "";
+		GeoVectorGeometryType geometryType = GeoVectorGeometryType::Unknown;
+		bool supportsPagination = false;
+		int pageSize = DefaultFeatureQueryPageSize;
+	};
+
+	struct TargetVectorRecord
+	{
+		std::string vectorTargetUid = "";
+		std::string layerUid = "";
+		std::string layerId = "";
+		std::string requestUrl = "";
+		double layerNumber = 0.0;
+		int layerOrderIndex = 0;
+	};
+
+	struct DisplayedVectorRecord
+	{
+		std::string vectorTargetUid = "";
+		std::string layerUid = "";
+		double layerNumber = 0.0;
+		std::vector<std::string> drawableUids;
+	};
+
 	struct TileTask
 	{
 		std::uint64_t generation = 0;
 		std::uint64_t sequence = 0;
+		RefreshTaskKind taskKind = RefreshTaskKind::ImageTile;
 		int layerOrderIndex = 0;
 		double layerNumber = 0.0;
 		std::string layerUid = "";
 		std::string tileUid = "";
+		std::string vectorTargetUid = "";
 		ImageRequestItem requestItem;
+		VectorRequestItem vectorRequestItem;
 		std::string sourceWktUtf8 = "";
 		std::string targetWktUtf8 = "";
 		bool needsReprojection = false;
@@ -1407,6 +1967,18 @@ public:
 		std::string layerUid = "";
 		double layerNumber = 0.0;
 		MapTileDrawable tile;
+	};
+
+	struct VectorResult
+	{
+		std::uint64_t generation = 0;
+		std::string vectorTargetUid = "";
+		std::string layerUid = "";
+		double layerNumber = 0.0;
+		std::vector<PointDrawable> points;
+		std::vector<PolylineDrawable> polylines;
+		std::vector<PolygonDrawable> polygons;
+		std::vector<std::string> drawableUids;
 	};
 
 	explicit Impl(LayerRefresher* owner)
@@ -1487,16 +2059,20 @@ public:
 
 		StopRefresh();
 		RemoveAllDisplayedTiles();
+		RemoveAllDisplayedVectors();
 		RemoveAllTransitionTiles();
 		layers.clear();
 		currentTargetsByUid.clear();
+		currentVectorTargetsByUid.clear();
 	}
 
 	void StopRefresh()
 	{
 		currentGeneration.fetch_add(1, std::memory_order_acq_rel);
 		pendingTileResults.clear();
+		pendingVectorResults.clear();
 		isTileResultFlushScheduled = false;
+		isVectorResultFlushScheduled = false;
 
 		{
 			std::lock_guard<std::mutex> lock(taskQueueMutex);
@@ -1633,7 +2209,7 @@ private:
 
 		for (const LayerSnapshot& layer : layers)
 		{
-			if (!IsLayerUidInList(autoZoomLayerUids, layer.layerUid) || !layer.visible || !layer.importRequest.IsValid() || !CanImportNodeAsImage(layer.importRequest))
+			if (!IsLayerUidInList(autoZoomLayerUids, layer.layerUid) || !layer.visible || !layer.importRequest.IsValid() || !CanImportNodeAsDrawable(layer.importRequest))
 			{
 				continue;
 			}
@@ -1738,15 +2314,18 @@ private:
 		}
 
 		std::unordered_map<std::string, TargetTileRecord> newTargetsByUid;
+		std::unordered_map<std::string, TargetVectorRecord> newVectorTargetsByUid;
 		std::vector<TileTask> newTasks;
 
 		if (hasViewExtent && currentViewExtent.IsValid() && !layers.empty())
 		{
-			BuildRefreshTasks(generation, newTargetsByUid, newTasks);
+			BuildRefreshTasks(generation, newTargetsByUid, newVectorTargetsByUid, newTasks);
 		}
 
 		ReconcileDisplayedTiles(newTargetsByUid, newTasks);
+		ReconcileDisplayedVectors(newVectorTargetsByUid, newTasks);
 		currentTargetsByUid.swap(newTargetsByUid);
+		currentVectorTargetsByUid.swap(newVectorTargetsByUid);
 		BeginRefreshCompletionTracking(generation, newTasks.size());
 		EnqueueTasks(newTasks);
 
@@ -1758,7 +2337,7 @@ private:
 		}
 	}
 
-	void BuildRefreshTasks(std::uint64_t generation, std::unordered_map<std::string, TargetTileRecord>& outTargetsByUid, std::vector<TileTask>& outTasks)
+	void BuildRefreshTasks(std::uint64_t generation, std::unordered_map<std::string, TargetTileRecord>& outTargetsByUid, std::unordered_map<std::string, TargetVectorRecord>& outVectorTargetsByUid, std::vector<TileTask>& outTasks)
 	{
 		if (!mainCanvas || !currentViewExtent.IsValid())
 		{
@@ -1769,13 +2348,23 @@ private:
 		const int viewHeight = std::max(1, mainCanvas->height());
 		for (const LayerSnapshot& layer : layers)
 		{
-			if (!layer.visible || !layer.importRequest.IsValid() || !CanImportNodeAsImage(layer.importRequest))
+			if (!layer.visible || !layer.importRequest.IsValid())
 			{
 				continue;
 			}
 
 			const ArcGISRestServiceInfo* serviceInfo = GetServiceInfo(layer.importRequest);
 			if (!serviceInfo)
+			{
+				continue;
+			}
+
+			if (CanImportNodeAsVector(layer.importRequest))
+			{
+				BuildVectorRefreshTasksForLayer(generation, layer, *serviceInfo, outVectorTargetsByUid, outTasks);
+			}
+
+			if (!CanImportNodeAsImage(layer.importRequest))
 			{
 				continue;
 			}
@@ -1877,6 +2466,96 @@ private:
 		}
 	}
 
+
+	void BuildVectorRefreshTasksForLayer(std::uint64_t generation, const LayerSnapshot& layer, const ArcGISRestServiceInfo& serviceInfo, std::unordered_map<std::string, TargetVectorRecord>& outTargetsByUid, std::vector<TileTask>& outTasks)
+	{
+		const std::vector<std::string> layerIds = ResolveVectorLayerIds(layer.importRequest, serviceInfo);
+		if (layerIds.empty())
+		{
+			return;
+		}
+
+		const std::string canvasWktBefore = mainCanvas ? mainCanvas->GetCrsWkt() : std::string();
+		const double layerNumber = static_cast<double>(layer.orderIndex);
+		const GB_NetworkRequestOptions networkOptions = CreateNetworkOptionsFromConnectionSettings(layer.importRequest.connectionSettings);
+
+		for (const std::string& layerId : layerIds)
+		{
+			const std::string geometryTypeText = GetVectorGeometryTypeText(serviceInfo, layerId);
+			const GeoVectorGeometryType geometryType = GeometryTypeFromArcGISStringForRefresh(geometryTypeText);
+			if (geometryType == GeoVectorGeometryType::Unknown)
+			{
+				continue;
+			}
+
+			const std::string requestWkt = GetVectorRequestWkt(serviceInfo, layerId);
+			if (!SetCanvasCrsIfNeeded(requestWkt))
+			{
+				continue;
+			}
+
+			const std::string canvasWkt = mainCanvas->GetCrsWkt();
+			if (!IsCrsDefinitionValid(requestWkt) || !IsCrsDefinitionValid(canvasWkt))
+			{
+				continue;
+			}
+
+			GB_Rectangle requestViewExtent;
+			if (!TryTransformRectangleBetweenCrs(canvasWkt, requestWkt, currentViewExtent, requestViewExtent))
+			{
+				continue;
+			}
+
+			const bool supportsPagination = GetLayerSupportsPagination(serviceInfo, layerId);
+			const int rawPageSize = GetLayerMaxRecordCount(serviceInfo, layerId);
+			const int pageSize = GB_Clamp(rawPageSize > 0 ? rawPageSize : DefaultFeatureQueryPageSize, 1, MaxFeatureQueryPageSize);
+			const int inputSpatialReferenceCode = GetPreferredLayerSpatialReferenceCode(serviceInfo, layerId);
+			const std::string requestUrl = BuildFeatureQueryBaseUrl(layer.importRequest.serviceUrl, layerId, requestViewExtent, inputSpatialReferenceCode, supportsPagination, pageSize);
+			if (requestUrl.empty())
+			{
+				continue;
+			}
+
+			VectorRequestItem requestItem;
+			requestItem.serviceUrl = layer.importRequest.serviceUrl;
+			requestItem.layerId = layerId;
+			requestItem.requestUrl = requestUrl;
+			requestItem.queryExtent = requestViewExtent;
+			requestItem.geometryTypeText = geometryTypeText;
+			requestItem.geometryType = geometryType;
+			requestItem.supportsPagination = supportsPagination;
+			requestItem.pageSize = pageSize;
+			requestItem.uid = BuildLayerVectorTargetUid(layer.layerUid, layerId, requestUrl, canvasWkt);
+
+			TargetVectorRecord target;
+			target.vectorTargetUid = requestItem.uid;
+			target.layerUid = layer.layerUid;
+			target.layerId = layerId;
+			target.requestUrl = requestUrl;
+			target.layerNumber = layerNumber;
+			target.layerOrderIndex = layer.orderIndex;
+			outTargetsByUid[target.vectorTargetUid] = target;
+
+			TileTask task;
+			task.generation = generation;
+			task.sequence = nextTaskSequence++;
+			task.taskKind = RefreshTaskKind::VectorQuery;
+			task.layerOrderIndex = layer.orderIndex;
+			task.layerNumber = layerNumber;
+			task.layerUid = layer.layerUid;
+			task.vectorTargetUid = requestItem.uid;
+			task.vectorRequestItem = requestItem;
+			task.sourceWktUtf8 = requestWkt;
+			task.targetWktUtf8 = canvasWkt;
+			task.needsReprojection = !AreCrsEquivalent(requestWkt, canvasWkt);
+			task.connectionSettings = layer.importRequest.connectionSettings;
+			task.networkOptions = networkOptions;
+			outTasks.push_back(std::move(task));
+		}
+
+		(void)canvasWktBefore;
+	}
+
 	void ReconcileDisplayedTiles(const std::unordered_map<std::string, TargetTileRecord>& targetsByUid, std::vector<TileTask>& tasks)
 	{
 		if (!mainCanvas)
@@ -1936,6 +2615,45 @@ private:
 		{
 			tasks.erase(std::remove_if(tasks.begin(), tasks.end(), [this](const TileTask& task) {
 				return displayedTilesByUid.find(task.tileUid) != displayedTilesByUid.end();
+				}), tasks.end());
+		}
+	}
+
+
+	void ReconcileDisplayedVectors(const std::unordered_map<std::string, TargetVectorRecord>& targetsByUid, std::vector<TileTask>& tasks)
+	{
+		if (!mainCanvas)
+		{
+			return;
+		}
+
+		for (auto iter = displayedVectorsByUid.begin(); iter != displayedVectorsByUid.end(); )
+		{
+			const auto targetIter = targetsByUid.find(iter->first);
+			if (targetIter == targetsByUid.end())
+			{
+				if (!iter->second.drawableUids.empty())
+				{
+					mainCanvas->RemoveDrawables(iter->second.drawableUids);
+				}
+				iter = displayedVectorsByUid.erase(iter);
+				continue;
+			}
+
+			DisplayedVectorRecord& displayedVector = iter->second;
+			const TargetVectorRecord& target = targetIter->second;
+			if (displayedVector.layerNumber != target.layerNumber && !displayedVector.drawableUids.empty())
+			{
+				mainCanvas->SetDrawablesLayerNumber(displayedVector.drawableUids, target.layerNumber);
+				displayedVector.layerNumber = target.layerNumber;
+			}
+			iter++;
+		}
+
+		if (!tasks.empty())
+		{
+			tasks.erase(std::remove_if(tasks.begin(), tasks.end(), [this](const TileTask& task) {
+				return task.taskKind == RefreshTaskKind::VectorQuery && displayedVectorsByUid.find(task.vectorTargetUid) != displayedVectorsByUid.end();
 				}), tasks.end());
 		}
 	}
@@ -2024,6 +2742,28 @@ private:
 		}
 		mainCanvas->RemoveDrawables(uids);
 		displayedTilesByUid.clear();
+	}
+
+
+	void RemoveAllDisplayedVectors()
+	{
+		if (!mainCanvas || displayedVectorsByUid.empty())
+		{
+			displayedVectorsByUid.clear();
+			return;
+		}
+
+		std::vector<std::string> uids;
+		for (const auto& item : displayedVectorsByUid)
+		{
+			uids.insert(uids.end(), item.second.drawableUids.begin(), item.second.drawableUids.end());
+		}
+
+		if (!uids.empty())
+		{
+			mainCanvas->RemoveDrawables(uids);
+		}
+		displayedVectorsByUid.clear();
 	}
 
 	void RemoveAllTransitionTiles()
@@ -2234,6 +2974,12 @@ private:
 			return;
 		}
 
+		if (task.taskKind == RefreshTaskKind::VectorQuery)
+		{
+			ProcessVectorTask(task);
+			return;
+		}
+
 		try
 		{
 			const std::string downloadUrl = PrefixRequestUrlIfNeeded(task.requestItem.requestUrl, task.connectionSettings);
@@ -2339,6 +3085,338 @@ private:
 		}
 	}
 
+
+	bool ReadVerticesFromPartVariant(const GB_Variant& partVariant, std::vector<GB_Point2d>& outVertices) const
+	{
+		outVertices.clear();
+		const GB_VariantList* pointVariants = TryGetVariantList(partVariant);
+		if (pointVariants == nullptr)
+		{
+			return false;
+		}
+
+		outVertices.reserve(pointVariants->size());
+		for (const GB_Variant& pointVariant : *pointVariants)
+		{
+			GB_Point2d point;
+			if (TryReadPointFromArrayVariant(pointVariant, point))
+			{
+				outVertices.push_back(point);
+			}
+		}
+		return !outVertices.empty();
+	}
+
+	size_t CountVectorResultDrawables(const VectorResult& result) const
+	{
+		return result.points.size() + result.polylines.size() + result.polygons.size();
+	}
+
+	bool AppendPointGeometryDrawables(const TileTask& task, const GB_VariantMap& geometryMap, size_t featureIndex, VectorResult& result)
+	{
+		const GB_Variant* pointsValue = FindVariantValue(geometryMap, "points");
+		if (pointsValue != nullptr)
+		{
+			const GB_VariantList* pointVariants = TryGetVariantList(*pointsValue);
+			if (pointVariants == nullptr)
+			{
+				return false;
+			}
+
+			size_t partIndex = 0;
+			for (const GB_Variant& pointVariant : *pointVariants)
+			{
+				GB_Point2d point;
+				if (!TryReadPointFromArrayVariant(pointVariant, point))
+				{
+					partIndex++;
+					continue;
+				}
+
+				std::vector<GB_Point2d> points;
+				points.push_back(point);
+				if (!TransformPointsForDisplay(points, task.sourceWktUtf8, task.targetWktUtf8, task.needsReprojection))
+				{
+					partIndex++;
+					continue;
+				}
+
+				AppendPointDrawable(result.points, result.drawableUids, task.vectorTargetUid, points.front(), featureIndex, partIndex, task.layerNumber);
+				partIndex++;
+				if (CountVectorResultDrawables(result) >= MaxFeatureDrawableCountPerRefresh)
+				{
+					break;
+				}
+			}
+			return true;
+		}
+
+		GB_Point2d point;
+		if (!TryReadPointFromMapVariant(geometryMap, point))
+		{
+			return false;
+		}
+
+		std::vector<GB_Point2d> points;
+		points.push_back(point);
+		if (!TransformPointsForDisplay(points, task.sourceWktUtf8, task.targetWktUtf8, task.needsReprojection))
+		{
+			return false;
+		}
+
+		AppendPointDrawable(result.points, result.drawableUids, task.vectorTargetUid, points.front(), featureIndex, 0, task.layerNumber);
+		return true;
+	}
+
+	bool AppendPolylineGeometryDrawables(const TileTask& task, const GB_VariantMap& geometryMap, size_t featureIndex, VectorResult& result)
+	{
+		const GB_Variant* pathsValue = FindVariantValue(geometryMap, "paths");
+		if (pathsValue == nullptr)
+		{
+			return false;
+		}
+
+		const GB_VariantList* pathVariants = TryGetVariantList(*pathsValue);
+		if (pathVariants == nullptr)
+		{
+			return false;
+		}
+
+		size_t partIndex = 0;
+		for (const GB_Variant& pathVariant : *pathVariants)
+		{
+			std::vector<GB_Point2d> vertices;
+			if (!ReadVerticesFromPartVariant(pathVariant, vertices) || vertices.size() < 2)
+			{
+				partIndex++;
+				continue;
+			}
+
+			if (!TransformPointsForDisplay(vertices, task.sourceWktUtf8, task.targetWktUtf8, task.needsReprojection))
+			{
+				partIndex++;
+				continue;
+			}
+
+			AppendPolylineDrawable(result.polylines, result.drawableUids, task.vectorTargetUid, std::move(vertices), featureIndex, partIndex, task.layerNumber);
+			partIndex++;
+			if (CountVectorResultDrawables(result) >= MaxFeatureDrawableCountPerRefresh)
+			{
+				break;
+			}
+		}
+		return true;
+	}
+
+	bool AppendPolygonGeometryDrawables(const TileTask& task, const GB_VariantMap& geometryMap, size_t featureIndex, VectorResult& result)
+	{
+		const GB_Variant* ringsValue = FindVariantValue(geometryMap, "rings");
+		if (ringsValue == nullptr)
+		{
+			return false;
+		}
+
+		const GB_VariantList* ringVariants = TryGetVariantList(*ringsValue);
+		if (ringVariants == nullptr)
+		{
+			return false;
+		}
+
+		size_t partIndex = 0;
+		for (const GB_Variant& ringVariant : *ringVariants)
+		{
+			std::vector<GB_Point2d> vertices;
+			if (!ReadVerticesFromPartVariant(ringVariant, vertices) || vertices.size() < 3)
+			{
+				partIndex++;
+				continue;
+			}
+
+			if (!TransformPointsForDisplay(vertices, task.sourceWktUtf8, task.targetWktUtf8, task.needsReprojection))
+			{
+				partIndex++;
+				continue;
+			}
+
+			AppendPolygonDrawable(result.polygons, result.drawableUids, task.vectorTargetUid, std::move(vertices), featureIndex, partIndex, task.layerNumber);
+			partIndex++;
+			if (CountVectorResultDrawables(result) >= MaxFeatureDrawableCountPerRefresh)
+			{
+				break;
+			}
+		}
+		return true;
+	}
+
+	bool AppendVectorFeatureDrawables(const TileTask& task, const GB_VariantMap& featureMap, GeoVectorGeometryType responseGeometryType, size_t featureIndex, VectorResult& result)
+	{
+		const GB_Variant* geometryValue = FindVariantValue(featureMap, "geometry");
+		if (geometryValue == nullptr)
+		{
+			return false;
+		}
+
+		const GB_VariantMap* geometryMap = TryGetVariantMap(*geometryValue);
+		if (geometryMap == nullptr)
+		{
+			return false;
+		}
+
+		GeoVectorGeometryType geometryType = task.vectorRequestItem.geometryType;
+		if (geometryType == GeoVectorGeometryType::Unknown)
+		{
+			geometryType = responseGeometryType;
+		}
+
+		switch (geometryType)
+		{
+		case GeoVectorGeometryType::Point:
+			return AppendPointGeometryDrawables(task, *geometryMap, featureIndex, result);
+		case GeoVectorGeometryType::Polyline:
+			return AppendPolylineGeometryDrawables(task, *geometryMap, featureIndex, result);
+		case GeoVectorGeometryType::Polygon:
+			return AppendPolygonGeometryDrawables(task, *geometryMap, featureIndex, result);
+		case GeoVectorGeometryType::Unknown:
+		default:
+			return false;
+		}
+	}
+
+	bool FetchVectorPage(const TileTask& task, const std::string& requestUrl, size_t featureBaseIndex, VectorResult& result, bool& outExceededTransferLimit, size_t& outFeatureCount)
+	{
+		outExceededTransferLimit = false;
+		outFeatureCount = 0;
+
+		const std::string downloadUrl = PrefixRequestUrlIfNeeded(requestUrl, task.connectionSettings);
+		if (downloadUrl.empty())
+		{
+			return false;
+		}
+
+		const GB_NetworkResponse response = GB_RequestUrlData(downloadUrl, task.networkOptions);
+		if (!response.ok || response.body.empty())
+		{
+			return false;
+		}
+
+		GB_VariantMap rootMap;
+		std::string errorMessage;
+		if (!GB_JsonParser::ParseToVariantMap(response.body, rootMap, &errorMessage) || HasArcGISRestError(rootMap))
+		{
+			return false;
+		}
+
+		bool exceededTransferLimit = false;
+		if (TryGetBoolValue(rootMap, "exceededTransferLimit", exceededTransferLimit))
+		{
+			outExceededTransferLimit = exceededTransferLimit;
+		}
+
+		GeoVectorGeometryType responseGeometryType = GeometryTypeFromArcGISStringForRefresh(GetStringValue(rootMap, "geometryType"));
+		const GB_Variant* featuresValue = FindVariantValue(rootMap, "features");
+		if (featuresValue == nullptr)
+		{
+			return true;
+		}
+
+		const GB_VariantList* featureVariants = TryGetVariantList(*featuresValue);
+		if (featureVariants == nullptr)
+		{
+			return false;
+		}
+
+		outFeatureCount = featureVariants->size();
+		for (size_t featureIndex = 0; featureIndex < featureVariants->size(); featureIndex++)
+		{
+			if (CountVectorResultDrawables(result) >= MaxFeatureDrawableCountPerRefresh)
+			{
+				break;
+			}
+
+			const GB_VariantMap* featureMap = TryGetVariantMap((*featureVariants)[featureIndex]);
+			if (featureMap == nullptr)
+			{
+				continue;
+			}
+
+			AppendVectorFeatureDrawables(task, *featureMap, responseGeometryType, featureBaseIndex + featureIndex, result);
+		}
+		return true;
+	}
+
+	bool ProcessVectorRequest(const TileTask& task, VectorResult& result)
+	{
+		result.generation = task.generation;
+		result.vectorTargetUid = task.vectorTargetUid;
+		result.layerUid = task.layerUid;
+		result.layerNumber = task.layerNumber;
+
+		if (task.vectorRequestItem.requestUrl.empty())
+		{
+			return false;
+		}
+
+		size_t featureBaseIndex = 0;
+		for (size_t pageIndex = 0; pageIndex < MaxFeatureQueryPageCount; pageIndex++)
+		{
+			if (!IsTaskGenerationCurrent(task.generation))
+			{
+				return false;
+			}
+
+			std::string pageUrl = task.vectorRequestItem.requestUrl;
+			if (task.vectorRequestItem.supportsPagination)
+			{
+				pageUrl = GB_UrlOperator::SetUrlQueryValue(pageUrl, "resultOffset", std::to_string(featureBaseIndex));
+				pageUrl = GB_UrlOperator::SetUrlQueryValue(pageUrl, "resultRecordCount", std::to_string(task.vectorRequestItem.pageSize));
+			}
+
+			bool exceededTransferLimit = false;
+			size_t pageFeatureCount = 0;
+			if (!FetchVectorPage(task, pageUrl, featureBaseIndex, result, exceededTransferLimit, pageFeatureCount))
+			{
+				return CountVectorResultDrawables(result) > 0;
+			}
+
+			if (!task.vectorRequestItem.supportsPagination || pageFeatureCount == 0 || CountVectorResultDrawables(result) >= MaxFeatureDrawableCountPerRefresh)
+			{
+				break;
+			}
+
+			featureBaseIndex += pageFeatureCount;
+			if (!exceededTransferLimit && pageFeatureCount < static_cast<size_t>(task.vectorRequestItem.pageSize))
+			{
+				break;
+			}
+		}
+		return true;
+	}
+
+	void ProcessVectorTask(const TileTask& task)
+	{
+		if (!IsTaskGenerationCurrent(task.generation))
+		{
+			return;
+		}
+
+		try
+		{
+			VectorResult result;
+			if (!ProcessVectorRequest(task, result))
+			{
+				PostTileTaskFinishedIfCurrent(task.generation);
+				return;
+			}
+
+			PostVectorResult(std::move(result));
+		}
+		catch (...)
+		{
+			PostTileTaskFinishedIfCurrent(task.generation);
+			return;
+		}
+	}
+
 	void PostTileResult(TileResult result)
 	{
 		LayerRefresher* owner = ownerPointer.data();
@@ -2356,6 +3434,27 @@ private:
 			}
 
 			refresher->impl->AppendPendingTileResult(std::move(result));
+			}, Qt::QueuedConnection);
+	}
+
+
+	void PostVectorResult(VectorResult result)
+	{
+		LayerRefresher* owner = ownerPointer.data();
+		if (!owner)
+		{
+			return;
+		}
+
+		const QPointer<LayerRefresher> safeOwnerPointer = ownerPointer;
+		QMetaObject::invokeMethod(owner, [safeOwnerPointer, result = std::move(result)]() mutable {
+			LayerRefresher* refresher = safeOwnerPointer.data();
+			if (!refresher || !refresher->impl)
+			{
+				return;
+			}
+
+			refresher->impl->AppendPendingVectorResult(std::move(result));
 			}, Qt::QueuedConnection);
 	}
 
@@ -2382,6 +3481,62 @@ private:
 
 			refresher->impl->OnTileTaskFinished(generation);
 			}, Qt::QueuedConnection);
+	}
+
+
+	void AppendPendingVectorResult(VectorResult&& result)
+	{
+		if (!IsTaskGenerationCurrent(result.generation))
+		{
+			return;
+		}
+
+		pendingVectorResults.push_back(std::move(result));
+		SchedulePendingVectorResultFlush();
+	}
+
+	void SchedulePendingVectorResultFlush()
+	{
+		if (isVectorResultFlushScheduled)
+		{
+			return;
+		}
+
+		LayerRefresher* owner = ownerPointer.data();
+		if (!owner)
+		{
+			return;
+		}
+
+		isVectorResultFlushScheduled = true;
+		const QPointer<LayerRefresher> safeOwnerPointer = ownerPointer;
+		QTimer::singleShot(0, owner, [safeOwnerPointer]() mutable {
+			LayerRefresher* refresher = safeOwnerPointer.data();
+			if (!refresher || !refresher->impl)
+			{
+				return;
+			}
+
+			refresher->impl->FlushPendingVectorResults();
+			});
+	}
+
+	void FlushPendingVectorResults()
+	{
+		isVectorResultFlushScheduled = false;
+		if (pendingVectorResults.empty())
+		{
+			return;
+		}
+
+		std::vector<VectorResult> results;
+		results.swap(pendingVectorResults);
+		OnVectorResultsReady(results);
+
+		if (!pendingVectorResults.empty())
+		{
+			SchedulePendingVectorResultFlush();
+		}
 	}
 
 	void AppendPendingTileResult(TileResult&& result)
@@ -2447,6 +3602,74 @@ private:
 		}
 
 		MarkTileTaskFinished(generation);
+	}
+
+
+	void OnVectorResultsReady(std::vector<VectorResult>& results)
+	{
+		if (!mainCanvas)
+		{
+			return;
+		}
+
+		for (VectorResult& result : results)
+		{
+			if (!IsTaskGenerationCurrent(result.generation))
+			{
+				continue;
+			}
+
+			const auto targetIter = currentVectorTargetsByUid.find(result.vectorTargetUid);
+			if (targetIter != currentVectorTargetsByUid.end())
+			{
+				const TargetVectorRecord& target = targetIter->second;
+				if (target.layerUid == result.layerUid && target.layerNumber == result.layerNumber && displayedVectorsByUid.find(result.vectorTargetUid) == displayedVectorsByUid.end())
+				{
+					if (!result.drawableUids.empty())
+					{
+						mainCanvas->RemoveDrawables(result.drawableUids);
+					}
+
+					for (PolygonDrawable& polygon : result.polygons)
+					{
+						polygon.layerNumber = target.layerNumber;
+						polygon.visible = true;
+					}
+					for (PolylineDrawable& polyline : result.polylines)
+					{
+						polyline.layerNumber = target.layerNumber;
+						polyline.visible = true;
+					}
+					for (PointDrawable& point : result.points)
+					{
+						point.layerNumber = target.layerNumber;
+						point.visible = true;
+					}
+
+					if (!result.polygons.empty())
+					{
+						mainCanvas->AddPolygonDrawables(std::move(result.polygons));
+					}
+					if (!result.polylines.empty())
+					{
+						mainCanvas->AddPolylineDrawables(std::move(result.polylines));
+					}
+					if (!result.points.empty())
+					{
+						mainCanvas->AddPointDrawables(std::move(result.points));
+					}
+
+					DisplayedVectorRecord displayedVector;
+					displayedVector.vectorTargetUid = result.vectorTargetUid;
+					displayedVector.layerUid = result.layerUid;
+					displayedVector.layerNumber = target.layerNumber;
+					displayedVector.drawableUids = std::move(result.drawableUids);
+					displayedVectorsByUid[result.vectorTargetUid] = std::move(displayedVector);
+				}
+			}
+
+			MarkTileTaskFinished(result.generation);
+		}
 	}
 
 	void OnTileResultsReady(std::vector<TileResult>& results)
@@ -2520,9 +3743,13 @@ private:
 	std::unordered_map<std::string, TargetTileRecord> currentTargetsByUid;
 	std::unordered_map<std::string, DisplayedTileRecord> displayedTilesByUid;
 	std::unordered_map<std::string, DisplayedTileRecord> transitionTilesByUid;
+	std::unordered_map<std::string, TargetVectorRecord> currentVectorTargetsByUid;
+	std::unordered_map<std::string, DisplayedVectorRecord> displayedVectorsByUid;
 
 	std::vector<TileResult> pendingTileResults;
+	std::vector<VectorResult> pendingVectorResults;
 	bool isTileResultFlushScheduled = false;
+	bool isVectorResultFlushScheduled = false;
 
 	std::atomic<std::uint64_t> currentGeneration;
 	std::uint64_t nextTaskSequence;

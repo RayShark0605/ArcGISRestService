@@ -1,57 +1,87 @@
 ﻿#include "ArcGISRestCapabilities.h"
 #include <iostream>
+#include "GeoIO.h"
+#include "GeoBase/GB_Utf8String.h"
+#include "GeoBase/GB_Utility.h"
+#include "GeoBase/GB_Timer.h"
+
+GeoIO_Shp::ReadWriteProgress progress;
+GeoIO_Shp::ShpData shpData;
+std::atomic_bool complete = false;
+
+void ThreadFunc()
+{
+	const std::string shpFilePath = GB_STR("C:/Users/localuser/Desktop/拓扑检查/自测shp/大shp/gis_osm_roads_free_1.shp");
+	const bool success = GeoIO_Shp::Read(shpFilePath, shpData, GeoIO_Shp::ReadOptions(), nullptr, &progress);
+	complete = true;
+}
 
 int main(int argc, char* argv[])
 {
-	ArcGISRestConnectionSettings settings;
-	settings.serviceUrl = "https://sampleserver6.arcgisonline.com/arcgis/rest/services";
-
-	std::string json = "";
-	if (!RequestArcGISRestJson(settings, json) || json.empty())
+	std::string encoding = "";
+	GB_GetConsoleEncodingString(encoding);
+	GB_SetConsoleEncodingToUtf8();
+	complete = false;
+	std::thread readerThread(ThreadFunc);
+	GB_Timer timer;
+	timer.Start();
+	while (!complete)
 	{
-		std::cout << "Failed to request ArcGIS REST JSON." << std::endl;
-		return 1;
+		std::this_thread::sleep_for(std::chrono::milliseconds(500));
+		std::cout << GB_STR("进度: ") << (progress.totalProgress && progress.currentProgress ? (100.0 * progress.currentProgress / progress.totalProgress) : 0.0) << "%\r\r" << std::flush;
 	}
+	std::cout << std::endl << GB_STR("读取完成，耗时: ") << timer.ElapsedMilliseconds() << GB_STR(" 毫秒") << std::endl;
+	readerThread.join();
 
-	ArcGISRestServiceInfo rootInfo;
-	if (!ParseArcGISRestJson(json, settings.serviceUrl, rootInfo))
-	{
-		std::cout << "Failed to parse ArcGIS REST JSON." << std::endl;
-		return 1;
-	}
-
-	ArcGISRestServiceTreeNode rootNode;
-	if (!BuildArcGISRestServiceTree(rootInfo, rootNode))
-	{
-		return 1;
-	}
-
-	const std::vector<ArcGISRestServiceTreeNode*> militaryNodes = rootNode.FindNodes("NYTimes_Covid19Cases_USCounties");
-	if (militaryNodes.size() < 1)
-	{
-		std::cout << "Failed to find node." << std::endl;
-		return 1;
-	}
-
-	if (!militaryNodes[0]->Expand(settings))
-	{
-		std::cout << "Failed to expand node." << std::endl;
-		return 1;
-	}
-
-	const std::vector<ArcGISRestServiceTreeNode*> unitsNodes = rootNode.FindNodes("[place_holder]");
-	if (unitsNodes.size() < 2)
-	{
-		std::cout << "Failed to find node." << std::endl;
-		return 1;
-	}
-
-	const ArcGISRestServiceTreeNode* serviceParentNode = nullptr;
-	if (!unitsNodes[1]->FindServiceParentNode(rootNode, serviceParentNode))
-	{
-		std::cout << "Failed to find parent service info." << std::endl;
-		return 1;
-	}
+	//ArcGISRestConnectionSettings settings;
+	//settings.serviceUrl = "https://sampleserver6.arcgisonline.com/arcgis/rest/services";
+	//
+	//std::string json = "";
+	//if (!RequestArcGISRestJson(settings, json) || json.empty())
+	//{
+	//	std::cout << "Failed to request ArcGIS REST JSON." << std::endl;
+	//	return 1;
+	//}
+	//
+	//ArcGISRestServiceInfo rootInfo;
+	//if (!ParseArcGISRestJson(json, settings.serviceUrl, rootInfo))
+	//{
+	//	std::cout << "Failed to parse ArcGIS REST JSON." << std::endl;
+	//	return 1;
+	//}
+	//
+	//ArcGISRestServiceTreeNode rootNode;
+	//if (!BuildArcGISRestServiceTree(rootInfo, rootNode))
+	//{
+	//	return 1;
+	//}
+	//
+	//const std::vector<ArcGISRestServiceTreeNode*> militaryNodes = rootNode.FindNodes("NYTimes_Covid19Cases_USCounties");
+	//if (militaryNodes.size() < 1)
+	//{
+	//	std::cout << "Failed to find node." << std::endl;
+	//	return 1;
+	//}
+	//
+	//if (!militaryNodes[0]->Expand(settings))
+	//{
+	//	std::cout << "Failed to expand node." << std::endl;
+	//	return 1;
+	//}
+	//
+	//const std::vector<ArcGISRestServiceTreeNode*> unitsNodes = rootNode.FindNodes("[place_holder]");
+	//if (unitsNodes.size() < 2)
+	//{
+	//	std::cout << "Failed to find node." << std::endl;
+	//	return 1;
+	//}
+	//
+	//const ArcGISRestServiceTreeNode* serviceParentNode = nullptr;
+	//if (!unitsNodes[1]->FindServiceParentNode(rootNode, serviceParentNode))
+	//{
+	//	std::cout << "Failed to find parent service info." << std::endl;
+	//	return 1;
+	//}
 
 	//CalculateImageRequestItemsInput input;
 	//input.viewExtent.Set(-23179900.597176231, -11427170.097761590, 21910215.030743435, 11036497.615786836);

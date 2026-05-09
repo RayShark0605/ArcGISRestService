@@ -115,38 +115,44 @@ std::vector<PolygonDrawable> CreateRandomPolygonDrawables(
 	return polygons;
 }
 
-//int main(int argc, char* argv[])
-//{
-//	QApplication app(argc, argv);
-//	QArcGISRestMainWindow mainWindow;
-//	mainWindow.show();
-//	return app.exec();
-//}
-
-#include "QMainCanvas.h"
-static QMainCanvas* g_mainCanvas = nullptr;
-std::vector<PolygonDrawable> polygons;
-void ThreadFunc()
-{
-	std::this_thread::sleep_for(std::chrono::seconds(5));
-	if (g_mainCanvas)
-	{
-		g_mainCanvas->AddPolygonDrawables(polygons);
-	}
-}
-
 int main(int argc, char* argv[])
 {
-	const GB_Rectangle testExtent(-10000000.0, -10000000.0, 10000000.0, 10000000.0);
-	polygons = CreateRandomPolygonDrawables(5000000, testExtent);
-
-
 	QApplication app(argc, argv);
 	QArcGISRestMainWindow mainWindow;
 	mainWindow.show();
-	g_mainCanvas = mainWindow.GetCanvas();
-
-	std::thread workerThread(ThreadFunc);
-	workerThread.detach();
 	return app.exec();
 }
+
+//#include "QMainCanvas.h"
+//static QMainCanvas* g_mainCanvas = nullptr;
+//std::vector<PolygonDrawable> polygons;
+//void ThreadFunc()
+//{
+//	std::this_thread::sleep_for(std::chrono::seconds(5));
+//	if (g_mainCanvas)
+//	{
+//		//g_mainCanvas->SetRenderBackend(QMainCanvasRenderBackend::QPainter);
+//		g_mainCanvas->AddPolygonDrawables(polygons);
+//	}
+//}
+//
+//int main(int argc, char* argv[])
+//{
+//
+//
+//
+//
+//
+//	const GB_Rectangle testExtent(-10000000.0, -10000000.0, 10000000.0, 10000000.0);
+//	polygons = CreateRandomPolygonDrawables(1000000, testExtent);
+//
+//
+//	QApplication app(argc, argv);
+//	QArcGISRestMainWindow mainWindow;
+//	mainWindow.show();
+//	g_mainCanvas = mainWindow.GetCanvas();
+//
+//	std::thread workerThread(ThreadFunc);
+//	workerThread.detach();
+//	return app.exec();
+//}
