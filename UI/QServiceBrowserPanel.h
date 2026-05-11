@@ -54,6 +54,9 @@ struct LayerImportRequestInfo
 	std::shared_ptr<const ArcGISRestServiceInfo> serviceInfoHolder; // 保证 serviceInfo 指针在信号投递期间有效。
 	const ArcGISRestServiceInfo* serviceInfo = nullptr;             // 跟 serviceUrl 匹配的服务信息。
 
+	std::shared_ptr<const ArcGISRestServiceInfo> nodeInfoHolder;    // 当前被导入节点对应资源的详细信息，例如 /FeatureServer/<layerId>。
+	const ArcGISRestServiceInfo* nodeInfo = nullptr;                // 跟 nodeUrl 匹配的节点详细信息；可能为空。
+
 	std::string layerId = "";        // 图层 ID；全部图层节点为逗号分隔的全部图层 ID。
 	ArcGISRestServiceTreeNode::NodeType nodeType = ArcGISRestServiceTreeNode::NodeType::Unknown;
 	ArcGISRestServiceTreeNode::NodeType serviceNodeType = ArcGISRestServiceTreeNode::NodeType::Unknown;
@@ -193,6 +196,7 @@ private:
 	bool BuildArcGISRestLayerImportRequest(QTreeWidgetItem* item, LayerImportRequestInfo& outRequest, QString* errorMessage = nullptr) const;
 	const QTreeWidgetItem* FindArcGISRestServiceItemForImport(const QTreeWidgetItem* item) const;
 	std::shared_ptr<const ArcGISRestServiceInfo> GetArcGISRestServiceInfoForItem(const QTreeWidgetItem* item) const;
+	std::shared_ptr<const ArcGISRestServiceInfo> GetArcGISRestNodeInfoForImport(const QTreeWidgetItem* item, const ArcGISRestConnectionSettings& connectionSettings) const;
 	std::string ExtractLayerIdForImport(const QTreeWidgetItem* item, const std::string& serviceUrl, const ArcGISRestServiceInfo* serviceInfo) const;
 	void EditArcGISRestConnection(QTreeWidgetItem* item);
 	void DeleteArcGISRestConnection(QTreeWidgetItem* item);

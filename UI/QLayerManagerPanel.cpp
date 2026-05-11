@@ -2,6 +2,8 @@
 
 #include "GeoBoundingBox.h"
 #include "GeoCrsTransform.h"
+#include "GeoCrsManager.h"
+#include "GeoBase/GB_Network.h"
 #include "QMainCanvas.h"
 
 #include <QAbstractItemModel>
@@ -15,6 +17,7 @@
 #include <QListWidget>
 #include <QListWidgetItem>
 #include <QMenu>
+#include <QMetaObject>
 #include <QMessageBox>
 #include <QPainter>
 #include <QPainterPath>
@@ -27,6 +30,7 @@
 #include <QSizePolicy>
 #include <QStyle>
 #include <QTimer>
+#include <QThread>
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <QWidget>
@@ -34,12 +38,97 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <memory>
+#include <string>
+#include <utility>
 
 namespace
 {
 	QString ToQString(const std::string& textUtf8)
 	{
 		return QString::fromUtf8(textUtf8.c_str());
+	}
+
+	std::string TrimmedStdString(const std::string& text)
+	{
+		size_t beginIndex = 0;
+		while (beginIndex < text.size() && std::isspace(static_cast<unsigned char>(text[beginIndex])))
+		{
+			beginIndex++;
+		}
+
+		size_t endIndex = text.size();
+		while (endIndex > beginIndex && std::isspace(static_cast<unsigned char>(text[endIndex - 1])))
+		{
+			endIndex--;
+		}
+
+		return text.substr(beginIndex, endIndex - beginIndex);
+	}
+
+	GB_NetworkRequestOptions CreateNetworkOptionsFromConnectionSettings(const ArcGISRestConnectionSettings& settings)
+	{
+		GB_NetworkRequestOptions networkOptions;
+		networkOptions.connectTimeoutMs = 5000;
+		networkOptions.totalTimeoutMs = 60000;
+		networkOptions.refererUtf8 = TrimmedStdString(settings.httpReferer);
+
+		for (const std::pair<std::string, std::string>& header : settings.httpCustomHeaders)
+		{
+			const std::string headerName = TrimmedStdString(header.first);
+			if (headerName.empty())
+			{
+				continue;
+			}
+
+			networkOptions.headersUtf8.push_back(headerName + ": " + header.second);
+		}
+		return networkOptions;
+	}
+
+	bool IsArcGISRestServiceNodeTypeForMetadata(ArcGISRestServiceTreeNode::NodeType nodeType)
+	{
+		switch (nodeType)
+		{
+		case ArcGISRestServiceTreeNode::NodeType::MapService:
+		case ArcGISRestServiceTreeNode::NodeType::ImageService:
+		case ArcGISRestServiceTreeNode::NodeType::FeatureService:
+			return true;
+		case ArcGISRestServiceTreeNode::NodeType::Unknown:
+		case ArcGISRestServiceTreeNode::NodeType::Root:
+		case ArcGISRestServiceTreeNode::NodeType::Folder:
+		case ArcGISRestServiceTreeNode::NodeType::AllLayers:
+		case ArcGISRestServiceTreeNode::NodeType::UnknownVectorLayer:
+		case ArcGISRestServiceTreeNode::NodeType::PointVectorLayer:
+		case ArcGISRestServiceTreeNode::NodeType::LineVectorLayer:
+		case ArcGISRestServiceTreeNode::NodeType::PolygonVectorLayer:
+		case ArcGISRestServiceTreeNode::NodeType::RasterLayer:
+		case ArcGISRestServiceTreeNode::NodeType::Table:
+		default:
+			return false;
+		}
+	}
+
+	bool ShouldHoldForPreciseFeatureLayerMetadata(const LayerImportRequestInfo& request)
+	{
+		if (request.serviceNodeType != ArcGISRestServiceTreeNode::NodeType::FeatureService)
+		{
+			return false;
+		}
+
+		if (request.nodeType == ArcGISRestServiceTreeNode::NodeType::FeatureService ||
+			request.nodeType == ArcGISRestServiceTreeNode::NodeType::AllLayers ||
+			request.nodeType == ArcGISRestServiceTreeNode::NodeType::Table)
+		{
+			return false;
+		}
+
+		if (request.layerId.empty() || request.nodeUrl.empty())
+		{
+			return false;
+		}
+
+		return request.nodeInfo == nullptr && request.nodeInfoHolder.get() == nullptr;
 	}
 
 	bool IsFiniteCoordinate(double value)
@@ -123,16 +212,86 @@ namespace
 		return ExtractLastNumericPathSegment(request.serviceUrl);
 	}
 
-	std::string ResolveFallbackServiceWkt(const ArcGISRestServiceInfo& serviceInfo)
+	std::string SpatialReferenceCodeToDefinition(int wkid)
 	{
-		if (serviceInfo.hasSpatialReference && !serviceInfo.spatialReference.wkt.empty())
+		if (wkid <= 0)
 		{
-			return serviceInfo.spatialReference.wkt;
+			return std::string();
 		}
 
-		if (serviceInfo.hasTileInfo && !serviceInfo.tileInfo.spatialReference.wkt.empty())
+		const std::string epsgDefinition = std::string("EPSG:") + std::to_string(wkid);
+		if (GeoCrsManager::IsDefinitionValidCached(epsgDefinition))
 		{
-			return serviceInfo.tileInfo.spatialReference.wkt;
+			return epsgDefinition;
+		}
+
+		const std::string esriDefinition = std::string("ESRI:") + std::to_string(wkid);
+		if (GeoCrsManager::IsDefinitionValidCached(esriDefinition))
+		{
+			return esriDefinition;
+		}
+
+		return epsgDefinition;
+	}
+
+	std::string SpatialReferenceToWktOrDefinition(const ArcGISRestSpatialReference& spatialReference)
+	{
+		if (!spatialReference.wkt.empty())
+		{
+			return spatialReference.wkt;
+		}
+
+		std::string definition = SpatialReferenceCodeToDefinition(spatialReference.latestWkid);
+		if (!definition.empty())
+		{
+			return definition;
+		}
+
+		definition = SpatialReferenceCodeToDefinition(spatialReference.wkid);
+		if (!definition.empty())
+		{
+			return definition;
+		}
+
+		return std::string();
+	}
+
+	std::string ResolveFallbackServiceWkt(const ArcGISRestServiceInfo& serviceInfo)
+	{
+		if (serviceInfo.hasSpatialReference)
+		{
+			const std::string spatialReferenceText = SpatialReferenceToWktOrDefinition(serviceInfo.spatialReference);
+			if (!spatialReferenceText.empty())
+			{
+				return spatialReferenceText;
+			}
+		}
+
+		if (serviceInfo.hasTileInfo)
+		{
+			const std::string tileSpatialReferenceText = SpatialReferenceToWktOrDefinition(serviceInfo.tileInfo.spatialReference);
+			if (!tileSpatialReferenceText.empty())
+			{
+				return tileSpatialReferenceText;
+			}
+		}
+
+		if (serviceInfo.hasFullExtent)
+		{
+			const std::string fullExtentText = SpatialReferenceToWktOrDefinition(serviceInfo.fullExtent.spatialReference);
+			if (!fullExtentText.empty())
+			{
+				return fullExtentText;
+			}
+		}
+
+		if (serviceInfo.hasInitialExtent)
+		{
+			const std::string initialExtentText = SpatialReferenceToWktOrDefinition(serviceInfo.initialExtent.spatialReference);
+			if (!initialExtentText.empty())
+			{
+				return initialExtentText;
+			}
 		}
 
 		return std::string();
@@ -140,9 +299,10 @@ namespace
 
 	std::string ResolveEnvelopeWkt(const ArcGISRestEnvelope& envelope, const std::string& fallbackWkt)
 	{
-		if (!envelope.spatialReference.wkt.empty())
+		const std::string envelopeSpatialReferenceText = SpatialReferenceToWktOrDefinition(envelope.spatialReference);
+		if (!envelopeSpatialReferenceText.empty())
 		{
-			return envelope.spatialReference.wkt;
+			return envelopeSpatialReferenceText;
 		}
 		return fallbackWkt;
 	}
@@ -164,8 +324,14 @@ namespace
 			return false;
 		}
 
-		outBox.Set(ResolveEnvelopeWkt(envelope, fallbackWkt), rect);
-		return outBox.rect.IsValid();
+		const std::string envelopeWkt = ResolveEnvelopeWkt(envelope, fallbackWkt);
+		if (envelopeWkt.empty())
+		{
+			return false;
+		}
+
+		outBox.Set(envelopeWkt, rect);
+		return outBox.IsValid();
 	}
 
 	const ArcGISRestLayerOrTableInfo* FindLayerOrTableInfoById(const ArcGISRestServiceInfo& serviceInfo, const std::string& layerId)
@@ -199,6 +365,16 @@ namespace
 		return nullptr;
 	}
 
+	const ArcGISRestServiceInfo* GetImportRequestNodeInfo(const LayerImportRequestInfo& request)
+	{
+		if (request.nodeInfo != nullptr)
+		{
+			return request.nodeInfo;
+		}
+
+		return request.nodeInfoHolder.get();
+	}
+
 	bool TryCreateBoundingBoxFromLayerOrTableInfo(const ArcGISRestLayerOrTableInfo& layerInfo, const std::string& serviceFallbackWkt, GeoBoundingBox& outBox)
 	{
 		outBox.Reset();
@@ -208,9 +384,9 @@ namespace
 		}
 
 		std::string fallbackWkt = serviceFallbackWkt;
-		if (fallbackWkt.empty() && layerInfo.hasSourceSpatialReference && !layerInfo.sourceSpatialReference.wkt.empty())
+		if (fallbackWkt.empty() && layerInfo.hasSourceSpatialReference)
 		{
-			fallbackWkt = layerInfo.sourceSpatialReference.wkt;
+			fallbackWkt = SpatialReferenceToWktOrDefinition(layerInfo.sourceSpatialReference);
 		}
 
 		return TryCreateBoundingBoxFromEnvelope(layerInfo.extent, fallbackWkt, outBox);
@@ -246,21 +422,27 @@ namespace
 		const auto appendLayer = [&serviceFallbackWkt, &unionWkt, &unionRect](const ArcGISRestLayerOrTableInfo& layerInfo) -> bool
 			{
 				GeoBoundingBox layerBox;
-				if (!TryCreateBoundingBoxFromLayerOrTableInfo(layerInfo, serviceFallbackWkt, layerBox) || !layerBox.rect.IsValid())
+				if (!TryCreateBoundingBoxFromLayerOrTableInfo(layerInfo, serviceFallbackWkt, layerBox) || !layerBox.rect.IsValid() || layerBox.wktUtf8.empty())
 				{
 					return false;
 				}
 
+				GB_Rectangle rectToAppend = layerBox.rect;
 				if (unionWkt.empty())
 				{
 					unionWkt = layerBox.wktUtf8;
 				}
 				else if (unionWkt != layerBox.wktUtf8)
 				{
-					return false;
+					GeoBoundingBox transformedBox;
+					if (!GeoCrsTransform::TransformBoundingBox(layerBox, unionWkt, transformedBox, 21) || !transformedBox.rect.IsValid())
+					{
+						return false;
+					}
+					rectToAppend = transformedBox.rect;
 				}
 
-				unionRect.Expand(layerBox.rect);
+				unionRect.Expand(rectToAppend);
 				return true;
 			};
 
@@ -382,6 +564,100 @@ namespace
 	}
 }
 
+
+class QLayerManagerPanel::ArcGISRestLayerMetadataThread : public QThread
+{
+private:
+	struct LoadResult
+	{
+		QString layerUid = "";
+		quint64 loadToken = 0;
+		bool succeeded = false;
+		std::string nodeUrl = "";
+		std::shared_ptr<const ArcGISRestServiceInfo> nodeInfoHolder;
+	};
+
+public:
+	ArcGISRestLayerMetadataThread(const QPointer<QLayerManagerPanel>& panelPointer,
+		const QString& layerUid,
+		quint64 loadToken,
+		const LayerImportRequestInfo& request)
+		: QThread(nullptr), panelPointer(panelPointer), layerUid(layerUid), loadToken(loadToken), request(request)
+	{
+	}
+
+protected:
+	virtual void run() override
+	{
+		LoadResult result;
+		result.layerUid = layerUid;
+		result.loadToken = loadToken;
+		result.nodeUrl = request.nodeUrl;
+
+		if (request.nodeUrl.empty())
+		{
+			PostResult(result);
+			return;
+		}
+
+		ArcGISRestConnectionSettings requestSettings = request.connectionSettings;
+		requestSettings.serviceUrl = request.nodeUrl;
+
+		std::string jsonText;
+		const GB_NetworkRequestOptions networkOptions = CreateNetworkOptionsFromConnectionSettings(requestSettings);
+		if (!RequestArcGISRestJson(requestSettings, jsonText, networkOptions, nullptr) || jsonText.empty())
+		{
+			PostResult(result);
+			return;
+		}
+
+		ArcGISRestServiceInfo nodeInfo;
+		if (!ParseArcGISRestJson(jsonText, request.nodeUrl, nodeInfo, nullptr) || nodeInfo.resourceType == ArcGISRestResourceType::Unknown)
+		{
+			PostResult(result);
+			return;
+		}
+
+		result.succeeded = true;
+		result.nodeInfoHolder = std::make_shared<ArcGISRestServiceInfo>(std::move(nodeInfo));
+		PostResult(result);
+	}
+
+private:
+	void PostResult(const LoadResult& result)
+	{
+		QLayerManagerPanel* panel = panelPointer.data();
+		if (!panel)
+		{
+			return;
+		}
+
+		const QPointer<QLayerManagerPanel> safePanelPointer = panelPointer;
+		QMetaObject::invokeMethod(panel, [safePanelPointer, result]() mutable {
+			QLayerManagerPanel* panel = safePanelPointer.data();
+			if (!panel)
+			{
+				return;
+			}
+
+			if (result.succeeded && result.nodeInfoHolder)
+			{
+				panel->HandleArcGISRestLayerMetadataLoaded(result.layerUid, result.loadToken, result.nodeUrl, result.nodeInfoHolder);
+			}
+			else
+			{
+				panel->HandleArcGISRestLayerMetadataLoadFailed(result.layerUid, result.loadToken);
+			}
+			}, Qt::QueuedConnection);
+	}
+
+private:
+	QPointer<QLayerManagerPanel> panelPointer;
+	QString layerUid = "";
+	quint64 loadToken = 0;
+	LayerImportRequestInfo request;
+};
+
 QLayerManagerPanel::QLayerManagerPanel(QWidget* parent) : QDockWidget(QStringLiteral("图层管理"), parent)
 {
 	qRegisterMetaType<LayerImportRequestInfo>("LayerImportRequestInfo");
@@ -465,6 +741,7 @@ QLayerManagerPanel::QLayerManagerPanel(QWidget* parent) : QDockWidget(QStringLit
 
 QLayerManagerPanel::~QLayerManagerPanel()
 {
+	CancelAllArcGISRestLayerMetadataLoads();
 	layers.clear();
 	layerIndexByUid.clear();
 }
@@ -561,6 +838,7 @@ bool QLayerManagerPanel::AddLayer(const LayerImportRequestInfo& request)
 	std::vector<int> affectedRows;
 	affectedRows.push_back(0);
 	EmitChange(LayerManagerActionType::LayerImported, affectedLayers, affectedRows, true);
+	StartArcGISRestLayerMetadataLoadIfNeeded(layerInfo.layerUid);
 	return true;
 }
 
@@ -621,6 +899,8 @@ void QLayerManagerPanel::ClearLayers()
 	{
 		return;
 	}
+
+	CancelAllArcGISRestLayerMetadataLoads();
 
 	isUpdatingItems = true;
 	if (listWidget)
@@ -1318,15 +1598,27 @@ bool QLayerManagerPanel::TryCalculateLayerExtentInCanvasCrs(const LayerManagerLa
 bool QLayerManagerPanel::TryGetLayerBoundingBox(const LayerManagerLayerInfo& layerInfo, GeoBoundingBox& outBox) const
 {
 	outBox.Reset();
-	if (!layerInfo.importRequest.serviceInfo)
+	const ArcGISRestServiceInfo* serviceInfoPtr = layerInfo.importRequest.serviceInfo;
+	if (serviceInfoPtr == nullptr)
+	{
+		serviceInfoPtr = layerInfo.importRequest.serviceInfoHolder.get();
+	}
+
+	if (serviceInfoPtr == nullptr)
 	{
 		return false;
 	}
 
-	const ArcGISRestServiceInfo& serviceInfo = *(layerInfo.importRequest.serviceInfo);
+	const ArcGISRestServiceInfo& serviceInfo = *serviceInfoPtr;
 	const std::string serviceFallbackWkt = ResolveFallbackServiceWkt(serviceInfo);
 	const std::string requestLayerId = ResolveLayerIdFromRequest(layerInfo.importRequest);
 
+	const ArcGISRestServiceInfo* requestNodeInfo = GetImportRequestNodeInfo(layerInfo.importRequest);
+	if (requestNodeInfo != nullptr && requestNodeInfo->resourceType == ArcGISRestResourceType::LayerOrTable &&
+		TryCreateBoundingBoxFromLayerOrTableInfo(requestNodeInfo->layerOrTable, serviceFallbackWkt, outBox))
+	{
+		return true;
+	}
 	if (layerInfo.importRequest.nodeType == ArcGISRestServiceTreeNode::NodeType::AllLayers)
 	{
 		if (TryCreateServiceBoundingBox(serviceInfo, outBox))
@@ -1347,6 +1639,14 @@ bool QLayerManagerPanel::TryGetLayerBoundingBox(const LayerManagerLayerInfo& lay
 		TryCreateBoundingBoxFromLayerOrTableInfo(serviceInfo.layerOrTable, serviceFallbackWkt, outBox))
 	{
 		return true;
+	}
+
+
+	// 对 FeatureServer 子图层，若服务根信息里也找不到该子图层的详细 extent，
+	// 则等待异步 metadata 返回，不能回退到 FeatureServer 根服务 fullExtent。
+	if (ShouldHoldForPreciseFeatureLayerMetadata(layerInfo.importRequest))
+	{
+		return false;
 	}
 
 	if (layerInfo.importRequest.nodeType == ArcGISRestServiceTreeNode::NodeType::MapService ||
@@ -1478,6 +1778,13 @@ bool QLayerManagerPanel::RemoveRows(const std::vector<int>& rowsToRemove, LayerM
 
 	std::vector<int> rowsForDeletion = validRows;
 	std::sort(rowsForDeletion.rbegin(), rowsForDeletion.rend());
+	for (int row : rowsForDeletion)
+	{
+		if (row >= 0 && row < static_cast<int>(layers.size()))
+		{
+			CancelArcGISRestLayerMetadataLoad(layers[static_cast<size_t>(row)].layerUid);
+		}
+	}
 
 	isUpdatingItems = true;
 	for (int row : rowsForDeletion)
@@ -1580,6 +1887,7 @@ bool QLayerManagerPanel::CloneLayerAtRow(int row)
 	std::vector<int> affectedRows;
 	affectedRows.push_back(0);
 	EmitChange(LayerManagerActionType::LayerCloned, affectedLayers, affectedRows, true);
+	StartArcGISRestLayerMetadataLoadIfNeeded(newLayerInfo.layerUid);
 	return true;
 }
 
@@ -1641,4 +1949,124 @@ void QLayerManagerPanel::UpdateSelectionDependentButtons()
 	{
 		removeSelectedButton->setEnabled(hasSelection);
 	}
+}
+
+
+bool QLayerManagerPanel::ShouldLoadArcGISRestNodeMetadata(const LayerImportRequestInfo& request) const
+{
+	if (!request.IsValid() || request.nodeUrl.empty() || request.serviceUrl.empty())
+	{
+		return false;
+	}
+
+	if (request.nodeInfo != nullptr || request.nodeInfoHolder.get() != nullptr)
+	{
+		return false;
+	}
+
+	if (request.nodeType == ArcGISRestServiceTreeNode::NodeType::AllLayers || IsArcGISRestServiceNodeTypeForMetadata(request.nodeType))
+	{
+		return false;
+	}
+
+	if (TrimTrailingSlash(StripUrlQueryAndFragment(request.nodeUrl)) == TrimTrailingSlash(StripUrlQueryAndFragment(request.serviceUrl)))
+	{
+		return false;
+	}
+
+	return true;
+}
+
+void QLayerManagerPanel::StartArcGISRestLayerMetadataLoadIfNeeded(const QString& layerUid)
+{
+	if (layerUid.isEmpty() || metadataLoadTokenByLayerUid.contains(layerUid))
+	{
+		return;
+	}
+
+	const int layerIndex = FindLayerIndexByUid(layerUid);
+	if (layerIndex < 0)
+	{
+		return;
+	}
+
+	const LayerImportRequestInfo request = layers[static_cast<size_t>(layerIndex)].importRequest;
+	if (!ShouldLoadArcGISRestNodeMetadata(request))
+	{
+		return;
+	}
+
+	const quint64 loadToken = nextMetadataLoadToken++;
+	metadataLoadTokenByLayerUid.insert(layerUid, loadToken);
+
+	ArcGISRestLayerMetadataThread* metadataThread = new ArcGISRestLayerMetadataThread(QPointer<QLayerManagerPanel>(this), layerUid, loadToken, request);
+	connect(metadataThread, &QThread::finished, metadataThread, &QObject::deleteLater);
+	metadataThread->start();
+}
+
+void QLayerManagerPanel::CancelArcGISRestLayerMetadataLoad(const QString& layerUid)
+{
+	if (layerUid.isEmpty())
+	{
+		return;
+	}
+
+	metadataLoadTokenByLayerUid.remove(layerUid);
+}
+
+void QLayerManagerPanel::CancelAllArcGISRestLayerMetadataLoads()
+{
+	metadataLoadTokenByLayerUid.clear();
+}
+
+bool QLayerManagerPanel::IsArcGISRestLayerMetadataLoadCurrent(const QString& layerUid, quint64 loadToken) const
+{
+	const auto iter = metadataLoadTokenByLayerUid.constFind(layerUid);
+	return iter != metadataLoadTokenByLayerUid.constEnd() && iter.value() == loadToken;
+}
+
+void QLayerManagerPanel::HandleArcGISRestLayerMetadataLoaded(const QString& layerUid, quint64 loadToken, const std::string& nodeUrl, const std::shared_ptr<const ArcGISRestServiceInfo>& nodeInfoHolder)
+{
+	if (!IsArcGISRestLayerMetadataLoadCurrent(layerUid, loadToken))
+	{
+		return;
+	}
+	metadataLoadTokenByLayerUid.remove(layerUid);
+
+	if (!nodeInfoHolder || nodeInfoHolder->resourceType == ArcGISRestResourceType::Unknown)
+	{
+		return;
+	}
+
+	const int layerIndex = FindLayerIndexByUid(layerUid);
+	if (layerIndex < 0)
+	{
+		return;
+	}
+
+	LayerManagerLayerInfo& layerInfo = layers[static_cast<size_t>(layerIndex)];
+	if (TrimTrailingSlash(StripUrlQueryAndFragment(layerInfo.importRequest.nodeUrl)) != TrimTrailingSlash(StripUrlQueryAndFragment(nodeUrl)))
+	{
+		return;
+	}
+
+	layerInfo.importRequest.nodeInfoHolder = nodeInfoHolder;
+	layerInfo.importRequest.nodeInfo = layerInfo.importRequest.nodeInfoHolder.get();
+	layerInfo.row = layerIndex;
+
+	std::vector<LayerManagerLayerInfo> affectedLayers;
+	affectedLayers.push_back(layerInfo);
+	std::vector<int> affectedRows;
+	affectedRows.push_back(layerIndex);
+	EmitChange(LayerManagerActionType::LayerMetadataUpdated, affectedLayers, affectedRows, true);
+}
+
+void QLayerManagerPanel::HandleArcGISRestLayerMetadataLoadFailed(const QString& layerUid, quint64 loadToken)
+{
+	if (!IsArcGISRestLayerMetadataLoadCurrent(layerUid, loadToken))
+	{
+		return;
+	}
+
+	metadataLoadTokenByLayerUid.remove(layerUid);
 }

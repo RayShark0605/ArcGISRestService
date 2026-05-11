@@ -188,21 +188,99 @@ namespace
 		return CanImportNodeAsImage(request) || CanImportNodeAsVector(request);
 	}
 
+	bool ShouldHoldForPreciseFeatureLayerMetadata(const LayerImportRequestInfo& request)
+	{
+		if (request.serviceNodeType != ArcGISRestServiceTreeNode::NodeType::FeatureService)
+		{
+			return false;
+		}
+
+		if (request.nodeType == ArcGISRestServiceTreeNode::NodeType::FeatureService ||
+			request.nodeType == ArcGISRestServiceTreeNode::NodeType::AllLayers ||
+			request.nodeType == ArcGISRestServiceTreeNode::NodeType::Table)
+		{
+			return false;
+		}
+
+		if (request.layerId.empty() || request.nodeUrl.empty())
+		{
+			return false;
+		}
+
+		return request.nodeInfo == nullptr && request.nodeInfoHolder.get() == nullptr;
+	}
+
+	std::string SpatialReferenceCodeToDefinition(int wkid)
+	{
+		if (wkid <= 0)
+		{
+			return std::string();
+		}
+
+		const std::string epsgDefinition = std::string("EPSG:") + std::to_string(wkid);
+		if (GeoCrsManager::IsDefinitionValidCached(epsgDefinition))
+		{
+			return epsgDefinition;
+		}
+
+		const std::string esriDefinition = std::string("ESRI:") + std::to_string(wkid);
+		if (GeoCrsManager::IsDefinitionValidCached(esriDefinition))
+		{
+			return esriDefinition;
+		}
+
+		return epsgDefinition;
+	}
+
+	std::string SpatialReferenceToWktOrDefinition(const ArcGISRestSpatialReference& spatialReference)
+	{
+		if (!spatialReference.wkt.empty())
+		{
+			return spatialReference.wkt;
+		}
+
+		std::string definition = SpatialReferenceCodeToDefinition(spatialReference.latestWkid);
+		if (!definition.empty())
+		{
+			return definition;
+		}
+
+		definition = SpatialReferenceCodeToDefinition(spatialReference.wkid);
+		if (!definition.empty())
+		{
+			return definition;
+		}
+
+		return std::string();
+	}
+
 	std::string GetServiceFallbackWkt(const ArcGISRestServiceInfo& serviceInfo)
 	{
-		if (serviceInfo.hasSpatialReference && !serviceInfo.spatialReference.wkt.empty())
+		if (serviceInfo.hasSpatialReference)
 		{
-			return serviceInfo.spatialReference.wkt;
+			const std::string spatialReferenceText = SpatialReferenceToWktOrDefinition(serviceInfo.spatialReference);
+			if (!spatialReferenceText.empty())
+			{
+				return spatialReferenceText;
+			}
 		}
 
-		if (serviceInfo.hasFullExtent && !serviceInfo.fullExtent.spatialReference.wkt.empty())
+		if (serviceInfo.hasFullExtent)
 		{
-			return serviceInfo.fullExtent.spatialReference.wkt;
+			const std::string fullExtentText = SpatialReferenceToWktOrDefinition(serviceInfo.fullExtent.spatialReference);
+			if (!fullExtentText.empty())
+			{
+				return fullExtentText;
+			}
 		}
 
-		if (serviceInfo.hasInitialExtent && !serviceInfo.initialExtent.spatialReference.wkt.empty())
+		if (serviceInfo.hasInitialExtent)
 		{
-			return serviceInfo.initialExtent.spatialReference.wkt;
+			const std::string initialExtentText = SpatialReferenceToWktOrDefinition(serviceInfo.initialExtent.spatialReference);
+			if (!initialExtentText.empty())
+			{
+				return initialExtentText;
+			}
 		}
 
 		return std::string();
@@ -210,9 +288,13 @@ namespace
 
 	std::string GetImageRequestWkt(const ArcGISRestServiceInfo& serviceInfo, bool isTiled)
 	{
-		if (isTiled && !serviceInfo.tileInfo.spatialReference.wkt.empty())
+		if (isTiled)
 		{
-			return serviceInfo.tileInfo.spatialReference.wkt;
+			const std::string tileInfoText = SpatialReferenceToWktOrDefinition(serviceInfo.tileInfo.spatialReference);
+			if (!tileInfoText.empty())
+			{
+				return tileInfoText;
+			}
 		}
 
 		return GetServiceFallbackWkt(serviceInfo);
@@ -353,9 +435,19 @@ namespace
 		return std::isfinite(outPixelSizeX) && outPixelSizeX > 0.0 && std::isfinite(outPixelSizeY) && outPixelSizeY > 0.0;
 	}
 
+	const ArcGISRestServiceInfo* GetImportRequestNodeInfo(const LayerImportRequestInfo& request)
+	{
+		if (request.nodeInfo != nullptr)
+		{
+			return request.nodeInfo;
+		}
+
+		return request.nodeInfoHolder.get();
+	}
+
 	bool TryCreateBoundingBoxFromEnvelope(const ArcGISRestEnvelope& envelope, const std::string& fallbackWkt, GeoBoundingBox& outBBox)
 	{
-		std::string wkt = envelope.spatialReference.wkt;
+		std::string wkt = SpatialReferenceToWktOrDefinition(envelope.spatialReference);
 		if (wkt.empty())
 		{
 			wkt = fallbackWkt;
@@ -381,9 +473,23 @@ namespace
 	{
 		const std::string fallbackWkt = GetServiceFallbackWkt(serviceInfo);
 
+		const ArcGISRestServiceInfo* requestNodeInfo = GetImportRequestNodeInfo(request);
+		if (requestNodeInfo != nullptr && requestNodeInfo->resourceType == ArcGISRestResourceType::LayerOrTable &&
+			requestNodeInfo->layerOrTable.hasExtent && TryCreateBoundingBoxFromEnvelope(requestNodeInfo->layerOrTable.extent, fallbackWkt, outBBox))
+		{
+			return true;
+		}
 		if (serviceInfo.layerOrTable.hasExtent && TryCreateBoundingBoxFromEnvelope(serviceInfo.layerOrTable.extent, fallbackWkt, outBBox))
 		{
 			return true;
+		}
+
+
+		// 对 FeatureServer 子图层，若当前可用信息里没有该子图层 extent，则等待异步 metadata 返回，
+		// 不能回退到根服务 fullExtent。
+		if (ShouldHoldForPreciseFeatureLayerMetadata(request))
+		{
+			return false;
 		}
 
 		if (serviceInfo.hasFullExtent && TryCreateBoundingBoxFromEnvelope(serviceInfo.fullExtent, fallbackWkt, outBBox))
@@ -396,7 +502,6 @@ namespace
 			return true;
 		}
 
-		(void)request;
 		return false;
 	}
 
@@ -1583,23 +1688,6 @@ namespace
 		return std::string();
 	}
 
-	std::string SpatialReferenceToWktOrDefinition(const ArcGISRestSpatialReference& spatialReference)
-	{
-		if (!spatialReference.wkt.empty())
-		{
-			return spatialReference.wkt;
-		}
-		if (spatialReference.latestWkid > 0)
-		{
-			return std::string("EPSG:") + std::to_string(spatialReference.latestWkid);
-		}
-		if (spatialReference.wkid > 0)
-		{
-			return std::string("EPSG:") + std::to_string(spatialReference.wkid);
-		}
-		return std::string();
-	}
-
 	std::string GetVectorRequestWkt(const ArcGISRestServiceInfo& serviceInfo, const std::string& layerId)
 	{
 		const ArcGISRestLayerOrTableInfo* layerInfo = FindLayerOrTableInfoById(serviceInfo, layerId);
@@ -1923,6 +2011,7 @@ public:
 	{
 		std::string vectorTargetUid = "";
 		std::string layerUid = "";
+		std::string layerId = "";
 		double layerNumber = 0.0;
 		std::vector<std::string> drawableUids;
 	};
@@ -1974,6 +2063,7 @@ public:
 		std::uint64_t generation = 0;
 		std::string vectorTargetUid = "";
 		std::string layerUid = "";
+		std::string layerId = "";
 		double layerNumber = 0.0;
 		std::vector<PointDrawable> points;
 		std::vector<PolylineDrawable> polylines;
@@ -2061,6 +2151,7 @@ public:
 		RemoveAllDisplayedTiles();
 		RemoveAllDisplayedVectors();
 		RemoveAllTransitionTiles();
+		RemoveAllTransitionVectors();
 		layers.clear();
 		currentTargetsByUid.clear();
 		currentVectorTargetsByUid.clear();
@@ -2096,7 +2187,8 @@ public:
 
 	void OnLayersChanged(const LayerManagerChangeInfo& changeInfo)
 	{
-		const bool allowAutoZoomToImportedLayer = (changeInfo.actionType == LayerManagerActionType::LayerImported);
+		const bool allowAutoZoomToImportedLayer = (changeInfo.actionType == LayerManagerActionType::LayerImported ||
+			changeInfo.actionType == LayerManagerActionType::LayerMetadataUpdated);
 		const std::vector<std::string> autoZoomLayerUids = BuildLayerUidList(changeInfo.affectedLayers);
 
 		SetLayersFromLayerInfos(changeInfo.allLayers);
@@ -2620,6 +2712,79 @@ private:
 	}
 
 
+	const TargetVectorRecord* FindVectorTargetByLayerKey(const std::unordered_map<std::string, TargetVectorRecord>& targetsByUid, const std::string& layerUid, const std::string& layerId) const
+	{
+		for (const auto& targetItem : targetsByUid)
+		{
+			const TargetVectorRecord& target = targetItem.second;
+			if (target.layerUid == layerUid && target.layerId == layerId)
+			{
+				return &target;
+			}
+		}
+		return nullptr;
+	}
+
+	void SetDisplayedVectorLayerNumber(DisplayedVectorRecord& displayedVector, double layerNumber)
+	{
+		if (!mainCanvas)
+		{
+			return;
+		}
+
+		if (displayedVector.layerNumber == layerNumber)
+		{
+			return;
+		}
+
+		if (!displayedVector.drawableUids.empty())
+		{
+			mainCanvas->SetDrawablesLayerNumber(displayedVector.drawableUids, layerNumber);
+		}
+		displayedVector.layerNumber = layerNumber;
+	}
+
+	void RemoveDisplayedVectorDrawables(const DisplayedVectorRecord& displayedVector)
+	{
+		if (!mainCanvas || displayedVector.drawableUids.empty())
+		{
+			return;
+		}
+		mainCanvas->RemoveDrawables(displayedVector.drawableUids);
+	}
+
+	void MoveDisplayedVectorToTransition(const std::string& vectorTargetUid, DisplayedVectorRecord&& displayedVector, double layerNumber)
+	{
+		if (!mainCanvas || vectorTargetUid.empty())
+		{
+			return;
+		}
+
+		SetDisplayedVectorLayerNumber(displayedVector, layerNumber);
+		displayedVector.vectorTargetUid = vectorTargetUid;
+		displayedVector.layerNumber = layerNumber;
+		transitionVectorsByUid[vectorTargetUid] = std::move(displayedVector);
+	}
+
+	void RemoveTransitionVectorsForLayerKey(const std::string& layerUid, const std::string& layerId)
+	{
+		if (!mainCanvas || transitionVectorsByUid.empty())
+		{
+			return;
+		}
+
+		for (auto iter = transitionVectorsByUid.begin(); iter != transitionVectorsByUid.end(); )
+		{
+			if (iter->second.layerUid == layerUid && iter->second.layerId == layerId)
+			{
+				RemoveDisplayedVectorDrawables(iter->second);
+				iter = transitionVectorsByUid.erase(iter);
+				continue;
+			}
+			iter++;
+		}
+	}
+
 	void ReconcileDisplayedVectors(const std::unordered_map<std::string, TargetVectorRecord>& targetsByUid, std::vector<TileTask>& tasks)
 	{
 		if (!mainCanvas)
@@ -2629,25 +2794,53 @@ private:
 
 		for (auto iter = displayedVectorsByUid.begin(); iter != displayedVectorsByUid.end(); )
 		{
-			const auto targetIter = targetsByUid.find(iter->first);
-			if (targetIter == targetsByUid.end())
+			const auto exactTargetIter = targetsByUid.find(iter->first);
+			if (exactTargetIter != targetsByUid.end())
 			{
-				if (!iter->second.drawableUids.empty())
-				{
-					mainCanvas->RemoveDrawables(iter->second.drawableUids);
-				}
-				iter = displayedVectorsByUid.erase(iter);
+				DisplayedVectorRecord& displayedVector = iter->second;
+				const TargetVectorRecord& target = exactTargetIter->second;
+				SetDisplayedVectorLayerNumber(displayedVector, target.layerNumber);
+				displayedVector.layerId = target.layerId;
+				iter++;
 				continue;
 			}
 
-			DisplayedVectorRecord& displayedVector = iter->second;
-			const TargetVectorRecord& target = targetIter->second;
-			if (displayedVector.layerNumber != target.layerNumber && !displayedVector.drawableUids.empty())
+			DisplayedVectorRecord displayedVector = std::move(iter->second);
+			const TargetVectorRecord* replacementTarget = FindVectorTargetByLayerKey(targetsByUid, displayedVector.layerUid, displayedVector.layerId);
+			if (replacementTarget != nullptr)
 			{
-				mainCanvas->SetDrawablesLayerNumber(displayedVector.drawableUids, target.layerNumber);
-				displayedVector.layerNumber = target.layerNumber;
+				MoveDisplayedVectorToTransition(iter->first, std::move(displayedVector), replacementTarget->layerNumber);
 			}
-			iter++;
+			else
+			{
+				RemoveDisplayedVectorDrawables(displayedVector);
+			}
+			iter = displayedVectorsByUid.erase(iter);
+		}
+
+		for (auto iter = transitionVectorsByUid.begin(); iter != transitionVectorsByUid.end(); )
+		{
+			const auto exactTargetIter = targetsByUid.find(iter->first);
+			if (exactTargetIter != targetsByUid.end())
+			{
+				DisplayedVectorRecord displayedVector = std::move(iter->second);
+				SetDisplayedVectorLayerNumber(displayedVector, exactTargetIter->second.layerNumber);
+				displayedVector.layerId = exactTargetIter->second.layerId;
+				displayedVectorsByUid[iter->first] = std::move(displayedVector);
+				iter = transitionVectorsByUid.erase(iter);
+				continue;
+			}
+
+			const TargetVectorRecord* replacementTarget = FindVectorTargetByLayerKey(targetsByUid, iter->second.layerUid, iter->second.layerId);
+			if (replacementTarget != nullptr)
+			{
+				SetDisplayedVectorLayerNumber(iter->second, replacementTarget->layerNumber);
+				iter++;
+				continue;
+			}
+
+			RemoveDisplayedVectorDrawables(iter->second);
+			iter = transitionVectorsByUid.erase(iter);
 		}
 
 		if (!tasks.empty())
@@ -2657,6 +2850,7 @@ private:
 				}), tasks.end());
 		}
 	}
+
 
 	void MoveDisplayedTileToTransition(const std::string& tileUid, DisplayedTileRecord&& displayedTile)
 	{
@@ -2684,6 +2878,7 @@ private:
 		if (trackedPendingTaskCount == 0)
 		{
 			RemoveAllTransitionTiles();
+			RemoveAllTransitionVectors();
 		}
 	}
 
@@ -2702,6 +2897,7 @@ private:
 		if (trackedFinishedTaskCount >= trackedPendingTaskCount)
 		{
 			RemoveAllTransitionTiles();
+			RemoveAllTransitionVectors();
 		}
 	}
 
@@ -2782,6 +2978,27 @@ private:
 		}
 		mainCanvas->RemoveDrawables(uids);
 		transitionTilesByUid.clear();
+	}
+
+	void RemoveAllTransitionVectors()
+	{
+		if (!mainCanvas || transitionVectorsByUid.empty())
+		{
+			transitionVectorsByUid.clear();
+			return;
+		}
+
+		std::vector<std::string> uids;
+		for (const auto& item : transitionVectorsByUid)
+		{
+			uids.insert(uids.end(), item.second.drawableUids.begin(), item.second.drawableUids.end());
+		}
+
+		if (!uids.empty())
+		{
+			mainCanvas->RemoveDrawables(uids);
+		}
+		transitionVectorsByUid.clear();
 	}
 
 	void StartWorkers()
@@ -3349,6 +3566,7 @@ private:
 		result.generation = task.generation;
 		result.vectorTargetUid = task.vectorTargetUid;
 		result.layerUid = task.layerUid;
+		result.layerId = task.vectorRequestItem.layerId;
 		result.layerNumber = task.layerNumber;
 
 		if (task.vectorRequestItem.requestUrl.empty())
@@ -3623,12 +3841,9 @@ private:
 			if (targetIter != currentVectorTargetsByUid.end())
 			{
 				const TargetVectorRecord& target = targetIter->second;
-				if (target.layerUid == result.layerUid && target.layerNumber == result.layerNumber && displayedVectorsByUid.find(result.vectorTargetUid) == displayedVectorsByUid.end())
+				if (target.layerUid == result.layerUid && target.layerId == result.layerId && target.layerNumber == result.layerNumber && displayedVectorsByUid.find(result.vectorTargetUid) == displayedVectorsByUid.end())
 				{
-					if (!result.drawableUids.empty())
-					{
-						mainCanvas->RemoveDrawables(result.drawableUids);
-					}
+					RemoveTransitionVectorsForLayerKey(target.layerUid, target.layerId);
 
 					for (PolygonDrawable& polygon : result.polygons)
 					{
@@ -3662,6 +3877,7 @@ private:
 					DisplayedVectorRecord displayedVector;
 					displayedVector.vectorTargetUid = result.vectorTargetUid;
 					displayedVector.layerUid = result.layerUid;
+					displayedVector.layerId = target.layerId;
 					displayedVector.layerNumber = target.layerNumber;
 					displayedVector.drawableUids = std::move(result.drawableUids);
 					displayedVectorsByUid[result.vectorTargetUid] = std::move(displayedVector);
@@ -3745,6 +3961,7 @@ private:
 	std::unordered_map<std::string, DisplayedTileRecord> transitionTilesByUid;
 	std::unordered_map<std::string, TargetVectorRecord> currentVectorTargetsByUid;
 	std::unordered_map<std::string, DisplayedVectorRecord> displayedVectorsByUid;
+	std::unordered_map<std::string, DisplayedVectorRecord> transitionVectorsByUid;
 
 	std::vector<TileResult> pendingTileResults;
 	std::vector<VectorResult> pendingVectorResults;

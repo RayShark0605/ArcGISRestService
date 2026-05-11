@@ -2841,6 +2841,8 @@ bool QServiceBrowserPanel::BuildArcGISRestLayerImportRequest(QTreeWidgetItem* it
 	outRequest.connectionSettings = connectionSettings;
 	outRequest.serviceInfoHolder = serviceInfoHolder;
 	outRequest.serviceInfo = outRequest.serviceInfoHolder.get();
+	outRequest.nodeInfoHolder = GetArcGISRestNodeInfoForImport(item, connectionSettings);
+	outRequest.nodeInfo = outRequest.nodeInfoHolder.get();
 	outRequest.layerId = layerId;
 	outRequest.nodeType = requestNodeType;
 	outRequest.serviceNodeType = serviceNodeType;
@@ -2887,6 +2889,27 @@ std::shared_ptr<const ArcGISRestServiceInfo> QServiceBrowserPanel::GetArcGISRest
 		return std::shared_ptr<const ArcGISRestServiceInfo>();
 	}
 	return serviceInfoIter.value();
+}
+
+std::shared_ptr<const ArcGISRestServiceInfo> QServiceBrowserPanel::GetArcGISRestNodeInfoForImport(const QTreeWidgetItem* item, const ArcGISRestConnectionSettings& connectionSettings) const
+{
+	(void)connectionSettings;
+
+	if (!item || IsPlaceholderItem(item))
+	{
+		return std::shared_ptr<const ArcGISRestServiceInfo>();
+	}
+
+	std::shared_ptr<const ArcGISRestServiceInfo> cachedInfo = GetArcGISRestServiceInfoForItem(item);
+	if (cachedInfo && cachedInfo->resourceType != ArcGISRestResourceType::Unknown)
+	{
+		return cachedInfo;
+	}
+
+	// 注意：这里不能同步请求当前节点 JSON。
+	// BuildArcGISRestLayerImportRequest() 运行在 GUI 线程，拖拽/右键导入时若在这里访问网络，
+	// 主界面会被阻塞。当前节点的详细 metadata 由 QLayerManagerPanel 在导入后异步补全。
+	return cachedInfo;
 }
 
 std::string QServiceBrowserPanel::ExtractLayerIdForImport(const QTreeWidgetItem* item, const std::string& serviceUrl, const ArcGISRestServiceInfo* serviceInfo) const

@@ -7,6 +7,8 @@
 #include <QPointer>
 #include <QString>
 
+#include <memory>
+#include <string>
 #include <vector>
 
 #include "QServiceBrowserPanel.h"
@@ -38,7 +40,8 @@ enum class LayerManagerActionType
 	RemoveAllLayers,
 	LayerRenamed,
 	LayerCloned,
-	LayerOrderChanged
+	LayerOrderChanged,
+	LayerMetadataUpdated
 };
 
 /**
@@ -86,6 +89,9 @@ Q_DECLARE_METATYPE(LayerManagerChangeInfo)
 	class QLayerManagerPanel : public QDockWidget
 {
 	Q_OBJECT
+
+private:
+	class ArcGISRestLayerMetadataThread;
 
 public:
 	explicit QLayerManagerPanel(QWidget* parent = nullptr);
@@ -182,6 +188,14 @@ private:
 	void SelectOnlyRow(int row);
 	void UpdateSelectionDependentButtons();
 
+	bool ShouldLoadArcGISRestNodeMetadata(const LayerImportRequestInfo& request) const;
+	void StartArcGISRestLayerMetadataLoadIfNeeded(const QString& layerUid);
+	void CancelArcGISRestLayerMetadataLoad(const QString& layerUid);
+	void CancelAllArcGISRestLayerMetadataLoads();
+	bool IsArcGISRestLayerMetadataLoadCurrent(const QString& layerUid, quint64 loadToken) const;
+	void HandleArcGISRestLayerMetadataLoaded(const QString& layerUid, quint64 loadToken, const std::string& nodeUrl, const std::shared_ptr<const ArcGISRestServiceInfo>& nodeInfoHolder);
+	void HandleArcGISRestLayerMetadataLoadFailed(const QString& layerUid, quint64 loadToken);
+
 	QListWidget* listWidget = nullptr;
 	QToolButton* showAllButton = nullptr;
 	QToolButton* hideAllButton = nullptr;
@@ -194,6 +208,8 @@ private:
 	// 内部顺序始终与列表可视顺序一致：index 0 为最顶层，最后一个为最底层。
 	std::vector<LayerManagerLayerInfo> layers;
 	QHash<QString, int> layerIndexByUid;
+	QHash<QString, quint64> metadataLoadTokenByLayerUid;
+	quint64 nextMetadataLoadToken = 1;
 	bool isUpdatingItems = false;
 	int nextLayerSerial = 1;
 };
