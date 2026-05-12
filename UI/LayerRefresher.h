@@ -16,13 +16,13 @@ class QMainCanvas;
  * @brief ArcGIS REST 图层刷新控制器。
  *
  * 该类负责把图层管理面板中的图层快照与主画布视口状态合并，形成当前应显示的
- * ArcGIS REST 影像瓦片/动态影像请求集合，以及 FeatureServer 矢量要素查询请求集合。
- * 影像任务会在后台线程执行“计算请求范围 -> 缓存命中读取/缓存未命中下载 -> 解码 -> 必要时重投影 -> 显示”；
- * 矢量任务会在后台线程执行“计算视口空间过滤范围 -> query 请求 -> JSON 解析 -> 必要时坐标转换 -> Drawable 显示”。
+ * ArcGIS REST 影像瓦片/动态影像请求集合，以及 FeatureServer / MapServer 矢量要素查询请求集合。
+ * 影像任务会在后台线程执行“计算请求范围 -> 影像缓存命中读取/缓存未命中下载 -> 解码 -> 必要时重投影 -> 显示”；
+ * 矢量任务会在后台线程执行“计算视口空间过滤范围 -> 矢量缓存命中读取/缓存未命中 query 请求 -> JSON 解析 -> 必要时坐标转换 -> Drawable 显示”。
  *
  * 线程模型：
  * - ViewStateChanged / LayersChanged 在 UI 线程进入本对象；
- * - 缓存读取、网络下载、图片解码、FeatureServer JSON 解析在内部 worker 线程执行；
+ * - 缓存读取、网络下载、图片解码、ArcGIS REST 矢量 JSON 解析在内部 worker 线程执行；
  * - 画布增删瓦片/矢量 Drawable 只通过 Qt::QueuedConnection 回到本对象所属线程后执行。
  *
  * 刷新模型：

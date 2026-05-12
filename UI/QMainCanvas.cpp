@@ -9,6 +9,7 @@
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QEvent>
+#include <QImage>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -38,6 +39,21 @@
 #include <stack>
 #include <unordered_set>
 #include <utility>
+
+
+struct QMainCanvasSpatialIndexNode
+{
+	GB_Rectangle extent;
+	std::vector<size_t> drawableIndices;
+	int firstChildIndex = -1;
+};
+
+struct QMainCanvasSpatialIndex
+{
+	GB_Rectangle extent;
+	std::vector<QMainCanvasSpatialIndexNode> nodes;
+	bool isValid = false;
+};
 
 namespace
 {
@@ -1407,23 +1423,481 @@ namespace
 
 }
 
-QMainCanvas::QMainCanvas(QWidget* parent) : QOpenGLWidget(parent)
+
+class QMainCanvas::Impl : protected QOpenGLFunctions
+{
+public:
+	explicit Impl(QMainCanvas* owner);
+	~Impl();
+
+	int width() const
+	{
+		return owner ? owner->width() : 0;
+	}
+
+	int height() const
+	{
+		return owner ? owner->height() : 0;
+	}
+
+	QRect rect() const
+	{
+		return owner ? owner->rect() : QRect();
+	}
+
+	void update()
+	{
+		if (owner)
+		{
+			owner->update();
+		}
+	}
+
+	void makeCurrent()
+	{
+		if (owner)
+		{
+			owner->makeCurrent();
+		}
+	}
+
+	void doneCurrent()
+	{
+		if (owner)
+		{
+			owner->doneCurrent();
+		}
+	}
+
+	QMainCanvas* owner = nullptr;
+
+
+	void SetCrsWkt(const std::string& wktUtf8);
+	const std::string& GetCrsWkt() const;
+	QString GetCrsDisplayText() const;
+	void SetClipMapTilesToCrsValidArea(bool enabled);
+	bool IsClipMapTilesToCrsValidAreaEnabled() const;
+	void SetCrsValidAreaVisible(bool visible, const GB_ColorRGBA& color = GB_ColorRGBA(255, 0, 0, 80));
+	void HideCrsValidArea();
+	bool GetCrsValidAreaVisible(GB_ColorRGBA& outColor) const;
+	void SetViewCenter(double centerX, double centerY);
+	void SetViewCenter(const GB_Point2d& center);
+	GB_Point2d GetViewCenter() const;
+	GB_Rectangle GetCurrentViewExtent() const;
+	bool TryGetCurrentViewExtent(GB_Rectangle& outExtent) const;
+	double GetPixelSize() const;
+	void SetViewExtent(const GB_Rectangle& extent);
+	void ZoomToExtent(const GB_Rectangle& extent, double marginRatio = 0.05);
+	bool TryGetCrsValidAreaPolygonsExtent(GB_Rectangle& outExtent) const;
+	bool ZoomToCrsValidArea(double marginRatio = 0.05);
+	void ZoomFull();
+	GB_Point2d WorldToScreen(const GB_Point2d& point) const;
+	GB_Point2d ScreenToWorld(const GB_Point2d& point) const;
+	bool TryGetCurrentMouseWorldPosition(GB_Point2d& outPosition) const;
+	void AddMapTile(const MapTileDrawable& tile);
+	void AddMapTile(const MapTileDrawable& tile, double layerNumber);
+	void AddMapTiles(const std::vector<MapTileDrawable>& tiles);
+	void AddPointDrawable(const PointDrawable& point);
+	void AddPointDrawable(const PointDrawable& point, double layerNumber);
+	void AddPointDrawable(PointDrawable&& point);
+	void AddPointDrawable(PointDrawable&& point, double layerNumber);
+	void AddPointDrawables(const std::vector<PointDrawable>& points);
+	void AddPointDrawables(std::vector<PointDrawable>&& points);
+	void AddPolylineDrawable(const PolylineDrawable& polyline);
+	void AddPolylineDrawable(const PolylineDrawable& polyline, double layerNumber);
+	void AddPolylineDrawable(PolylineDrawable&& polyline);
+	void AddPolylineDrawable(PolylineDrawable&& polyline, double layerNumber);
+	void AddPolylineDrawables(const std::vector<PolylineDrawable>& polylines);
+	void AddPolylineDrawables(std::vector<PolylineDrawable>&& polylines);
+	void AddPolygonDrawable(const PolygonDrawable& polygon);
+	void AddPolygonDrawable(const PolygonDrawable& polygon, double layerNumber);
+	void AddPolygonDrawable(PolygonDrawable&& polygon);
+	void AddPolygonDrawable(PolygonDrawable&& polygon, double layerNumber);
+	void AddPolygonDrawables(const std::vector<PolygonDrawable>& polygons);
+	void AddPolygonDrawables(std::vector<PolygonDrawable>&& polygons);
+	bool HasDrawables() const;
+	void ClearDrawables();
+	void RemoveDrawables(const std::vector<std::string>& drawablesUids);
+	void SetDrawablesVisible(const std::vector<std::string>& drawablesUids, bool visible);
+	void SetDrawablesLayerNumber(const std::vector<std::string>& drawablesUids, double layerNumber);
+	void SetRenderBackend(QMainCanvasRenderBackend backend);
+	QMainCanvasRenderBackend GetRenderBackend() const;
+	bool IsOpenGLRenderBackendUsable() const;
+	void initializeGL();
+	void resizeGL(int width, int height);
+	void paintGL();
+	void resizeEvent(QResizeEvent* event);
+	void mousePressEvent(QMouseEvent* event);
+	void mouseMoveEvent(QMouseEvent* event);
+	void mouseReleaseEvent(QMouseEvent* event);
+	void wheelEvent(QWheelEvent* event);
+	void leaveEvent(QEvent* event);
+	void dragEnterEvent(QDragEnterEvent* event);
+	void dragMoveEvent(QDragMoveEvent* event);
+	void dropEvent(QDropEvent* event);
+
+
+	struct CachedMapTile
+	{
+		MapTileDrawable tile;
+		QPixmap pixmap;
+		double tileExtentWidth = 0.0;
+		double tileExtentHeight = 0.0;
+		double inverseTileExtentWidth = 0.0;
+		double inverseTileExtentHeight = 0.0;
+		double pixmapWidth = 0.0;
+		double pixmapHeight = 0.0;
+		std::uint64_t insertionSequence = 0;
+	};
+
+	struct CachedPointDrawable
+	{
+		PointDrawable point;
+		GB_Rectangle extent;
+		double screenMarginPixels = 0.0;
+		std::uint64_t insertionSequence = 0;
+	};
+
+	struct CachedPolylineDrawable
+	{
+		PolylineDrawable polyline;
+		GB_Rectangle extent;
+		double screenMarginPixels = 0.0;
+		std::uint64_t insertionSequence = 0;
+	};
+
+	struct CachedPolygonDrawable
+	{
+		PolygonDrawable polygon;
+		GB_Rectangle extent;
+		double screenMarginPixels = 0.0;
+		std::uint64_t insertionSequence = 0;
+	};
+
+	enum class CachedDrawableKind
+	{
+		MapTile = 0,
+		Point,
+		Polyline,
+		Polygon
+	};
+
+	struct VisibleDrawableReference
+	{
+		CachedDrawableKind kind = CachedDrawableKind::MapTile;
+		size_t index = 0;
+	};
+
+
+	struct GpuPointVertex
+	{
+		float centerX = 0.0f;
+		float centerY = 0.0f;
+		float localX = 0.0f;
+		float localY = 0.0f;
+		float size = 1.0f;
+		float borderWidth = 0.0f;
+		float shape = 0.0f;
+		float filled = 1.0f;
+		float fillR = 1.0f;
+		float fillG = 0.0f;
+		float fillB = 0.0f;
+		float fillA = 1.0f;
+		float borderR = 0.0f;
+		float borderG = 0.0f;
+		float borderB = 0.0f;
+		float borderA = 1.0f;
+	};
+
+	struct GpuLineVertex
+	{
+		float startX = 0.0f;
+		float startY = 0.0f;
+		float endX = 0.0f;
+		float endY = 0.0f;
+		float side = 0.0f;
+		float endpoint = 0.0f;
+		float width = 1.0f;
+		float reserved = 0.0f;
+		float colorR = 1.0f;
+		float colorG = 0.0f;
+		float colorB = 0.0f;
+		float colorA = 1.0f;
+	};
+
+	struct GpuPolygonVertex
+	{
+		float x = 0.0f;
+		float y = 0.0f;
+		float colorR = 1.0f;
+		float colorG = 0.0f;
+		float colorB = 0.0f;
+		float colorA = 1.0f;
+	};
+
+	struct GpuVectorChunk
+	{
+		double layerNumber = 0.0;
+		std::uint64_t insertionSequence = 0;
+		GB_Rectangle extent;
+		double originX = 0.0;
+		double originY = 0.0;
+		std::vector<GpuPointVertex> pointVertices;
+		std::vector<GpuLineVertex> polylineVertices;
+		std::vector<GpuPolygonVertex> polygonFillVertices;
+		std::vector<GpuLineVertex> polygonBorderVertices;
+		mutable GLuint pointBufferId = 0;
+		mutable GLuint polylineBufferId = 0;
+		mutable GLuint polygonFillBufferId = 0;
+		mutable GLuint polygonBorderBufferId = 0;
+		mutable bool buffersUploaded = false;
+	};
+
+	struct OpenGLPaintReference
+	{
+		CachedDrawableKind kind = CachedDrawableKind::MapTile;
+		size_t index = 0;
+		double layerNumber = 0.0;
+		std::uint64_t insertionSequence = 0;
+	};
+
+	std::string crsWkt = "";
+	QString crsDisplayText;
+	GB_Rectangle viewExtent;
+	double pixelSize = 1;
+	bool clipMapTilesToCrsValidArea = false;
+	bool crsValidAreaVisible = false;
+	GB_ColorRGBA crsValidAreaColor = GB_ColorRGBA(255, 0, 0, 80);
+
+	QMainCanvasRenderBackend renderBackend = QMainCanvasRenderBackend::OpenGL;
+	bool openGLInitialized = false;
+	bool openGLProgramsReady = false;
+	bool openGLProgramsFailed = false;
+	std::unique_ptr<QOpenGLShaderProgram> openGLPointProgram;
+	std::unique_ptr<QOpenGLShaderProgram> openGLLineProgram;
+	std::unique_ptr<QOpenGLShaderProgram> openGLPolygonProgram;
+
+	mutable std::vector<std::vector<GB_Point2d>> crsValidAreaPolygonsCache;
+	mutable std::vector<GB_Rectangle> crsValidAreaPolygonExtentsCache;
+	mutable bool crsValidAreaPolygonsCacheDirty = true;
+	mutable std::string crsValidAreaPolygonsCacheCrsWkt;
+
+	mutable GB_Rectangle crsValidAreaRectCache;
+	mutable bool crsValidAreaRectCacheDirty = true;
+	mutable std::string crsValidAreaRectCacheCrsWkt;
+
+	mutable QPainterPath crsValidAreaScreenPathCache;
+	mutable GB_Rectangle crsValidAreaScreenPathWorldExtentCache;
+	mutable bool crsValidAreaScreenPathCacheDirty = true;
+	mutable GB_Rectangle crsValidAreaScreenPathCacheViewExtent;
+	mutable double crsValidAreaScreenPathCachePixelSize = 0.0;
+	mutable std::string crsValidAreaScreenPathCacheCrsWkt;
+
+	mutable bool crsMetersPerUnitCacheDirty = true;
+	mutable std::string crsMetersPerUnitCacheCrsWkt;
+	mutable double crsMetersPerUnitCache = 0.0;
+
+	std::vector<CachedMapTile> mapTiles;
+	std::vector<CachedPointDrawable> pointDrawables;
+	std::vector<CachedPolylineDrawable> polylineDrawables;
+	std::vector<CachedPolygonDrawable> polygonDrawables;
+	std::uint64_t nextDrawableInsertionSequence = 0;
+
+	mutable bool mapTileSpatialIndexDirty = true;
+	mutable std::vector<size_t> mapTileMinXOrderCache;
+	mutable std::vector<size_t> mapTileMaxXOrderCache;
+	mutable std::vector<size_t> mapTileVisibleIndexScratch;
+
+	mutable bool pointDrawableSpatialIndexDirty = true;
+	mutable QMainCanvasSpatialIndex pointDrawableSpatialIndexCache;
+	mutable std::vector<size_t> pointDrawableVisibleIndexScratch;
+
+	mutable bool polylineDrawableSpatialIndexDirty = true;
+	mutable QMainCanvasSpatialIndex polylineDrawableSpatialIndexCache;
+	mutable std::vector<size_t> polylineDrawableVisibleIndexScratch;
+
+	mutable bool polygonDrawableSpatialIndexDirty = true;
+	mutable QMainCanvasSpatialIndex polygonDrawableSpatialIndexCache;
+	mutable std::vector<size_t> polygonDrawableVisibleIndexScratch;
+
+	mutable bool openGLVectorCacheDirty = true;
+	mutable bool openGLVectorChunkSpatialIndexDirty = true;
+	mutable std::vector<GpuVectorChunk> openGLVectorChunks;
+	mutable QMainCanvasSpatialIndex openGLVectorChunkSpatialIndexCache;
+
+	mutable std::vector<VisibleDrawableReference> visibleDrawableReferenceScratch;
+	mutable std::vector<OpenGLPaintReference> openGLPaintReferenceScratch;
+	mutable std::vector<size_t> openGLVectorChunkVisibleIndexScratch;
+
+	mutable bool pointDrawableMaxScreenMarginCacheDirty = true;
+	mutable double pointDrawableMaxScreenMarginCache = 0.0;
+	mutable bool polylineDrawableMaxScreenMarginCacheDirty = true;
+	mutable double polylineDrawableMaxScreenMarginCache = 0.0;
+	mutable bool polygonDrawableMaxScreenMarginCacheDirty = true;
+	mutable double polygonDrawableMaxScreenMarginCache = 0.0;
+
+	mutable bool allDrawableExtentCacheDirty = true;
+	mutable GB_Rectangle allDrawableExtentCache;
+	bool isPanning = false;
+	QPoint lastPanPosition;
+	bool hasMousePosition = false;
+	QPoint lastMousePosition;
+
+	QTimer viewStateChangedDebounceTimer;
+
+	mutable QPixmap mapContentCache;
+	mutable bool isMapContentCacheDirty = true;
+	mutable GB_Rectangle mapContentCacheViewExtent;
+	mutable double mapContentCachePixelSize = 0.0;
+	mutable bool mapContentCacheClipMapTilesToCrsValidArea = false;
+	mutable std::string mapContentCacheCrsWkt;
+	mutable bool mapContentCacheCrsValidAreaVisible = false;
+	mutable GB_ColorRGBA mapContentCacheCrsValidAreaColor = GB_ColorRGBA(255, 0, 0, 80);
+
+	QPixmap panPreviewPixmap;
+	bool hasPanPreview = false;
+	GB_Rectangle panPreviewViewExtent;
+	double panPreviewPixelSize = 0.0;
+	bool hasPendingViewStateChanged = false;
+	bool hasEmittedViewState = false;
+	GB_Rectangle lastEmittedViewExtent;
+	double lastEmittedApproximateMetersPerPixel = 0.0;
+
+	QImage CreateQImageFromGBImage(const GB_Image& image) const;
+	QPixmap CreateQPixmapFromGBImage(const GB_Image& image) const;
+	static double NormalizeLayerNumber(double layerNumber);
+	static bool IsTopLayerNumber(double layerNumber);
+	static bool IsBottomLayerNumber(double layerNumber);
+	static int GetLayerPaintOrderGroup(double layerNumber);
+	static bool IsCachedDrawablePaintOrderLess(double firstLayerNumber, std::uint64_t firstInsertionSequence, double secondLayerNumber, std::uint64_t secondInsertionSequence);
+	static bool IsCachedMapTilePaintOrderLess(const CachedMapTile& firstTile, const CachedMapTile& secondTile);
+	bool IsVisibleDrawableReferencePaintOrderLess(const VisibleDrawableReference& firstReference, const VisibleDrawableReference& secondReference) const;
+	double GetVisibleDrawableReferenceLayerNumber(const VisibleDrawableReference& reference) const;
+	std::uint64_t GetVisibleDrawableReferenceInsertionSequence(const VisibleDrawableReference& reference) const;
+	bool TryCreateCachedMapTile(const MapTileDrawable& tile, double layerNumber, CachedMapTile& outCachedTile);
+	bool TryCreateCachedPointDrawable(PointDrawable point, double layerNumber, CachedPointDrawable& outCachedPoint);
+	bool TryCreateCachedPolylineDrawable(PolylineDrawable polyline, double layerNumber, CachedPolylineDrawable& outCachedPolyline);
+	bool TryCreateCachedPolygonDrawable(PolygonDrawable polygon, double layerNumber, CachedPolygonDrawable& outCachedPolygon);
+	void InsertCachedMapTile(CachedMapTile&& cachedTile);
+	void EnsureMapTileSpatialIndex() const;
+	void InvalidateMapTileSpatialIndex() const;
+	void CollectVisibleMapTileIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const;
+	void EnsurePointDrawableSpatialIndex() const;
+	void InvalidatePointDrawableSpatialIndex() const;
+	void CollectVisiblePointDrawableIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const;
+	bool CollectVisiblePointDrawableIndicesLimited(const GB_Rectangle& queryWorldExtent, size_t maxCount, std::vector<size_t>& outIndices) const;
+	void EnsurePolylineDrawableSpatialIndex() const;
+	void InvalidatePolylineDrawableSpatialIndex() const;
+	void CollectVisiblePolylineDrawableIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const;
+	bool CollectVisiblePolylineDrawableIndicesLimited(const GB_Rectangle& queryWorldExtent, size_t maxCount, std::vector<size_t>& outIndices) const;
+	void EnsurePolygonDrawableSpatialIndex() const;
+	void InvalidatePolygonDrawableSpatialIndex() const;
+	void CollectVisiblePolygonDrawableIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const;
+	bool CollectVisiblePolygonDrawableIndicesLimited(const GB_Rectangle& queryWorldExtent, size_t maxCount, std::vector<size_t>& outIndices) const;
+	void InvalidateVectorDrawableSpatialIndexes() const;
+	void InvalidateVectorDrawableMaxScreenMarginCaches() const;
+	double GetMaxPointDrawableScreenMarginPixels() const;
+	double GetMaxPolylineDrawableScreenMarginPixels() const;
+	double GetMaxPolygonDrawableScreenMarginPixels() const;
+	void DrawBackground(QPainter& painter) const;
+	void RenderWithQPainter(QPainter& painter, const QRectF& exposedRect) const;
+	void RenderWithOpenGLBackend(QPainter& painter, const QRectF& exposedRect);
+	void DrawDrawables(QPainter& painter, const QRectF& exposedRect) const;
+	bool EnsureOpenGLPrograms();
+	bool EnsureOpenGLVectorCache();
+	void InvalidateOpenGLVectorCache() const;
+	void DestroyOpenGLVectorBuffers();
+	void DestroyOpenGLResources();
+	void EnsureOpenGLVectorChunkSpatialIndex() const;
+	void CollectVisibleOpenGLVectorChunkIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const;
+	void UploadOpenGLVectorChunk(const GpuVectorChunk& chunk);
+	void DrawOpenGLVectorChunk(const GpuVectorChunk& chunk);
+	void DrawOpenGLPointChunk(const GpuVectorChunk& chunk);
+	void DrawOpenGLPolylineChunk(const GpuVectorChunk& chunk);
+	void DrawOpenGLPolygonFillChunk(const GpuVectorChunk& chunk);
+	void DrawOpenGLPolygonBorderChunk(const GpuVectorChunk& chunk);
+	void DrawCachedMapTile(QPainter& painter, const CachedMapTile& cachedTile, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect, const QPainterPath* crsClipPath, bool hasPreciseCrsClip, bool canUseCrsPolygonExtents) const;
+	void DrawCachedPointDrawable(QPainter& painter, const CachedPointDrawable& cachedPoint, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const;
+	void DrawCachedPolylineDrawable(QPainter& painter, const CachedPolylineDrawable& cachedPolyline, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const;
+	void DrawCachedPolygonDrawable(QPainter& painter, const CachedPolygonDrawable& cachedPolygon, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const;
+	void DrawCachedPointDrawableFastLod(QPainter& painter, const CachedPointDrawable& cachedPoint, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const;
+	void DrawCachedPolylineDrawableFastLod(QPainter& painter, const CachedPolylineDrawable& cachedPolyline, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const;
+	void DrawCachedPolygonDrawableFastLod(QPainter& painter, const CachedPolygonDrawable& cachedPolygon, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const;
+	void DrawVisibleDrawableReferencesExact(QPainter& painter, const QRectF& exposedRect, const GB_Rectangle& mapTileQueryWorldExtent, const GB_Rectangle& pointDrawQueryWorldExtent, const GB_Rectangle& polylineDrawQueryWorldExtent, const GB_Rectangle& polygonDrawQueryWorldExtent, const QPainterPath* crsClipPath, bool hasPreciseCrsClip, bool canUseCrsPolygonExtents) const;
+	void DrawVectorDrawablesFastLod(QPainter& painter, const QRectF& exposedRect, const GB_Rectangle& pointDrawQueryWorldExtent, const GB_Rectangle& polylineDrawQueryWorldExtent, const GB_Rectangle& polygonDrawQueryWorldExtent) const;
+	void DrawCoordinateAxes(QPainter& painter) const;
+	void DrawCrsValidArea(QPainter& painter) const;
+	void DrawMapContent(QPainter& painter, const QRectF& exposedRect) const;
+	void EnsureMapContentCache() const;
+	void InvalidateMapContentCache() const;
+	bool IsMapContentCacheValid() const;
+	//void DrawVectorDrawables(QPainter& painter) const;
+	//void DrawExtentMarkers(QPainter& painter) const;
+	void UpdateCrsDisplayText();
+	bool TryGetCrsValidArea(GB_Rectangle& outValidArea) const;
+	bool TryGetCachedCrsValidAreaPolygonsExtent(GB_Rectangle& outExtent) const;
+	bool TryBuildCrsValidAreaScreenPath(QPainterPath& outPath, GB_Rectangle& outWorldExtent) const;
+	bool TryGetCrsValidAreaScreenPathCache(const QPainterPath*& outPath, GB_Rectangle& outWorldExtent) const;
+	bool TryIntersectRectangleWithCrsValidAreaPolygons(const GB_Rectangle& rect, GB_Rectangle& outIntersectionExtent) const;
+	bool IsRectangleIntersectsCachedCrsValidAreaPolygonExtent(const GB_Rectangle& rect) const;
+	bool EnsureCrsValidAreaPolygonsCache() const;
+	void InvalidateCrsValidAreaPolygonsCache() const;
+	void InvalidateCrsValidAreaRectCache() const;
+	void InvalidateCrsValidAreaScreenPathCache() const;
+	double GetCrsMetersPerUnitCached() const;
+	void InvalidateCrsMetersPerUnitCache() const;
+
+	bool IsDrawableUidInSet(const std::vector<std::string>& drawablesUids, const std::string& uid) const;
+	bool HasVisibleMapTileIntersectingExtent(const GB_Rectangle& extent) const;
+	GB_Rectangle CalculateVisibleVectorDrawableExtent() const;
+	GB_Rectangle CalculateAllDrawableExtent() const;
+	void InvalidateAllDrawableExtentCache() const;
+
+	void SetViewExtentInternal(const GB_Rectangle& extent, bool emitSignal);
+	double GetMinimumPixelSizeForCurrentWidget() const;
+	double GetMaximumPixelSizeForCurrentWidget() const;
+	double ClampPixelSizeForCurrentWidget(double targetPixelSize) const;
+	GB_Point2d ClampViewCenterForPixelSize(const GB_Point2d& center, double targetPixelSize) const;
+	void UpdatePixelSizeFromViewExtent();
+	void UpdateViewExtentFromCenterAndPixelSize(const GB_Point2d& center);
+	GB_Rectangle MakeExtentByCenterAndPixelSize(const GB_Point2d& center, double targetPixelSize) const;
+	GB_Rectangle NormalizeExtentForCurrentWidget(const GB_Rectangle& extent) const;
+	GB_Rectangle EnsureUsableExtent(const GB_Rectangle& extent) const;
+	void ScheduleViewStateChanged();
+	void EmitViewExtentDisplayChangedIfNeeded(const GB_Rectangle& previousExtent);
+	bool SetMousePosition(const QPoint& position);
+	bool ClearMousePosition();
+	void EmitMousePositionChanged();
+	void ScheduleViewStateChangedWithDelay(int debounceIntervalMs);
+	void ScheduleWheelZoomViewStateChanged();
+	void FlushPendingViewStateChanged();
+	void EmitViewStateChanged();
+	bool ShouldEmitViewStateChanged(double approximateMetersPerPixel) const;
+	double CalculateApproximateMetersPerPixel() const;
+	QRectF WorldRectangleToScreenRectangle(const GB_Rectangle& rect) const;
+};
+
+QMainCanvas::Impl::Impl(QMainCanvas* inputOwner)
+	: owner(inputOwner)
 {
 	qRegisterMetaType<GB_Rectangle>("GB_Rectangle");
 	qRegisterMetaType<GB_Point2d>("GB_Point2d");
 
-	setMinimumSize(400, 300);
-	setMouseTracking(true);
-	setFocusPolicy(Qt::StrongFocus);
-	setAcceptDrops(true);
-	setAutoFillBackground(false);
-	setAttribute(Qt::WA_OpaquePaintEvent, true);
-	setUpdateBehavior(QOpenGLWidget::NoPartialUpdate);
+	if (owner)
+	{
+		owner->setMinimumSize(400, 300);
+		owner->setMouseTracking(true);
+		owner->setFocusPolicy(Qt::StrongFocus);
+		owner->setAcceptDrops(true);
+		owner->setAutoFillBackground(false);
+		owner->setAttribute(Qt::WA_OpaquePaintEvent, true);
+		owner->setUpdateBehavior(QOpenGLWidget::NoPartialUpdate);
+	}
 
 	viewStateChangedDebounceTimer.setSingleShot(true);
 	viewStateChangedDebounceTimer.setTimerType(Qt::PreciseTimer);
 	viewStateChangedDebounceTimer.setInterval(ViewStateChangedDebounceIntervalMs);
-	connect(&viewStateChangedDebounceTimer, &QTimer::timeout, this, [this]()
+	QObject::connect(&viewStateChangedDebounceTimer, &QTimer::timeout, owner, [this]()
 		{
 			FlushPendingViewStateChanged();
 		});
@@ -1434,14 +1908,24 @@ QMainCanvas::QMainCanvas(QWidget* parent) : QOpenGLWidget(parent)
 	UpdatePixelSizeFromViewExtent();
 }
 
-QMainCanvas::~QMainCanvas()
+QMainCanvas::Impl::~Impl()
 {
-	if (openGLInitialized)
+	if (openGLInitialized && owner)
 	{
 		makeCurrent();
 		DestroyOpenGLResources();
 		doneCurrent();
 	}
+}
+
+
+QMainCanvas::QMainCanvas(QWidget* parent)
+	: QOpenGLWidget(parent), impl(new Impl(this))
+{
+}
+
+QMainCanvas::~QMainCanvas()
+{
 }
 
 QString QMainCanvas::GetServiceNodeMimeType()
@@ -1471,6 +1955,321 @@ const std::string& QMainCanvas::GetCrsValidAreaDrawableUid()
 
 void QMainCanvas::SetCrsWkt(const std::string& wktUtf8)
 {
+	impl->SetCrsWkt(wktUtf8);
+}
+
+const std::string& QMainCanvas::GetCrsWkt() const
+{
+	return impl->GetCrsWkt();
+}
+
+QString QMainCanvas::GetCrsDisplayText() const
+{
+	return impl->GetCrsDisplayText();
+}
+
+void QMainCanvas::SetClipMapTilesToCrsValidArea(bool enabled)
+{
+	impl->SetClipMapTilesToCrsValidArea(enabled);
+}
+
+bool QMainCanvas::IsClipMapTilesToCrsValidAreaEnabled() const
+{
+	return impl->IsClipMapTilesToCrsValidAreaEnabled();
+}
+
+void QMainCanvas::SetCrsValidAreaVisible(bool visible, const GB_ColorRGBA& color)
+{
+	impl->SetCrsValidAreaVisible(visible, color);
+}
+
+void QMainCanvas::HideCrsValidArea()
+{
+	impl->HideCrsValidArea();
+}
+
+bool QMainCanvas::GetCrsValidAreaVisible(GB_ColorRGBA& outColor) const
+{
+	return impl->GetCrsValidAreaVisible(outColor);
+}
+
+void QMainCanvas::SetViewCenter(double centerX, double centerY)
+{
+	impl->SetViewCenter(centerX, centerY);
+}
+
+void QMainCanvas::SetViewCenter(const GB_Point2d& center)
+{
+	impl->SetViewCenter(center);
+}
+
+GB_Point2d QMainCanvas::GetViewCenter() const
+{
+	return impl->GetViewCenter();
+}
+
+GB_Rectangle QMainCanvas::GetCurrentViewExtent() const
+{
+	return impl->GetCurrentViewExtent();
+}
+
+bool QMainCanvas::TryGetCurrentViewExtent(GB_Rectangle& outExtent) const
+{
+	return impl->TryGetCurrentViewExtent(outExtent);
+}
+
+double QMainCanvas::GetPixelSize() const
+{
+	return impl->GetPixelSize();
+}
+
+void QMainCanvas::SetViewExtent(const GB_Rectangle& extent)
+{
+	impl->SetViewExtent(extent);
+}
+
+void QMainCanvas::ZoomToExtent(const GB_Rectangle& extent, double marginRatio)
+{
+	impl->ZoomToExtent(extent, marginRatio);
+}
+
+bool QMainCanvas::TryGetCrsValidAreaPolygonsExtent(GB_Rectangle& outExtent) const
+{
+	return impl->TryGetCrsValidAreaPolygonsExtent(outExtent);
+}
+
+bool QMainCanvas::ZoomToCrsValidArea(double marginRatio)
+{
+	return impl->ZoomToCrsValidArea(marginRatio);
+}
+
+void QMainCanvas::ZoomFull()
+{
+	impl->ZoomFull();
+}
+
+GB_Point2d QMainCanvas::WorldToScreen(const GB_Point2d& point) const
+{
+	return impl->WorldToScreen(point);
+}
+
+GB_Point2d QMainCanvas::ScreenToWorld(const GB_Point2d& point) const
+{
+	return impl->ScreenToWorld(point);
+}
+
+bool QMainCanvas::TryGetCurrentMouseWorldPosition(GB_Point2d& outPosition) const
+{
+	return impl->TryGetCurrentMouseWorldPosition(outPosition);
+}
+
+void QMainCanvas::AddMapTile(const MapTileDrawable& tile)
+{
+	impl->AddMapTile(tile);
+}
+
+void QMainCanvas::AddMapTile(const MapTileDrawable& tile, double layerNumber)
+{
+	impl->AddMapTile(tile, layerNumber);
+}
+
+void QMainCanvas::AddMapTiles(const std::vector<MapTileDrawable>& tiles)
+{
+	impl->AddMapTiles(tiles);
+}
+
+void QMainCanvas::AddPointDrawable(const PointDrawable& point)
+{
+	impl->AddPointDrawable(point);
+}
+
+void QMainCanvas::AddPointDrawable(const PointDrawable& point, double layerNumber)
+{
+	impl->AddPointDrawable(point, layerNumber);
+}
+
+void QMainCanvas::AddPointDrawable(PointDrawable&& point)
+{
+	impl->AddPointDrawable(std::move(point));
+}
+
+void QMainCanvas::AddPointDrawable(PointDrawable&& point, double layerNumber)
+{
+	impl->AddPointDrawable(std::move(point), layerNumber);
+}
+
+void QMainCanvas::AddPointDrawables(const std::vector<PointDrawable>& points)
+{
+	impl->AddPointDrawables(points);
+}
+
+void QMainCanvas::AddPointDrawables(std::vector<PointDrawable>&& points)
+{
+	impl->AddPointDrawables(std::move(points));
+}
+
+void QMainCanvas::AddPolylineDrawable(const PolylineDrawable& polyline)
+{
+	impl->AddPolylineDrawable(polyline);
+}
+
+void QMainCanvas::AddPolylineDrawable(const PolylineDrawable& polyline, double layerNumber)
+{
+	impl->AddPolylineDrawable(polyline, layerNumber);
+}
+
+void QMainCanvas::AddPolylineDrawable(PolylineDrawable&& polyline)
+{
+	impl->AddPolylineDrawable(std::move(polyline));
+}
+
+void QMainCanvas::AddPolylineDrawable(PolylineDrawable&& polyline, double layerNumber)
+{
+	impl->AddPolylineDrawable(std::move(polyline), layerNumber);
+}
+
+void QMainCanvas::AddPolylineDrawables(const std::vector<PolylineDrawable>& polylines)
+{
+	impl->AddPolylineDrawables(polylines);
+}
+
+void QMainCanvas::AddPolylineDrawables(std::vector<PolylineDrawable>&& polylines)
+{
+	impl->AddPolylineDrawables(std::move(polylines));
+}
+
+void QMainCanvas::AddPolygonDrawable(const PolygonDrawable& polygon)
+{
+	impl->AddPolygonDrawable(polygon);
+}
+
+void QMainCanvas::AddPolygonDrawable(const PolygonDrawable& polygon, double layerNumber)
+{
+	impl->AddPolygonDrawable(polygon, layerNumber);
+}
+
+void QMainCanvas::AddPolygonDrawable(PolygonDrawable&& polygon)
+{
+	impl->AddPolygonDrawable(std::move(polygon));
+}
+
+void QMainCanvas::AddPolygonDrawable(PolygonDrawable&& polygon, double layerNumber)
+{
+	impl->AddPolygonDrawable(std::move(polygon), layerNumber);
+}
+
+void QMainCanvas::AddPolygonDrawables(const std::vector<PolygonDrawable>& polygons)
+{
+	impl->AddPolygonDrawables(polygons);
+}
+
+void QMainCanvas::AddPolygonDrawables(std::vector<PolygonDrawable>&& polygons)
+{
+	impl->AddPolygonDrawables(std::move(polygons));
+}
+
+bool QMainCanvas::HasDrawables() const
+{
+	return impl->HasDrawables();
+}
+
+void QMainCanvas::ClearDrawables()
+{
+	impl->ClearDrawables();
+}
+
+void QMainCanvas::RemoveDrawables(const std::vector<std::string>& drawablesUids)
+{
+	impl->RemoveDrawables(drawablesUids);
+}
+
+void QMainCanvas::SetDrawablesVisible(const std::vector<std::string>& drawablesUids, bool visible)
+{
+	impl->SetDrawablesVisible(drawablesUids, visible);
+}
+
+void QMainCanvas::SetDrawablesLayerNumber(const std::vector<std::string>& drawablesUids, double layerNumber)
+{
+	impl->SetDrawablesLayerNumber(drawablesUids, layerNumber);
+}
+
+void QMainCanvas::SetRenderBackend(QMainCanvasRenderBackend backend)
+{
+	impl->SetRenderBackend(backend);
+}
+
+QMainCanvasRenderBackend QMainCanvas::GetRenderBackend() const
+{
+	return impl->GetRenderBackend();
+}
+
+bool QMainCanvas::IsOpenGLRenderBackendUsable() const
+{
+	return impl->IsOpenGLRenderBackendUsable();
+}
+
+void QMainCanvas::initializeGL()
+{
+	impl->initializeGL();
+}
+
+void QMainCanvas::resizeGL(int width, int height)
+{
+	impl->resizeGL(width, height);
+}
+
+void QMainCanvas::paintGL()
+{
+	impl->paintGL();
+}
+
+void QMainCanvas::resizeEvent(QResizeEvent* event)
+{
+	impl->resizeEvent(event);
+}
+
+void QMainCanvas::mousePressEvent(QMouseEvent* event)
+{
+	impl->mousePressEvent(event);
+}
+
+void QMainCanvas::mouseMoveEvent(QMouseEvent* event)
+{
+	impl->mouseMoveEvent(event);
+}
+
+void QMainCanvas::mouseReleaseEvent(QMouseEvent* event)
+{
+	impl->mouseReleaseEvent(event);
+}
+
+void QMainCanvas::wheelEvent(QWheelEvent* event)
+{
+	impl->wheelEvent(event);
+}
+
+void QMainCanvas::leaveEvent(QEvent* event)
+{
+	impl->leaveEvent(event);
+}
+
+void QMainCanvas::dragEnterEvent(QDragEnterEvent* event)
+{
+	impl->dragEnterEvent(event);
+}
+
+void QMainCanvas::dragMoveEvent(QDragMoveEvent* event)
+{
+	impl->dragMoveEvent(event);
+}
+
+void QMainCanvas::dropEvent(QDropEvent* event)
+{
+	impl->dropEvent(event);
+}
+
+void QMainCanvas::Impl::SetCrsWkt(const std::string& wktUtf8)
+{
 	if (crsWkt == wktUtf8)
 	{
 		return;
@@ -1489,17 +2288,17 @@ void QMainCanvas::SetCrsWkt(const std::string& wktUtf8)
 	update();
 }
 
-const std::string& QMainCanvas::GetCrsWkt() const
+const std::string& QMainCanvas::Impl::GetCrsWkt() const
 {
 	return crsWkt;
 }
 
-QString QMainCanvas::GetCrsDisplayText() const
+QString QMainCanvas::Impl::GetCrsDisplayText() const
 {
 	return crsDisplayText;
 }
 
-void QMainCanvas::SetClipMapTilesToCrsValidArea(bool enabled)
+void QMainCanvas::Impl::SetClipMapTilesToCrsValidArea(bool enabled)
 {
 	if (clipMapTilesToCrsValidArea == enabled)
 	{
@@ -1511,12 +2310,12 @@ void QMainCanvas::SetClipMapTilesToCrsValidArea(bool enabled)
 	update();
 }
 
-bool QMainCanvas::IsClipMapTilesToCrsValidAreaEnabled() const
+bool QMainCanvas::Impl::IsClipMapTilesToCrsValidAreaEnabled() const
 {
 	return clipMapTilesToCrsValidArea;
 }
 
-void QMainCanvas::SetCrsValidAreaVisible(bool visible, const GB_ColorRGBA& color)
+void QMainCanvas::Impl::SetCrsValidAreaVisible(bool visible, const GB_ColorRGBA& color)
 {
 	GB_ColorRGBA targetColor = crsValidAreaColor;
 	if (visible)
@@ -1537,18 +2336,18 @@ void QMainCanvas::SetCrsValidAreaVisible(bool visible, const GB_ColorRGBA& color
 	update();
 }
 
-void QMainCanvas::HideCrsValidArea()
+void QMainCanvas::Impl::HideCrsValidArea()
 {
 	SetCrsValidAreaVisible(false, crsValidAreaColor);
 }
 
-bool QMainCanvas::GetCrsValidAreaVisible(GB_ColorRGBA& outColor) const
+bool QMainCanvas::Impl::GetCrsValidAreaVisible(GB_ColorRGBA& outColor) const
 {
 	outColor = crsValidAreaColor;
 	return crsValidAreaVisible;
 }
 
-void QMainCanvas::UpdateCrsDisplayText()
+void QMainCanvas::Impl::UpdateCrsDisplayText()
 {
 	const QString previousCrsDisplayText = crsDisplayText;
 
@@ -1571,16 +2370,16 @@ void QMainCanvas::UpdateCrsDisplayText()
 
 	if (crsDisplayText != previousCrsDisplayText)
 	{
-		emit CrsDisplayTextChanged(crsDisplayText);
+		emit owner->CrsDisplayTextChanged(crsDisplayText);
 	}
 }
 
-void QMainCanvas::SetViewCenter(double centerX, double centerY)
+void QMainCanvas::Impl::SetViewCenter(double centerX, double centerY)
 {
 	SetViewCenter(GB_Point2d(centerX, centerY));
 }
 
-void QMainCanvas::SetViewCenter(const GB_Point2d& center)
+void QMainCanvas::Impl::SetViewCenter(const GB_Point2d& center)
 {
 	if (!center.IsValid())
 	{
@@ -1601,7 +2400,7 @@ void QMainCanvas::SetViewCenter(const GB_Point2d& center)
 	update();
 }
 
-GB_Point2d QMainCanvas::GetViewCenter() const
+GB_Point2d QMainCanvas::Impl::GetViewCenter() const
 {
 	if (!viewExtent.IsValid())
 	{
@@ -1610,12 +2409,12 @@ GB_Point2d QMainCanvas::GetViewCenter() const
 	return viewExtent.Center();
 }
 
-GB_Rectangle QMainCanvas::GetCurrentViewExtent() const
+GB_Rectangle QMainCanvas::Impl::GetCurrentViewExtent() const
 {
 	return viewExtent;
 }
 
-bool QMainCanvas::TryGetCurrentViewExtent(GB_Rectangle& outExtent) const
+bool QMainCanvas::Impl::TryGetCurrentViewExtent(GB_Rectangle& outExtent) const
 {
 	if (!viewExtent.IsValid())
 	{
@@ -1626,17 +2425,17 @@ bool QMainCanvas::TryGetCurrentViewExtent(GB_Rectangle& outExtent) const
 	return true;
 }
 
-double QMainCanvas::GetPixelSize() const
+double QMainCanvas::Impl::GetPixelSize() const
 {
 	return pixelSize;
 }
 
-void QMainCanvas::SetViewExtent(const GB_Rectangle& extent)
+void QMainCanvas::Impl::SetViewExtent(const GB_Rectangle& extent)
 {
 	SetViewExtentInternal(extent, true);
 }
 
-void QMainCanvas::ZoomToExtent(const GB_Rectangle& extent, double marginRatio)
+void QMainCanvas::Impl::ZoomToExtent(const GB_Rectangle& extent, double marginRatio)
 {
 	GB_Rectangle usableExtent = EnsureUsableExtent(extent);
 	if (!usableExtent.IsValid())
@@ -1651,7 +2450,7 @@ void QMainCanvas::ZoomToExtent(const GB_Rectangle& extent, double marginRatio)
 	SetViewExtentInternal(usableExtent, true);
 }
 
-bool QMainCanvas::TryGetCrsValidAreaPolygonsExtent(GB_Rectangle& outExtent) const
+bool QMainCanvas::Impl::TryGetCrsValidAreaPolygonsExtent(GB_Rectangle& outExtent) const
 {
 	outExtent.Reset();
 
@@ -1663,7 +2462,7 @@ bool QMainCanvas::TryGetCrsValidAreaPolygonsExtent(GB_Rectangle& outExtent) cons
 	return TryGetCrsValidArea(outExtent);
 }
 
-bool QMainCanvas::ZoomToCrsValidArea(double marginRatio)
+bool QMainCanvas::Impl::ZoomToCrsValidArea(double marginRatio)
 {
 	GB_Rectangle crsValidAreaExtent;
 	if (!TryGetCrsValidAreaPolygonsExtent(crsValidAreaExtent))
@@ -1675,7 +2474,7 @@ bool QMainCanvas::ZoomToCrsValidArea(double marginRatio)
 	return true;
 }
 
-void QMainCanvas::ZoomFull()
+void QMainCanvas::Impl::ZoomFull()
 {
 	GB_Rectangle allExtent;
 	allExtent.Reset();
@@ -1766,7 +2565,7 @@ void QMainCanvas::ZoomFull()
 	ZoomToExtent(allExtent, 0.05);
 }
 
-GB_Point2d QMainCanvas::WorldToScreen(const GB_Point2d& point) const
+GB_Point2d QMainCanvas::Impl::WorldToScreen(const GB_Point2d& point) const
 {
 	if (!point.IsValid() || !viewExtent.IsValid() || !IsFinitePositive(pixelSize))
 	{
@@ -1778,7 +2577,7 @@ GB_Point2d QMainCanvas::WorldToScreen(const GB_Point2d& point) const
 	return GB_Point2d(screenX, screenY);
 }
 
-GB_Point2d QMainCanvas::ScreenToWorld(const GB_Point2d& point) const
+GB_Point2d QMainCanvas::Impl::ScreenToWorld(const GB_Point2d& point) const
 {
 	if (!point.IsValid() || !viewExtent.IsValid() || !IsFinitePositive(pixelSize))
 	{
@@ -1790,7 +2589,7 @@ GB_Point2d QMainCanvas::ScreenToWorld(const GB_Point2d& point) const
 	return GB_Point2d(worldX, worldY);
 }
 
-bool QMainCanvas::TryGetCurrentMouseWorldPosition(GB_Point2d& outPosition) const
+bool QMainCanvas::Impl::TryGetCurrentMouseWorldPosition(GB_Point2d& outPosition) const
 {
 	outPosition = GB_Point2d(std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN());
 	if (!hasMousePosition)
@@ -1802,17 +2601,17 @@ bool QMainCanvas::TryGetCurrentMouseWorldPosition(GB_Point2d& outPosition) const
 	return outPosition.IsValid();
 }
 
-void QMainCanvas::AddMapTile(const MapTileDrawable& tile)
+void QMainCanvas::Impl::AddMapTile(const MapTileDrawable& tile)
 {
 	AddMapTile(tile, tile.layerNumber);
 }
 
-void QMainCanvas::AddMapTile(const MapTileDrawable& tile, double layerNumber)
+void QMainCanvas::Impl::AddMapTile(const MapTileDrawable& tile, double layerNumber)
 {
-	if (!IsInObjectThread(this))
+	if (!IsInObjectThread(owner))
 	{
 		std::shared_ptr<MapTileDrawable> tileData = std::make_shared<MapTileDrawable>(tile);
-		QMetaObject::invokeMethod(this, [this, tileData, layerNumber]()
+		QMetaObject::invokeMethod(owner, [this, tileData, layerNumber]()
 			{
 				AddMapTile(*tileData, layerNumber);
 			}, Qt::QueuedConnection);
@@ -1843,12 +2642,12 @@ void QMainCanvas::AddMapTile(const MapTileDrawable& tile, double layerNumber)
 	}
 }
 
-void QMainCanvas::AddMapTiles(const std::vector<MapTileDrawable>& tiles)
+void QMainCanvas::Impl::AddMapTiles(const std::vector<MapTileDrawable>& tiles)
 {
-	if (!IsInObjectThread(this))
+	if (!IsInObjectThread(owner))
 	{
 		std::shared_ptr<std::vector<MapTileDrawable>> tileData = std::make_shared<std::vector<MapTileDrawable>>(tiles);
-		QMetaObject::invokeMethod(this, [this, tileData]()
+		QMetaObject::invokeMethod(owner, [this, tileData]()
 			{
 				AddMapTiles(*tileData);
 			}, Qt::QueuedConnection);
@@ -1913,29 +2712,29 @@ void QMainCanvas::AddMapTiles(const std::vector<MapTileDrawable>& tiles)
 	}
 }
 
-void QMainCanvas::AddPointDrawable(const PointDrawable& point)
+void QMainCanvas::Impl::AddPointDrawable(const PointDrawable& point)
 {
 	AddPointDrawable(point, point.layerNumber);
 }
 
-void QMainCanvas::AddPointDrawable(const PointDrawable& point, double layerNumber)
+void QMainCanvas::Impl::AddPointDrawable(const PointDrawable& point, double layerNumber)
 {
 	PointDrawable pointCopy = point;
 	AddPointDrawable(std::move(pointCopy), layerNumber);
 }
 
-void QMainCanvas::AddPointDrawable(PointDrawable&& point)
+void QMainCanvas::Impl::AddPointDrawable(PointDrawable&& point)
 {
 	const double layerNumber = point.layerNumber;
 	AddPointDrawable(std::move(point), layerNumber);
 }
 
-void QMainCanvas::AddPointDrawable(PointDrawable&& point, double layerNumber)
+void QMainCanvas::Impl::AddPointDrawable(PointDrawable&& point, double layerNumber)
 {
-	if (!IsInObjectThread(this))
+	if (!IsInObjectThread(owner))
 	{
 		std::shared_ptr<PointDrawable> pointData = std::make_shared<PointDrawable>(std::move(point));
-		QMetaObject::invokeMethod(this, [this, pointData, layerNumber]()
+		QMetaObject::invokeMethod(owner, [this, pointData, layerNumber]()
 			{
 				AddPointDrawable(std::move(*pointData), layerNumber);
 			}, Qt::QueuedConnection);
@@ -1967,7 +2766,7 @@ void QMainCanvas::AddPointDrawable(PointDrawable&& point, double layerNumber)
 	}
 }
 
-void QMainCanvas::AddPointDrawables(const std::vector<PointDrawable>& points)
+void QMainCanvas::Impl::AddPointDrawables(const std::vector<PointDrawable>& points)
 {
 	if (points.empty())
 	{
@@ -1978,12 +2777,12 @@ void QMainCanvas::AddPointDrawables(const std::vector<PointDrawable>& points)
 	AddPointDrawables(std::move(pointCopies));
 }
 
-void QMainCanvas::AddPointDrawables(std::vector<PointDrawable>&& points)
+void QMainCanvas::Impl::AddPointDrawables(std::vector<PointDrawable>&& points)
 {
-	if (!IsInObjectThread(this))
+	if (!IsInObjectThread(owner))
 	{
 		std::shared_ptr<std::vector<PointDrawable>> pointData = std::make_shared<std::vector<PointDrawable>>(std::move(points));
-		QMetaObject::invokeMethod(this, [this, pointData]()
+		QMetaObject::invokeMethod(owner, [this, pointData]()
 			{
 				AddPointDrawables(std::move(*pointData));
 			}, Qt::QueuedConnection);
@@ -2038,29 +2837,29 @@ void QMainCanvas::AddPointDrawables(std::vector<PointDrawable>&& points)
 	}
 }
 
-void QMainCanvas::AddPolylineDrawable(const PolylineDrawable& polyline)
+void QMainCanvas::Impl::AddPolylineDrawable(const PolylineDrawable& polyline)
 {
 	AddPolylineDrawable(polyline, polyline.layerNumber);
 }
 
-void QMainCanvas::AddPolylineDrawable(const PolylineDrawable& polyline, double layerNumber)
+void QMainCanvas::Impl::AddPolylineDrawable(const PolylineDrawable& polyline, double layerNumber)
 {
 	PolylineDrawable polylineCopy = polyline;
 	AddPolylineDrawable(std::move(polylineCopy), layerNumber);
 }
 
-void QMainCanvas::AddPolylineDrawable(PolylineDrawable&& polyline)
+void QMainCanvas::Impl::AddPolylineDrawable(PolylineDrawable&& polyline)
 {
 	const double layerNumber = polyline.layerNumber;
 	AddPolylineDrawable(std::move(polyline), layerNumber);
 }
 
-void QMainCanvas::AddPolylineDrawable(PolylineDrawable&& polyline, double layerNumber)
+void QMainCanvas::Impl::AddPolylineDrawable(PolylineDrawable&& polyline, double layerNumber)
 {
-	if (!IsInObjectThread(this))
+	if (!IsInObjectThread(owner))
 	{
 		std::shared_ptr<PolylineDrawable> polylineData = std::make_shared<PolylineDrawable>(std::move(polyline));
-		QMetaObject::invokeMethod(this, [this, polylineData, layerNumber]()
+		QMetaObject::invokeMethod(owner, [this, polylineData, layerNumber]()
 			{
 				AddPolylineDrawable(std::move(*polylineData), layerNumber);
 			}, Qt::QueuedConnection);
@@ -2092,7 +2891,7 @@ void QMainCanvas::AddPolylineDrawable(PolylineDrawable&& polyline, double layerN
 	}
 }
 
-void QMainCanvas::AddPolylineDrawables(const std::vector<PolylineDrawable>& polylines)
+void QMainCanvas::Impl::AddPolylineDrawables(const std::vector<PolylineDrawable>& polylines)
 {
 	if (polylines.empty())
 	{
@@ -2103,12 +2902,12 @@ void QMainCanvas::AddPolylineDrawables(const std::vector<PolylineDrawable>& poly
 	AddPolylineDrawables(std::move(polylineCopies));
 }
 
-void QMainCanvas::AddPolylineDrawables(std::vector<PolylineDrawable>&& polylines)
+void QMainCanvas::Impl::AddPolylineDrawables(std::vector<PolylineDrawable>&& polylines)
 {
-	if (!IsInObjectThread(this))
+	if (!IsInObjectThread(owner))
 	{
 		std::shared_ptr<std::vector<PolylineDrawable>> polylineData = std::make_shared<std::vector<PolylineDrawable>>(std::move(polylines));
-		QMetaObject::invokeMethod(this, [this, polylineData]()
+		QMetaObject::invokeMethod(owner, [this, polylineData]()
 			{
 				AddPolylineDrawables(std::move(*polylineData));
 			}, Qt::QueuedConnection);
@@ -2163,29 +2962,29 @@ void QMainCanvas::AddPolylineDrawables(std::vector<PolylineDrawable>&& polylines
 	}
 }
 
-void QMainCanvas::AddPolygonDrawable(const PolygonDrawable& polygon)
+void QMainCanvas::Impl::AddPolygonDrawable(const PolygonDrawable& polygon)
 {
 	AddPolygonDrawable(polygon, polygon.layerNumber);
 }
 
-void QMainCanvas::AddPolygonDrawable(const PolygonDrawable& polygon, double layerNumber)
+void QMainCanvas::Impl::AddPolygonDrawable(const PolygonDrawable& polygon, double layerNumber)
 {
 	PolygonDrawable polygonCopy = polygon;
 	AddPolygonDrawable(std::move(polygonCopy), layerNumber);
 }
 
-void QMainCanvas::AddPolygonDrawable(PolygonDrawable&& polygon)
+void QMainCanvas::Impl::AddPolygonDrawable(PolygonDrawable&& polygon)
 {
 	const double layerNumber = polygon.layerNumber;
 	AddPolygonDrawable(std::move(polygon), layerNumber);
 }
 
-void QMainCanvas::AddPolygonDrawable(PolygonDrawable&& polygon, double layerNumber)
+void QMainCanvas::Impl::AddPolygonDrawable(PolygonDrawable&& polygon, double layerNumber)
 {
-	if (!IsInObjectThread(this))
+	if (!IsInObjectThread(owner))
 	{
 		std::shared_ptr<PolygonDrawable> polygonData = std::make_shared<PolygonDrawable>(std::move(polygon));
-		QMetaObject::invokeMethod(this, [this, polygonData, layerNumber]()
+		QMetaObject::invokeMethod(owner, [this, polygonData, layerNumber]()
 			{
 				AddPolygonDrawable(std::move(*polygonData), layerNumber);
 			}, Qt::QueuedConnection);
@@ -2217,7 +3016,7 @@ void QMainCanvas::AddPolygonDrawable(PolygonDrawable&& polygon, double layerNumb
 	}
 }
 
-void QMainCanvas::AddPolygonDrawables(const std::vector<PolygonDrawable>& polygons)
+void QMainCanvas::Impl::AddPolygonDrawables(const std::vector<PolygonDrawable>& polygons)
 {
 	if (polygons.empty())
 	{
@@ -2228,12 +3027,12 @@ void QMainCanvas::AddPolygonDrawables(const std::vector<PolygonDrawable>& polygo
 	AddPolygonDrawables(std::move(polygonCopies));
 }
 
-void QMainCanvas::AddPolygonDrawables(std::vector<PolygonDrawable>&& polygons)
+void QMainCanvas::Impl::AddPolygonDrawables(std::vector<PolygonDrawable>&& polygons)
 {
-	if (!IsInObjectThread(this))
+	if (!IsInObjectThread(owner))
 	{
 		std::shared_ptr<std::vector<PolygonDrawable>> polygonData = std::make_shared<std::vector<PolygonDrawable>>(std::move(polygons));
-		QMetaObject::invokeMethod(this, [this, polygonData]()
+		QMetaObject::invokeMethod(owner, [this, polygonData]()
 			{
 				AddPolygonDrawables(std::move(*polygonData));
 			}, Qt::QueuedConnection);
@@ -2288,12 +3087,12 @@ void QMainCanvas::AddPolygonDrawables(std::vector<PolygonDrawable>&& polygons)
 	}
 }
 
-bool QMainCanvas::HasDrawables() const
+bool QMainCanvas::Impl::HasDrawables() const
 {
 	return !mapTiles.empty() || !pointDrawables.empty() || !polylineDrawables.empty() || !polygonDrawables.empty();
 }
 
-void QMainCanvas::ClearDrawables()
+void QMainCanvas::Impl::ClearDrawables()
 {
 	const bool hadDrawables = HasDrawables();
 	mapTiles.clear();
@@ -2311,7 +3110,7 @@ void QMainCanvas::ClearDrawables()
 	}
 }
 
-void QMainCanvas::RemoveDrawables(const std::vector<std::string>& drawablesUids)
+void QMainCanvas::Impl::RemoveDrawables(const std::vector<std::string>& drawablesUids)
 {
 	if (drawablesUids.empty())
 	{
@@ -2382,7 +3181,7 @@ void QMainCanvas::RemoveDrawables(const std::vector<std::string>& drawablesUids)
 	}
 }
 
-void QMainCanvas::SetDrawablesVisible(const std::vector<std::string>& drawablesUids, bool visible)
+void QMainCanvas::Impl::SetDrawablesVisible(const std::vector<std::string>& drawablesUids, bool visible)
 {
 	if (drawablesUids.empty())
 	{
@@ -2391,7 +3190,7 @@ void QMainCanvas::SetDrawablesVisible(const std::vector<std::string>& drawablesU
 
 	const std::unordered_set<std::string> uidSet(drawablesUids.begin(), drawablesUids.end());
 
-	if (uidSet.find(GetCrsValidAreaDrawableUid()) != uidSet.end())
+	if (uidSet.find(QMainCanvas::GetCrsValidAreaDrawableUid()) != uidSet.end())
 	{
 		SetCrsValidAreaVisible(visible, crsValidAreaColor);
 	}
@@ -2462,7 +3261,7 @@ void QMainCanvas::SetDrawablesVisible(const std::vector<std::string>& drawablesU
 	}
 }
 
-void QMainCanvas::SetDrawablesLayerNumber(const std::vector<std::string>& drawablesUids, double layerNumber)
+void QMainCanvas::Impl::SetDrawablesLayerNumber(const std::vector<std::string>& drawablesUids, double layerNumber)
 {
 	if (drawablesUids.empty())
 	{
@@ -2525,7 +3324,7 @@ void QMainCanvas::SetDrawablesLayerNumber(const std::vector<std::string>& drawab
 	}
 }
 
-void QMainCanvas::SetRenderBackend(QMainCanvasRenderBackend backend)
+void QMainCanvas::Impl::SetRenderBackend(QMainCanvasRenderBackend backend)
 {
 	if (renderBackend == backend)
 	{
@@ -2537,17 +3336,17 @@ void QMainCanvas::SetRenderBackend(QMainCanvasRenderBackend backend)
 	update();
 }
 
-QMainCanvasRenderBackend QMainCanvas::GetRenderBackend() const
+QMainCanvasRenderBackend QMainCanvas::Impl::GetRenderBackend() const
 {
 	return renderBackend;
 }
 
-bool QMainCanvas::IsOpenGLRenderBackendUsable() const
+bool QMainCanvas::Impl::IsOpenGLRenderBackendUsable() const
 {
 	return openGLInitialized && !openGLProgramsFailed;
 }
 
-void QMainCanvas::initializeGL()
+void QMainCanvas::Impl::initializeGL()
 {
 	initializeOpenGLFunctions();
 	openGLInitialized = true;
@@ -2558,7 +3357,7 @@ void QMainCanvas::initializeGL()
 	glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
 }
 
-void QMainCanvas::resizeGL(int width, int height)
+void QMainCanvas::Impl::resizeGL(int width, int height)
 {
 	if (width > 0 && height > 0)
 	{
@@ -2566,7 +3365,7 @@ void QMainCanvas::resizeGL(int width, int height)
 	}
 }
 
-void QMainCanvas::paintGL()
+void QMainCanvas::Impl::paintGL()
 {
 	const QRectF exposedRect(rect());
 	glViewport(0, 0, std::max(1, width()), std::max(1, height()));
@@ -2575,7 +3374,7 @@ void QMainCanvas::paintGL()
 	glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
 	glClear(GL_COLOR_BUFFER_BIT);
 
-	QPainter painter(this);
+	QPainter painter(owner);
 	painter.setClipRect(exposedRect);
 
 	if (renderBackend == QMainCanvasRenderBackend::OpenGL && openGLInitialized && EnsureOpenGLPrograms())
@@ -2588,7 +3387,7 @@ void QMainCanvas::paintGL()
 	}
 }
 
-void QMainCanvas::RenderWithQPainter(QPainter& painter, const QRectF& exposedRect) const
+void QMainCanvas::Impl::RenderWithQPainter(QPainter& painter, const QRectF& exposedRect) const
 {
 	if (isPanning && hasPanPreview && !panPreviewPixmap.isNull() && viewExtent.IsValid() && panPreviewViewExtent.IsValid() && AreNearlyEqual(pixelSize, panPreviewPixelSize))
 	{
@@ -2615,9 +3414,9 @@ void QMainCanvas::RenderWithQPainter(QPainter& painter, const QRectF& exposedRec
 	}
 }
 
-void QMainCanvas::resizeEvent(QResizeEvent* event)
+void QMainCanvas::Impl::resizeEvent(QResizeEvent* event)
 {
-	QOpenGLWidget::resizeEvent(event);
+	owner->QOpenGLWidget::resizeEvent(event);
 	InvalidateMapContentCache();
 	hasPanPreview = false;
 	panPreviewPixmap = QPixmap();
@@ -2636,7 +3435,7 @@ void QMainCanvas::resizeEvent(QResizeEvent* event)
 	}
 }
 
-void QMainCanvas::mousePressEvent(QMouseEvent* event)
+void QMainCanvas::Impl::mousePressEvent(QMouseEvent* event)
 {
 	if (!event)
 	{
@@ -2663,15 +3462,15 @@ void QMainCanvas::mousePressEvent(QMouseEvent* event)
 
 		isPanning = true;
 		lastPanPosition = event->pos();
-		setCursor(Qt::ClosedHandCursor);
+		owner->setCursor(Qt::ClosedHandCursor);
 		event->accept();
 		return;
 	}
 
-	QOpenGLWidget::mousePressEvent(event);
+	owner->QOpenGLWidget::mousePressEvent(event);
 }
 
-void QMainCanvas::mouseMoveEvent(QMouseEvent* event)
+void QMainCanvas::Impl::mouseMoveEvent(QMouseEvent* event)
 {
 	if (!event)
 	{
@@ -2727,10 +3526,10 @@ void QMainCanvas::mouseMoveEvent(QMouseEvent* event)
 
 	Q_UNUSED(mousePositionChanged);
 
-	QOpenGLWidget::mouseMoveEvent(event);
+	owner->QOpenGLWidget::mouseMoveEvent(event);
 }
 
-void QMainCanvas::mouseReleaseEvent(QMouseEvent* event)
+void QMainCanvas::Impl::mouseReleaseEvent(QMouseEvent* event)
 {
 	if (!event)
 	{
@@ -2745,18 +3544,18 @@ void QMainCanvas::mouseReleaseEvent(QMouseEvent* event)
 		hasPanPreview = false;
 		panPreviewPixmap = QPixmap();
 		InvalidateMapContentCache();
-		unsetCursor();
+		owner->unsetCursor();
 		FlushPendingViewStateChanged();
 		update();
 		event->accept();
 		return;
 	}
 
-	QOpenGLWidget::mouseReleaseEvent(event);
+	owner->QOpenGLWidget::mouseReleaseEvent(event);
 }
 
 
-void QMainCanvas::wheelEvent(QWheelEvent* event)
+void QMainCanvas::Impl::wheelEvent(QWheelEvent* event)
 {
 	if (!event || !viewExtent.IsValid() || !IsFinitePositive(pixelSize))
 	{
@@ -2784,7 +3583,7 @@ void QMainCanvas::wheelEvent(QWheelEvent* event)
 			return;
 		}
 
-		QOpenGLWidget::wheelEvent(event);
+		owner->QOpenGLWidget::wheelEvent(event);
 		return;
 	}
 
@@ -2805,8 +3604,8 @@ void QMainCanvas::wheelEvent(QWheelEvent* event)
 	}
 
 	const double newPixelSize = ClampPixelSizeForCurrentWidget(pixelSize / zoomFactor);
-	const int canvasWidth = SafeWidgetWidth(this);
-	const int canvasHeight = SafeWidgetHeight(this);
+	const int canvasWidth = SafeWidgetWidth(owner);
+	const int canvasHeight = SafeWidgetHeight(owner);
 
 	const double minX = worldBefore.x - position.x() * newPixelSize;
 	const double maxY = worldBefore.y + position.y() * newPixelSize;
@@ -2847,13 +3646,13 @@ void QMainCanvas::wheelEvent(QWheelEvent* event)
 	event->accept();
 }
 
-void QMainCanvas::leaveEvent(QEvent* event)
+void QMainCanvas::Impl::leaveEvent(QEvent* event)
 {
 	ClearMousePosition();
-	QOpenGLWidget::leaveEvent(event);
+	owner->QOpenGLWidget::leaveEvent(event);
 }
 
-void QMainCanvas::dragEnterEvent(QDragEnterEvent* event)
+void QMainCanvas::Impl::dragEnterEvent(QDragEnterEvent* event)
 {
 	if (event && event->mimeData() && event->mimeData()->hasFormat(GetServiceNodeMimeType()))
 	{
@@ -2861,10 +3660,10 @@ void QMainCanvas::dragEnterEvent(QDragEnterEvent* event)
 		return;
 	}
 
-	QOpenGLWidget::dragEnterEvent(event);
+	owner->QOpenGLWidget::dragEnterEvent(event);
 }
 
-void QMainCanvas::dragMoveEvent(QDragMoveEvent* event)
+void QMainCanvas::Impl::dragMoveEvent(QDragMoveEvent* event)
 {
 	if (event && event->mimeData() && event->mimeData()->hasFormat(GetServiceNodeMimeType()))
 	{
@@ -2872,14 +3671,14 @@ void QMainCanvas::dragMoveEvent(QDragMoveEvent* event)
 		return;
 	}
 
-	QOpenGLWidget::dragMoveEvent(event);
+	owner->QOpenGLWidget::dragMoveEvent(event);
 }
 
-void QMainCanvas::dropEvent(QDropEvent* event)
+void QMainCanvas::Impl::dropEvent(QDropEvent* event)
 {
 	if (!event || !event->mimeData() || !event->mimeData()->hasFormat(GetServiceNodeMimeType()))
 	{
-		QOpenGLWidget::dropEvent(event);
+		owner->QOpenGLWidget::dropEvent(event);
 		return;
 	}
 
@@ -2904,11 +3703,11 @@ void QMainCanvas::dropEvent(QDropEvent* event)
 	const QString text = ReadStringValue("text");
 	const int nodeType = ReadIntValue("nodeType", 0);
 
-	emit LayerDropRequested(nodeUid, url, text, nodeType);
+	emit owner->LayerDropRequested(nodeUid, url, text, nodeType);
 	event->acceptProposedAction();
 }
 
-QImage QMainCanvas::CreateQImageFromGBImage(const GB_Image& image) const
+QImage QMainCanvas::Impl::CreateQImageFromGBImage(const GB_Image& image) const
 {
 	if (image.IsEmpty() || image.GetWidth() == 0 || image.GetHeight() == 0)
 	{
@@ -2991,7 +3790,7 @@ QImage QMainCanvas::CreateQImageFromGBImage(const GB_Image& image) const
 }
 
 
-QPixmap QMainCanvas::CreateQPixmapFromGBImage(const GB_Image& image) const
+QPixmap QMainCanvas::Impl::CreateQPixmapFromGBImage(const GB_Image& image) const
 {
 	const QImage qImage = CreateQImageFromGBImage(image);
 	if (qImage.isNull())
@@ -3002,27 +3801,27 @@ QPixmap QMainCanvas::CreateQPixmapFromGBImage(const GB_Image& image) const
 	return QPixmap::fromImage(qImage);
 }
 
-double QMainCanvas::NormalizeLayerNumber(double layerNumber)
+double QMainCanvas::Impl::NormalizeLayerNumber(double layerNumber)
 {
 	if (!std::isfinite(layerNumber))
 	{
-		return GetDefaultLayerNumber();
+		return QMainCanvas::GetDefaultLayerNumber();
 	}
 
 	return layerNumber;
 }
 
-bool QMainCanvas::IsTopLayerNumber(double layerNumber)
+bool QMainCanvas::Impl::IsTopLayerNumber(double layerNumber)
 {
-	return layerNumber == GetTopLayerNumber();
+	return layerNumber == QMainCanvas::GetTopLayerNumber();
 }
 
-bool QMainCanvas::IsBottomLayerNumber(double layerNumber)
+bool QMainCanvas::Impl::IsBottomLayerNumber(double layerNumber)
 {
-	return layerNumber == GetBottomLayerNumber();
+	return layerNumber == QMainCanvas::GetBottomLayerNumber();
 }
 
-int QMainCanvas::GetLayerPaintOrderGroup(double layerNumber)
+int QMainCanvas::Impl::GetLayerPaintOrderGroup(double layerNumber)
 {
 	if (IsBottomLayerNumber(layerNumber))
 	{
@@ -3037,7 +3836,7 @@ int QMainCanvas::GetLayerPaintOrderGroup(double layerNumber)
 	return 1;
 }
 
-bool QMainCanvas::IsCachedDrawablePaintOrderLess(double firstLayerNumber, std::uint64_t firstInsertionSequence, double secondLayerNumber, std::uint64_t secondInsertionSequence)
+bool QMainCanvas::Impl::IsCachedDrawablePaintOrderLess(double firstLayerNumber, std::uint64_t firstInsertionSequence, double secondLayerNumber, std::uint64_t secondInsertionSequence)
 {
 	const int firstGroup = GetLayerPaintOrderGroup(firstLayerNumber);
 	const int secondGroup = GetLayerPaintOrderGroup(secondLayerNumber);
@@ -3056,35 +3855,35 @@ bool QMainCanvas::IsCachedDrawablePaintOrderLess(double firstLayerNumber, std::u
 	return firstInsertionSequence < secondInsertionSequence;
 }
 
-bool QMainCanvas::IsCachedMapTilePaintOrderLess(const CachedMapTile& firstTile, const CachedMapTile& secondTile)
+bool QMainCanvas::Impl::IsCachedMapTilePaintOrderLess(const CachedMapTile& firstTile, const CachedMapTile& secondTile)
 {
 	return IsCachedDrawablePaintOrderLess(firstTile.tile.layerNumber, firstTile.insertionSequence, secondTile.tile.layerNumber, secondTile.insertionSequence);
 }
 
-bool QMainCanvas::IsVisibleDrawableReferencePaintOrderLess(const VisibleDrawableReference& firstReference, const VisibleDrawableReference& secondReference) const
+bool QMainCanvas::Impl::IsVisibleDrawableReferencePaintOrderLess(const VisibleDrawableReference& firstReference, const VisibleDrawableReference& secondReference) const
 {
 	return IsCachedDrawablePaintOrderLess(GetVisibleDrawableReferenceLayerNumber(firstReference), GetVisibleDrawableReferenceInsertionSequence(firstReference),
 		GetVisibleDrawableReferenceLayerNumber(secondReference), GetVisibleDrawableReferenceInsertionSequence(secondReference));
 }
 
-double QMainCanvas::GetVisibleDrawableReferenceLayerNumber(const VisibleDrawableReference& reference) const
+double QMainCanvas::Impl::GetVisibleDrawableReferenceLayerNumber(const VisibleDrawableReference& reference) const
 {
 	switch (reference.kind)
 	{
 	case CachedDrawableKind::MapTile:
-		return reference.index < mapTiles.size() ? mapTiles[reference.index].tile.layerNumber : GetDefaultLayerNumber();
+		return reference.index < mapTiles.size() ? mapTiles[reference.index].tile.layerNumber : QMainCanvas::GetDefaultLayerNumber();
 	case CachedDrawableKind::Point:
-		return reference.index < pointDrawables.size() ? pointDrawables[reference.index].point.layerNumber : GetDefaultLayerNumber();
+		return reference.index < pointDrawables.size() ? pointDrawables[reference.index].point.layerNumber : QMainCanvas::GetDefaultLayerNumber();
 	case CachedDrawableKind::Polyline:
-		return reference.index < polylineDrawables.size() ? polylineDrawables[reference.index].polyline.layerNumber : GetDefaultLayerNumber();
+		return reference.index < polylineDrawables.size() ? polylineDrawables[reference.index].polyline.layerNumber : QMainCanvas::GetDefaultLayerNumber();
 	case CachedDrawableKind::Polygon:
-		return reference.index < polygonDrawables.size() ? polygonDrawables[reference.index].polygon.layerNumber : GetDefaultLayerNumber();
+		return reference.index < polygonDrawables.size() ? polygonDrawables[reference.index].polygon.layerNumber : QMainCanvas::GetDefaultLayerNumber();
 	default:
-		return GetDefaultLayerNumber();
+		return QMainCanvas::GetDefaultLayerNumber();
 	}
 }
 
-std::uint64_t QMainCanvas::GetVisibleDrawableReferenceInsertionSequence(const VisibleDrawableReference& reference) const
+std::uint64_t QMainCanvas::Impl::GetVisibleDrawableReferenceInsertionSequence(const VisibleDrawableReference& reference) const
 {
 	switch (reference.kind)
 	{
@@ -3101,7 +3900,7 @@ std::uint64_t QMainCanvas::GetVisibleDrawableReferenceInsertionSequence(const Vi
 	}
 }
 
-bool QMainCanvas::TryCreateCachedMapTile(const MapTileDrawable& tile, double layerNumber, CachedMapTile& outCachedTile)
+bool QMainCanvas::Impl::TryCreateCachedMapTile(const MapTileDrawable& tile, double layerNumber, CachedMapTile& outCachedTile)
 {
 	outCachedTile = CachedMapTile();
 
@@ -3152,7 +3951,7 @@ bool QMainCanvas::TryCreateCachedMapTile(const MapTileDrawable& tile, double lay
 	return true;
 }
 
-bool QMainCanvas::TryCreateCachedPointDrawable(PointDrawable point, double layerNumber, CachedPointDrawable& outCachedPoint)
+bool QMainCanvas::Impl::TryCreateCachedPointDrawable(PointDrawable point, double layerNumber, CachedPointDrawable& outCachedPoint)
 {
 	outCachedPoint = CachedPointDrawable();
 	if (!IsPointFinite(point.position))
@@ -3186,7 +3985,7 @@ bool QMainCanvas::TryCreateCachedPointDrawable(PointDrawable point, double layer
 	return true;
 }
 
-bool QMainCanvas::TryCreateCachedPolylineDrawable(PolylineDrawable polyline, double layerNumber, CachedPolylineDrawable& outCachedPolyline)
+bool QMainCanvas::Impl::TryCreateCachedPolylineDrawable(PolylineDrawable polyline, double layerNumber, CachedPolylineDrawable& outCachedPolyline)
 {
 	outCachedPolyline = CachedPolylineDrawable();
 	if (polyline.vertices.size() < 2 || polyline.lineWidth <= 0 || polyline.lineColor.IsTransparent())
@@ -3216,7 +4015,7 @@ bool QMainCanvas::TryCreateCachedPolylineDrawable(PolylineDrawable polyline, dou
 	return true;
 }
 
-bool QMainCanvas::TryCreateCachedPolygonDrawable(PolygonDrawable polygon, double layerNumber, CachedPolygonDrawable& outCachedPolygon)
+bool QMainCanvas::Impl::TryCreateCachedPolygonDrawable(PolygonDrawable polygon, double layerNumber, CachedPolygonDrawable& outCachedPolygon)
 {
 	outCachedPolygon = CachedPolygonDrawable();
 	if (polygon.vertices.size() < 3)
@@ -3253,13 +4052,13 @@ bool QMainCanvas::TryCreateCachedPolygonDrawable(PolygonDrawable polygon, double
 	return true;
 }
 
-void QMainCanvas::InsertCachedMapTile(CachedMapTile&& cachedTile)
+void QMainCanvas::Impl::InsertCachedMapTile(CachedMapTile&& cachedTile)
 {
 	const auto insertIter = std::lower_bound(mapTiles.begin(), mapTiles.end(), cachedTile, IsCachedMapTilePaintOrderLess);
 	mapTiles.insert(insertIter, std::move(cachedTile));
 }
 
-void QMainCanvas::EnsureMapTileSpatialIndex() const
+void QMainCanvas::Impl::EnsureMapTileSpatialIndex() const
 {
 	if (!mapTileSpatialIndexDirty)
 	{
@@ -3308,7 +4107,7 @@ void QMainCanvas::EnsureMapTileSpatialIndex() const
 	mapTileSpatialIndexDirty = false;
 }
 
-void QMainCanvas::InvalidateMapTileSpatialIndex() const
+void QMainCanvas::Impl::InvalidateMapTileSpatialIndex() const
 {
 	mapTileSpatialIndexDirty = true;
 	mapTileMinXOrderCache.clear();
@@ -3316,7 +4115,7 @@ void QMainCanvas::InvalidateMapTileSpatialIndex() const
 	mapTileVisibleIndexScratch.clear();
 }
 
-void QMainCanvas::CollectVisibleMapTileIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const
+void QMainCanvas::Impl::CollectVisibleMapTileIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const
 {
 	outIndices.clear();
 
@@ -3387,11 +4186,18 @@ void QMainCanvas::CollectVisibleMapTileIndices(const GB_Rectangle& queryWorldExt
 
 	if (outIndices.size() > 1)
 	{
-		std::sort(outIndices.begin(), outIndices.end());
+		std::sort(outIndices.begin(), outIndices.end(), [this](size_t firstIndex, size_t secondIndex) -> bool
+			{
+				if (firstIndex >= mapTiles.size() || secondIndex >= mapTiles.size())
+				{
+					return firstIndex < secondIndex;
+				}
+				return IsCachedMapTilePaintOrderLess(mapTiles[firstIndex], mapTiles[secondIndex]);
+			});
 	}
 }
 
-void QMainCanvas::EnsurePointDrawableSpatialIndex() const
+void QMainCanvas::Impl::EnsurePointDrawableSpatialIndex() const
 {
 	if (!pointDrawableSpatialIndexDirty)
 	{
@@ -3405,7 +4211,7 @@ void QMainCanvas::EnsurePointDrawableSpatialIndex() const
 	pointDrawableSpatialIndexDirty = false;
 }
 
-void QMainCanvas::InvalidatePointDrawableSpatialIndex() const
+void QMainCanvas::Impl::InvalidatePointDrawableSpatialIndex() const
 {
 	pointDrawableSpatialIndexDirty = true;
 	ClearDrawableSpatialIndex(pointDrawableSpatialIndexCache);
@@ -3413,7 +4219,7 @@ void QMainCanvas::InvalidatePointDrawableSpatialIndex() const
 	InvalidateOpenGLVectorCache();
 }
 
-void QMainCanvas::CollectVisiblePointDrawableIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const
+void QMainCanvas::Impl::CollectVisiblePointDrawableIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const
 {
 	EnsurePointDrawableSpatialIndex();
 	CollectVisibleDrawableIndicesBySpatialIndexTree(pointDrawables, pointDrawableSpatialIndexCache, queryWorldExtent, outIndices,
@@ -3427,7 +4233,7 @@ void QMainCanvas::CollectVisiblePointDrawableIndices(const GB_Rectangle& queryWo
 		});
 }
 
-bool QMainCanvas::CollectVisiblePointDrawableIndicesLimited(const GB_Rectangle& queryWorldExtent, size_t maxCount, std::vector<size_t>& outIndices) const
+bool QMainCanvas::Impl::CollectVisiblePointDrawableIndicesLimited(const GB_Rectangle& queryWorldExtent, size_t maxCount, std::vector<size_t>& outIndices) const
 {
 	EnsurePointDrawableSpatialIndex();
 	return CollectVisibleDrawableIndicesBySpatialIndexTreeLimited(pointDrawables, pointDrawableSpatialIndexCache, queryWorldExtent, maxCount, outIndices,
@@ -3441,7 +4247,7 @@ bool QMainCanvas::CollectVisiblePointDrawableIndicesLimited(const GB_Rectangle& 
 		});
 }
 
-void QMainCanvas::EnsurePolylineDrawableSpatialIndex() const
+void QMainCanvas::Impl::EnsurePolylineDrawableSpatialIndex() const
 {
 	if (!polylineDrawableSpatialIndexDirty)
 	{
@@ -3455,7 +4261,7 @@ void QMainCanvas::EnsurePolylineDrawableSpatialIndex() const
 	polylineDrawableSpatialIndexDirty = false;
 }
 
-void QMainCanvas::InvalidatePolylineDrawableSpatialIndex() const
+void QMainCanvas::Impl::InvalidatePolylineDrawableSpatialIndex() const
 {
 	polylineDrawableSpatialIndexDirty = true;
 	ClearDrawableSpatialIndex(polylineDrawableSpatialIndexCache);
@@ -3463,7 +4269,7 @@ void QMainCanvas::InvalidatePolylineDrawableSpatialIndex() const
 	InvalidateOpenGLVectorCache();
 }
 
-void QMainCanvas::CollectVisiblePolylineDrawableIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const
+void QMainCanvas::Impl::CollectVisiblePolylineDrawableIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const
 {
 	EnsurePolylineDrawableSpatialIndex();
 	CollectVisibleDrawableIndicesBySpatialIndexTree(polylineDrawables, polylineDrawableSpatialIndexCache, queryWorldExtent, outIndices,
@@ -3477,7 +4283,7 @@ void QMainCanvas::CollectVisiblePolylineDrawableIndices(const GB_Rectangle& quer
 		});
 }
 
-bool QMainCanvas::CollectVisiblePolylineDrawableIndicesLimited(const GB_Rectangle& queryWorldExtent, size_t maxCount, std::vector<size_t>& outIndices) const
+bool QMainCanvas::Impl::CollectVisiblePolylineDrawableIndicesLimited(const GB_Rectangle& queryWorldExtent, size_t maxCount, std::vector<size_t>& outIndices) const
 {
 	EnsurePolylineDrawableSpatialIndex();
 	return CollectVisibleDrawableIndicesBySpatialIndexTreeLimited(polylineDrawables, polylineDrawableSpatialIndexCache, queryWorldExtent, maxCount, outIndices,
@@ -3491,7 +4297,7 @@ bool QMainCanvas::CollectVisiblePolylineDrawableIndicesLimited(const GB_Rectangl
 		});
 }
 
-void QMainCanvas::EnsurePolygonDrawableSpatialIndex() const
+void QMainCanvas::Impl::EnsurePolygonDrawableSpatialIndex() const
 {
 	if (!polygonDrawableSpatialIndexDirty)
 	{
@@ -3505,7 +4311,7 @@ void QMainCanvas::EnsurePolygonDrawableSpatialIndex() const
 	polygonDrawableSpatialIndexDirty = false;
 }
 
-void QMainCanvas::InvalidatePolygonDrawableSpatialIndex() const
+void QMainCanvas::Impl::InvalidatePolygonDrawableSpatialIndex() const
 {
 	polygonDrawableSpatialIndexDirty = true;
 	ClearDrawableSpatialIndex(polygonDrawableSpatialIndexCache);
@@ -3513,7 +4319,7 @@ void QMainCanvas::InvalidatePolygonDrawableSpatialIndex() const
 	InvalidateOpenGLVectorCache();
 }
 
-void QMainCanvas::CollectVisiblePolygonDrawableIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const
+void QMainCanvas::Impl::CollectVisiblePolygonDrawableIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const
 {
 	EnsurePolygonDrawableSpatialIndex();
 	CollectVisibleDrawableIndicesBySpatialIndexTree(polygonDrawables, polygonDrawableSpatialIndexCache, queryWorldExtent, outIndices,
@@ -3527,7 +4333,7 @@ void QMainCanvas::CollectVisiblePolygonDrawableIndices(const GB_Rectangle& query
 		});
 }
 
-bool QMainCanvas::CollectVisiblePolygonDrawableIndicesLimited(const GB_Rectangle& queryWorldExtent, size_t maxCount, std::vector<size_t>& outIndices) const
+bool QMainCanvas::Impl::CollectVisiblePolygonDrawableIndicesLimited(const GB_Rectangle& queryWorldExtent, size_t maxCount, std::vector<size_t>& outIndices) const
 {
 	EnsurePolygonDrawableSpatialIndex();
 	return CollectVisibleDrawableIndicesBySpatialIndexTreeLimited(polygonDrawables, polygonDrawableSpatialIndexCache, queryWorldExtent, maxCount, outIndices,
@@ -3541,14 +4347,14 @@ bool QMainCanvas::CollectVisiblePolygonDrawableIndicesLimited(const GB_Rectangle
 		});
 }
 
-void QMainCanvas::InvalidateVectorDrawableSpatialIndexes() const
+void QMainCanvas::Impl::InvalidateVectorDrawableSpatialIndexes() const
 {
 	InvalidatePointDrawableSpatialIndex();
 	InvalidatePolylineDrawableSpatialIndex();
 	InvalidatePolygonDrawableSpatialIndex();
 }
 
-void QMainCanvas::InvalidateVectorDrawableMaxScreenMarginCaches() const
+void QMainCanvas::Impl::InvalidateVectorDrawableMaxScreenMarginCaches() const
 {
 	pointDrawableMaxScreenMarginCacheDirty = true;
 	pointDrawableMaxScreenMarginCache = 0.0;
@@ -3558,7 +4364,7 @@ void QMainCanvas::InvalidateVectorDrawableMaxScreenMarginCaches() const
 	polygonDrawableMaxScreenMarginCache = 0.0;
 }
 
-double QMainCanvas::GetMaxPointDrawableScreenMarginPixels() const
+double QMainCanvas::Impl::GetMaxPointDrawableScreenMarginPixels() const
 {
 	if (!pointDrawableMaxScreenMarginCacheDirty)
 	{
@@ -3579,7 +4385,7 @@ double QMainCanvas::GetMaxPointDrawableScreenMarginPixels() const
 	return pointDrawableMaxScreenMarginCache;
 }
 
-double QMainCanvas::GetMaxPolylineDrawableScreenMarginPixels() const
+double QMainCanvas::Impl::GetMaxPolylineDrawableScreenMarginPixels() const
 {
 	if (!polylineDrawableMaxScreenMarginCacheDirty)
 	{
@@ -3600,7 +4406,7 @@ double QMainCanvas::GetMaxPolylineDrawableScreenMarginPixels() const
 	return polylineDrawableMaxScreenMarginCache;
 }
 
-double QMainCanvas::GetMaxPolygonDrawableScreenMarginPixels() const
+double QMainCanvas::Impl::GetMaxPolygonDrawableScreenMarginPixels() const
 {
 	if (!polygonDrawableMaxScreenMarginCacheDirty)
 	{
@@ -3621,13 +4427,13 @@ double QMainCanvas::GetMaxPolygonDrawableScreenMarginPixels() const
 	return polygonDrawableMaxScreenMarginCache;
 }
 
-void QMainCanvas::DrawBackground(QPainter& painter) const
+void QMainCanvas::Impl::DrawBackground(QPainter& painter) const
 {
 	painter.fillRect(rect(), Qt::white);
 }
 
 
-bool QMainCanvas::EnsureOpenGLPrograms()
+bool QMainCanvas::Impl::EnsureOpenGLPrograms()
 {
 	if (openGLProgramsReady)
 	{
@@ -3848,7 +4654,7 @@ bool QMainCanvas::EnsureOpenGLPrograms()
 	return true;
 }
 
-void QMainCanvas::InvalidateOpenGLVectorCache() const
+void QMainCanvas::Impl::InvalidateOpenGLVectorCache() const
 {
 	openGLVectorCacheDirty = true;
 	openGLVectorChunkSpatialIndexDirty = true;
@@ -3856,7 +4662,7 @@ void QMainCanvas::InvalidateOpenGLVectorCache() const
 	openGLVectorChunkVisibleIndexScratch.clear();
 }
 
-void QMainCanvas::DestroyOpenGLVectorBuffers()
+void QMainCanvas::Impl::DestroyOpenGLVectorBuffers()
 {
 	if (!openGLInitialized)
 	{
@@ -3889,7 +4695,7 @@ void QMainCanvas::DestroyOpenGLVectorBuffers()
 	}
 }
 
-void QMainCanvas::DestroyOpenGLResources()
+void QMainCanvas::Impl::DestroyOpenGLResources()
 {
 	DestroyOpenGLVectorBuffers();
 	openGLVectorChunks.clear();
@@ -3901,7 +4707,7 @@ void QMainCanvas::DestroyOpenGLResources()
 	openGLProgramsFailed = false;
 }
 
-bool QMainCanvas::EnsureOpenGLVectorCache()
+bool QMainCanvas::Impl::EnsureOpenGLVectorCache()
 {
 	if (!openGLVectorCacheDirty)
 	{
@@ -3958,7 +4764,7 @@ bool QMainCanvas::EnsureOpenGLVectorCache()
 
 	std::sort(references.begin(), references.end(), [](const BuildReference& firstReference, const BuildReference& secondReference) -> bool
 		{
-			return QMainCanvas::IsCachedDrawablePaintOrderLess(firstReference.layerNumber, firstReference.insertionSequence, secondReference.layerNumber, secondReference.insertionSequence);
+			return QMainCanvas::Impl::IsCachedDrawablePaintOrderLess(firstReference.layerNumber, firstReference.insertionSequence, secondReference.layerNumber, secondReference.insertionSequence);
 		});
 
 	GpuVectorChunk* currentChunk = nullptr;
@@ -4139,7 +4945,7 @@ bool QMainCanvas::EnsureOpenGLVectorCache()
 	return true;
 }
 
-void QMainCanvas::EnsureOpenGLVectorChunkSpatialIndex() const
+void QMainCanvas::Impl::EnsureOpenGLVectorChunkSpatialIndex() const
 {
 	if (!openGLVectorChunkSpatialIndexDirty)
 	{
@@ -4153,7 +4959,7 @@ void QMainCanvas::EnsureOpenGLVectorChunkSpatialIndex() const
 	openGLVectorChunkSpatialIndexDirty = false;
 }
 
-void QMainCanvas::CollectVisibleOpenGLVectorChunkIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const
+void QMainCanvas::Impl::CollectVisibleOpenGLVectorChunkIndices(const GB_Rectangle& queryWorldExtent, std::vector<size_t>& outIndices) const
 {
 	EnsureOpenGLVectorChunkSpatialIndex();
 	CollectVisibleDrawableIndicesBySpatialIndexTree(openGLVectorChunks, openGLVectorChunkSpatialIndexCache, queryWorldExtent, outIndices,
@@ -4167,7 +4973,7 @@ void QMainCanvas::CollectVisibleOpenGLVectorChunkIndices(const GB_Rectangle& que
 		});
 }
 
-void QMainCanvas::UploadOpenGLVectorChunk(const GpuVectorChunk& chunk)
+void QMainCanvas::Impl::UploadOpenGLVectorChunk(const GpuVectorChunk& chunk)
 {
 	if (chunk.buffersUploaded || !openGLInitialized)
 	{
@@ -4196,7 +5002,7 @@ void QMainCanvas::UploadOpenGLVectorChunk(const GpuVectorChunk& chunk)
 	chunk.buffersUploaded = true;
 }
 
-void QMainCanvas::DrawOpenGLVectorChunk(const GpuVectorChunk& chunk)
+void QMainCanvas::Impl::DrawOpenGLVectorChunk(const GpuVectorChunk& chunk)
 {
 	UploadOpenGLVectorChunk(chunk);
 	DrawOpenGLPolygonFillChunk(chunk);
@@ -4205,7 +5011,7 @@ void QMainCanvas::DrawOpenGLVectorChunk(const GpuVectorChunk& chunk)
 	DrawOpenGLPointChunk(chunk);
 }
 
-void QMainCanvas::DrawOpenGLPointChunk(const GpuVectorChunk& chunk)
+void QMainCanvas::Impl::DrawOpenGLPointChunk(const GpuVectorChunk& chunk)
 {
 	if (!openGLPointProgram || chunk.pointBufferId == 0 || chunk.pointVertices.empty())
 	{
@@ -4253,7 +5059,7 @@ void QMainCanvas::DrawOpenGLPointChunk(const GpuVectorChunk& chunk)
 	openGLPointProgram->release();
 }
 
-void QMainCanvas::DrawOpenGLPolylineChunk(const GpuVectorChunk& chunk)
+void QMainCanvas::Impl::DrawOpenGLPolylineChunk(const GpuVectorChunk& chunk)
 {
 	if (!openGLLineProgram || chunk.polylineBufferId == 0 || chunk.polylineVertices.empty())
 	{
@@ -4293,7 +5099,7 @@ void QMainCanvas::DrawOpenGLPolylineChunk(const GpuVectorChunk& chunk)
 	openGLLineProgram->release();
 }
 
-void QMainCanvas::DrawOpenGLPolygonFillChunk(const GpuVectorChunk& chunk)
+void QMainCanvas::Impl::DrawOpenGLPolygonFillChunk(const GpuVectorChunk& chunk)
 {
 	if (!openGLPolygonProgram || chunk.polygonFillBufferId == 0 || chunk.polygonFillVertices.empty())
 	{
@@ -4329,7 +5135,7 @@ void QMainCanvas::DrawOpenGLPolygonFillChunk(const GpuVectorChunk& chunk)
 	openGLPolygonProgram->release();
 }
 
-void QMainCanvas::DrawOpenGLPolygonBorderChunk(const GpuVectorChunk& chunk)
+void QMainCanvas::Impl::DrawOpenGLPolygonBorderChunk(const GpuVectorChunk& chunk)
 {
 	if (!openGLLineProgram || chunk.polygonBorderBufferId == 0 || chunk.polygonBorderVertices.empty())
 	{
@@ -4369,7 +5175,7 @@ void QMainCanvas::DrawOpenGLPolygonBorderChunk(const GpuVectorChunk& chunk)
 	openGLLineProgram->release();
 }
 
-void QMainCanvas::RenderWithOpenGLBackend(QPainter& painter, const QRectF& exposedRect)
+void QMainCanvas::Impl::RenderWithOpenGLBackend(QPainter& painter, const QRectF& exposedRect)
 {
 	if (!viewExtent.IsValid() || !IsFinitePositive(pixelSize))
 	{
@@ -4491,7 +5297,7 @@ void QMainCanvas::RenderWithOpenGLBackend(QPainter& painter, const QRectF& expos
 
 	std::sort(openGLPaintReferenceScratch.begin(), openGLPaintReferenceScratch.end(), [](const OpenGLPaintReference& firstReference, const OpenGLPaintReference& secondReference) -> bool
 		{
-			return QMainCanvas::IsCachedDrawablePaintOrderLess(firstReference.layerNumber, firstReference.insertionSequence, secondReference.layerNumber, secondReference.insertionSequence);
+			return QMainCanvas::Impl::IsCachedDrawablePaintOrderLess(firstReference.layerNumber, firstReference.insertionSequence, secondReference.layerNumber, secondReference.insertionSequence);
 		});
 
 	for (const OpenGLPaintReference& reference : openGLPaintReferenceScratch)
@@ -4524,7 +5330,7 @@ void QMainCanvas::RenderWithOpenGLBackend(QPainter& painter, const QRectF& expos
 	DrawCrsValidArea(painter);
 }
 
-bool QMainCanvas::TryGetCrsValidArea(GB_Rectangle& outValidArea) const
+bool QMainCanvas::Impl::TryGetCrsValidArea(GB_Rectangle& outValidArea) const
 {
 	outValidArea.Reset();
 
@@ -4572,7 +5378,7 @@ bool QMainCanvas::TryGetCrsValidArea(GB_Rectangle& outValidArea) const
 	return true;
 }
 
-bool QMainCanvas::TryGetCachedCrsValidAreaPolygonsExtent(GB_Rectangle& outExtent) const
+bool QMainCanvas::Impl::TryGetCachedCrsValidAreaPolygonsExtent(GB_Rectangle& outExtent) const
 {
 	outExtent.Reset();
 
@@ -4615,7 +5421,7 @@ bool QMainCanvas::TryGetCachedCrsValidAreaPolygonsExtent(GB_Rectangle& outExtent
 	return outExtent.IsValid();
 }
 
-bool QMainCanvas::TryBuildCrsValidAreaScreenPath(QPainterPath& outPath, GB_Rectangle& outWorldExtent) const
+bool QMainCanvas::Impl::TryBuildCrsValidAreaScreenPath(QPainterPath& outPath, GB_Rectangle& outWorldExtent) const
 {
 	outPath = QPainterPath();
 	outPath.setFillRule(Qt::WindingFill);
@@ -4631,7 +5437,7 @@ bool QMainCanvas::TryBuildCrsValidAreaScreenPath(QPainterPath& outPath, GB_Recta
 	return true;
 }
 
-bool QMainCanvas::TryGetCrsValidAreaScreenPathCache(const QPainterPath*& outPath, GB_Rectangle& outWorldExtent) const
+bool QMainCanvas::Impl::TryGetCrsValidAreaScreenPathCache(const QPainterPath*& outPath, GB_Rectangle& outWorldExtent) const
 {
 	outPath = nullptr;
 	outWorldExtent.Reset();
@@ -4752,7 +5558,7 @@ bool QMainCanvas::TryGetCrsValidAreaScreenPathCache(const QPainterPath*& outPath
 	return true;
 }
 
-bool QMainCanvas::TryIntersectRectangleWithCrsValidAreaPolygons(const GB_Rectangle& rect, GB_Rectangle& outIntersectionExtent) const
+bool QMainCanvas::Impl::TryIntersectRectangleWithCrsValidAreaPolygons(const GB_Rectangle& rect, GB_Rectangle& outIntersectionExtent) const
 {
 	outIntersectionExtent.Reset();
 
@@ -4804,7 +5610,7 @@ bool QMainCanvas::TryIntersectRectangleWithCrsValidAreaPolygons(const GB_Rectang
 	return outIntersectionExtent.IsValid();
 }
 
-bool QMainCanvas::IsRectangleIntersectsCachedCrsValidAreaPolygonExtent(const GB_Rectangle& rect) const
+bool QMainCanvas::Impl::IsRectangleIntersectsCachedCrsValidAreaPolygonExtent(const GB_Rectangle& rect) const
 {
 	if (!rect.IsValid())
 	{
@@ -4851,7 +5657,7 @@ bool QMainCanvas::IsRectangleIntersectsCachedCrsValidAreaPolygonExtent(const GB_
 	return false;
 }
 
-void QMainCanvas::DrawDrawables(QPainter& painter, const QRectF& exposedRect) const
+void QMainCanvas::Impl::DrawDrawables(QPainter& painter, const QRectF& exposedRect) const
 {
 	if (!viewExtent.IsValid() || !IsFinitePositive(pixelSize))
 	{
@@ -5016,7 +5822,7 @@ void QMainCanvas::DrawDrawables(QPainter& painter, const QRectF& exposedRect) co
 	painter.setRenderHint(QPainter::Antialiasing, false);
 }
 
-void QMainCanvas::DrawVisibleDrawableReferencesExact(QPainter& painter, const QRectF& exposedRect, const GB_Rectangle& mapTileQueryWorldExtent,
+void QMainCanvas::Impl::DrawVisibleDrawableReferencesExact(QPainter& painter, const QRectF& exposedRect, const GB_Rectangle& mapTileQueryWorldExtent,
 	const GB_Rectangle& pointDrawQueryWorldExtent, const GB_Rectangle& polylineDrawQueryWorldExtent, const GB_Rectangle& polygonDrawQueryWorldExtent,
 	const QPainterPath* crsClipPath, bool hasPreciseCrsClip, bool canUseCrsPolygonExtents) const
 {
@@ -5064,7 +5870,7 @@ void QMainCanvas::DrawVisibleDrawableReferencesExact(QPainter& painter, const QR
 	}
 }
 
-void QMainCanvas::DrawVectorDrawablesFastLod(QPainter& painter, const QRectF& exposedRect, const GB_Rectangle& pointDrawQueryWorldExtent,
+void QMainCanvas::Impl::DrawVectorDrawablesFastLod(QPainter& painter, const QRectF& exposedRect, const GB_Rectangle& pointDrawQueryWorldExtent,
 	const GB_Rectangle& polylineDrawQueryWorldExtent, const GB_Rectangle& polygonDrawQueryWorldExtent) const
 {
 	const auto MakeUsableScreenRect = [](const QRectF& inputRect) -> QRectF
@@ -5278,12 +6084,12 @@ void QMainCanvas::DrawVectorDrawablesFastLod(QPainter& painter, const QRectF& ex
 	painter.setRenderHint(QPainter::Antialiasing, oldAntialiasing);
 }
 
-void QMainCanvas::DrawCachedPointDrawableFastLod(QPainter& painter, const CachedPointDrawable& cachedPoint, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const
+void QMainCanvas::Impl::DrawCachedPointDrawableFastLod(QPainter& painter, const CachedPointDrawable& cachedPoint, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const
 {
 	DrawCachedPointDrawable(painter, cachedPoint, queryWorldExtent, exposedRect);
 }
 
-void QMainCanvas::DrawCachedPolylineDrawableFastLod(QPainter& painter, const CachedPolylineDrawable& cachedPolyline, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const
+void QMainCanvas::Impl::DrawCachedPolylineDrawableFastLod(QPainter& painter, const CachedPolylineDrawable& cachedPolyline, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const
 {
 	if (!cachedPolyline.polyline.visible || cachedPolyline.polyline.vertices.size() < 2 || cachedPolyline.polyline.lineWidth <= 0 || cachedPolyline.polyline.lineColor.IsTransparent())
 	{
@@ -5327,7 +6133,7 @@ void QMainCanvas::DrawCachedPolylineDrawableFastLod(QPainter& painter, const Cac
 	painter.drawLine(startPoint, endPoint);
 }
 
-void QMainCanvas::DrawCachedPolygonDrawableFastLod(QPainter& painter, const CachedPolygonDrawable& cachedPolygon, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const
+void QMainCanvas::Impl::DrawCachedPolygonDrawableFastLod(QPainter& painter, const CachedPolygonDrawable& cachedPolygon, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const
 {
 	// Fast LOD 只负责“少画多少个对象”，不应改变单个 PolygonDrawable 的几何语义。
 	// 旧实现用 extent 的屏幕包围盒 fillRect/drawRect 表示多边形，缩小到 LOD 阈值后会把所有面对象显示成矩形。
@@ -5335,7 +6141,7 @@ void QMainCanvas::DrawCachedPolygonDrawableFastLod(QPainter& painter, const Cach
 	DrawCachedPolygonDrawable(painter, cachedPolygon, queryWorldExtent, exposedRect);
 }
 
-void QMainCanvas::DrawCachedMapTile(QPainter& painter, const CachedMapTile& cachedTile, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect,
+void QMainCanvas::Impl::DrawCachedMapTile(QPainter& painter, const CachedMapTile& cachedTile, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect,
 	const QPainterPath* crsClipPath, bool hasPreciseCrsClip, bool canUseCrsPolygonExtents) const
 {
 	if (!cachedTile.tile.visible || cachedTile.pixmap.isNull() || !queryWorldExtent.IsValid() || !viewExtent.IsValid() || !IsFinitePositive(pixelSize))
@@ -5414,7 +6220,7 @@ void QMainCanvas::DrawCachedMapTile(QPainter& painter, const CachedMapTile& cach
 	}
 }
 
-void QMainCanvas::DrawCachedPointDrawable(QPainter& painter, const CachedPointDrawable& cachedPoint, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const
+void QMainCanvas::Impl::DrawCachedPointDrawable(QPainter& painter, const CachedPointDrawable& cachedPoint, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const
 {
 	if (!cachedPoint.point.visible || !cachedPoint.extent.IsValid() || !cachedPoint.extent.IsIntersects(queryWorldExtent))
 	{
@@ -5526,7 +6332,7 @@ void QMainCanvas::DrawCachedPointDrawable(QPainter& painter, const CachedPointDr
 	}
 }
 
-void QMainCanvas::DrawCachedPolylineDrawable(QPainter& painter, const CachedPolylineDrawable& cachedPolyline, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const
+void QMainCanvas::Impl::DrawCachedPolylineDrawable(QPainter& painter, const CachedPolylineDrawable& cachedPolyline, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const
 {
 	Q_UNUSED(exposedRect);
 	if (!cachedPolyline.polyline.visible || cachedPolyline.polyline.vertices.size() < 2 || cachedPolyline.polyline.lineWidth <= 0 || cachedPolyline.polyline.lineColor.IsTransparent())
@@ -5610,7 +6416,7 @@ void QMainCanvas::DrawCachedPolylineDrawable(QPainter& painter, const CachedPoly
 	FlushCurrentPart();
 }
 
-void QMainCanvas::DrawCachedPolygonDrawable(QPainter& painter, const CachedPolygonDrawable& cachedPolygon, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const
+void QMainCanvas::Impl::DrawCachedPolygonDrawable(QPainter& painter, const CachedPolygonDrawable& cachedPolygon, const GB_Rectangle& queryWorldExtent, const QRectF& exposedRect) const
 {
 	Q_UNUSED(exposedRect);
 	if (!cachedPolygon.polygon.visible || cachedPolygon.polygon.vertices.size() < 3 || !cachedPolygon.extent.IsValid() || !cachedPolygon.extent.IsIntersects(queryWorldExtent))
@@ -5729,7 +6535,7 @@ void QMainCanvas::DrawCachedPolygonDrawable(QPainter& painter, const CachedPolyg
 	}
 }
 
-void QMainCanvas::DrawMapContent(QPainter& painter, const QRectF& exposedRect) const
+void QMainCanvas::Impl::DrawMapContent(QPainter& painter, const QRectF& exposedRect) const
 {
 	DrawBackground(painter);
 	DrawDrawables(painter, exposedRect);
@@ -5737,14 +6543,14 @@ void QMainCanvas::DrawMapContent(QPainter& painter, const QRectF& exposedRect) c
 	DrawCrsValidArea(painter);
 }
 
-bool QMainCanvas::IsMapContentCacheValid() const
+bool QMainCanvas::Impl::IsMapContentCacheValid() const
 {
 	if (isMapContentCacheDirty || mapContentCache.isNull())
 	{
 		return false;
 	}
 
-	if (mapContentCache.size() != size())
+	if (mapContentCache.size() != (owner ? owner->size() : QSize()))
 	{
 		return false;
 	}
@@ -5777,7 +6583,7 @@ bool QMainCanvas::IsMapContentCacheValid() const
 	return mapContentCacheCrsWkt == crsWkt;
 }
 
-void QMainCanvas::EnsureMapContentCache() const
+void QMainCanvas::Impl::EnsureMapContentCache() const
 {
 	if (IsMapContentCacheValid())
 	{
@@ -5791,7 +6597,7 @@ void QMainCanvas::EnsureMapContentCache() const
 		return;
 	}
 
-	QPixmap newCache(size());
+	QPixmap newCache((owner ? owner->size() : QSize()));
 	newCache.fill(Qt::transparent);
 
 	QPainter cachePainter(&newCache);
@@ -5809,12 +6615,12 @@ void QMainCanvas::EnsureMapContentCache() const
 	isMapContentCacheDirty = false;
 }
 
-void QMainCanvas::InvalidateMapContentCache() const
+void QMainCanvas::Impl::InvalidateMapContentCache() const
 {
 	isMapContentCacheDirty = true;
 }
 
-void QMainCanvas::DrawCrsValidArea(QPainter& painter) const
+void QMainCanvas::Impl::DrawCrsValidArea(QPainter& painter) const
 {
 	if (!crsValidAreaVisible || crsValidAreaColor.IsTransparent() || !viewExtent.IsValid() || !IsFinitePositive(pixelSize))
 	{
@@ -5837,7 +6643,7 @@ void QMainCanvas::DrawCrsValidArea(QPainter& painter) const
 	painter.restore();
 }
 
-void QMainCanvas::DrawCoordinateAxes(QPainter& painter) const
+void QMainCanvas::Impl::DrawCoordinateAxes(QPainter& painter) const
 {
 	const int canvasWidth = width();
 	const int canvasHeight = height();
@@ -6026,7 +6832,7 @@ void QMainCanvas::DrawCoordinateAxes(QPainter& painter) const
 	painter.restore();
 }
 
-bool QMainCanvas::EnsureCrsValidAreaPolygonsCache() const
+bool QMainCanvas::Impl::EnsureCrsValidAreaPolygonsCache() const
 {
 	if (!crsValidAreaPolygonsCacheDirty && crsValidAreaPolygonsCacheCrsWkt == crsWkt)
 	{
@@ -6104,7 +6910,7 @@ bool QMainCanvas::EnsureCrsValidAreaPolygonsCache() const
 	return !crsValidAreaPolygonsCache.empty();
 }
 
-void QMainCanvas::InvalidateCrsValidAreaPolygonsCache() const
+void QMainCanvas::Impl::InvalidateCrsValidAreaPolygonsCache() const
 {
 	crsValidAreaPolygonsCacheDirty = true;
 	crsValidAreaPolygonsCacheCrsWkt.clear();
@@ -6113,14 +6919,14 @@ void QMainCanvas::InvalidateCrsValidAreaPolygonsCache() const
 	InvalidateCrsValidAreaScreenPathCache();
 }
 
-void QMainCanvas::InvalidateCrsValidAreaRectCache() const
+void QMainCanvas::Impl::InvalidateCrsValidAreaRectCache() const
 {
 	crsValidAreaRectCacheDirty = true;
 	crsValidAreaRectCacheCrsWkt.clear();
 	crsValidAreaRectCache.Reset();
 }
 
-void QMainCanvas::InvalidateCrsValidAreaScreenPathCache() const
+void QMainCanvas::Impl::InvalidateCrsValidAreaScreenPathCache() const
 {
 	crsValidAreaScreenPathCacheDirty = true;
 	crsValidAreaScreenPathCacheCrsWkt.clear();
@@ -6131,7 +6937,7 @@ void QMainCanvas::InvalidateCrsValidAreaScreenPathCache() const
 	crsValidAreaScreenPathWorldExtentCache.Reset();
 }
 
-double QMainCanvas::GetCrsMetersPerUnitCached() const
+double QMainCanvas::Impl::GetCrsMetersPerUnitCached() const
 {
 	if (!crsMetersPerUnitCacheDirty && crsMetersPerUnitCacheCrsWkt == crsWkt)
 	{
@@ -6162,14 +6968,14 @@ double QMainCanvas::GetCrsMetersPerUnitCached() const
 	return crsMetersPerUnitCache;
 }
 
-void QMainCanvas::InvalidateCrsMetersPerUnitCache() const
+void QMainCanvas::Impl::InvalidateCrsMetersPerUnitCache() const
 {
 	crsMetersPerUnitCacheDirty = true;
 	crsMetersPerUnitCacheCrsWkt.clear();
 	crsMetersPerUnitCache = 0.0;
 }
 
-bool QMainCanvas::IsDrawableUidInSet(const std::vector<std::string>& drawablesUids, const std::string& uid) const
+bool QMainCanvas::Impl::IsDrawableUidInSet(const std::vector<std::string>& drawablesUids, const std::string& uid) const
 {
 	if (uid.empty())
 	{
@@ -6179,7 +6985,7 @@ bool QMainCanvas::IsDrawableUidInSet(const std::vector<std::string>& drawablesUi
 	return std::find(drawablesUids.begin(), drawablesUids.end(), uid) != drawablesUids.end();
 }
 
-bool QMainCanvas::HasVisibleMapTileIntersectingExtent(const GB_Rectangle& extent) const
+bool QMainCanvas::Impl::HasVisibleMapTileIntersectingExtent(const GB_Rectangle& extent) const
 {
 	if (!extent.IsValid())
 	{
@@ -6197,7 +7003,7 @@ bool QMainCanvas::HasVisibleMapTileIntersectingExtent(const GB_Rectangle& extent
 	return false;
 }
 
-GB_Rectangle QMainCanvas::CalculateVisibleVectorDrawableExtent() const
+GB_Rectangle QMainCanvas::Impl::CalculateVisibleVectorDrawableExtent() const
 {
 	GB_Rectangle result;
 	result.Reset();
@@ -6229,7 +7035,7 @@ GB_Rectangle QMainCanvas::CalculateVisibleVectorDrawableExtent() const
 	return result;
 }
 
-GB_Rectangle QMainCanvas::CalculateAllDrawableExtent() const
+GB_Rectangle QMainCanvas::Impl::CalculateAllDrawableExtent() const
 {
 	if (!allDrawableExtentCacheDirty)
 	{
@@ -6258,13 +7064,13 @@ GB_Rectangle QMainCanvas::CalculateAllDrawableExtent() const
 	return allDrawableExtentCache;
 }
 
-void QMainCanvas::InvalidateAllDrawableExtentCache() const
+void QMainCanvas::Impl::InvalidateAllDrawableExtentCache() const
 {
 	allDrawableExtentCacheDirty = true;
 	allDrawableExtentCache.Reset();
 }
 
-void QMainCanvas::SetViewExtentInternal(const GB_Rectangle& extent, bool emitSignal)
+void QMainCanvas::Impl::SetViewExtentInternal(const GB_Rectangle& extent, bool emitSignal)
 {
 	const GB_Rectangle usableExtent = EnsureUsableExtent(extent);
 	if (!usableExtent.IsValid())
@@ -6297,26 +7103,26 @@ void QMainCanvas::SetViewExtentInternal(const GB_Rectangle& extent, bool emitSig
 	update();
 }
 
-double QMainCanvas::GetMinimumPixelSizeForCurrentWidget() const
+double QMainCanvas::Impl::GetMinimumPixelSizeForCurrentWidget() const
 {
-	const int canvasWidth = SafeWidgetWidth(this);
-	const int canvasHeight = SafeWidgetHeight(this);
+	const int canvasWidth = SafeWidgetWidth(owner);
+	const int canvasHeight = SafeWidgetHeight(owner);
 	const int minimumCanvasSize = std::max(1, std::min(canvasWidth, canvasHeight));
 	const double minimumPixelSize = MinimumCoordinateRange / static_cast<double>(minimumCanvasSize);
 	return IsFinitePositive(minimumPixelSize) ? minimumPixelSize : FallbackMinimumPixelSize;
 }
 
-double QMainCanvas::GetMaximumPixelSizeForCurrentWidget() const
+double QMainCanvas::Impl::GetMaximumPixelSizeForCurrentWidget() const
 {
-	const int canvasWidth = SafeWidgetWidth(this);
-	const int canvasHeight = SafeWidgetHeight(this);
+	const int canvasWidth = SafeWidgetWidth(owner);
+	const int canvasHeight = SafeWidgetHeight(owner);
 	const int maximumCanvasSize = std::max(1, std::max(canvasWidth, canvasHeight));
 	const double maximumCoordinateRange = MaximumCoordinateAbsValue * 2.0;
 	const double maximumPixelSize = maximumCoordinateRange / static_cast<double>(maximumCanvasSize);
 	return IsFinitePositive(maximumPixelSize) ? maximumPixelSize : FallbackMaximumPixelSize;
 }
 
-double QMainCanvas::ClampPixelSizeForCurrentWidget(double targetPixelSize) const
+double QMainCanvas::Impl::ClampPixelSizeForCurrentWidget(double targetPixelSize) const
 {
 	const double minimumPixelSize = GetMinimumPixelSizeForCurrentWidget();
 	const double maximumPixelSize = GetMaximumPixelSizeForCurrentWidget();
@@ -6343,7 +7149,7 @@ double QMainCanvas::ClampPixelSizeForCurrentWidget(double targetPixelSize) const
 	return GB_Clamp(targetPixelSize, minimumPixelSize, maximumPixelSize);
 }
 
-GB_Point2d QMainCanvas::ClampViewCenterForPixelSize(const GB_Point2d& center, double targetPixelSize) const
+GB_Point2d QMainCanvas::Impl::ClampViewCenterForPixelSize(const GB_Point2d& center, double targetPixelSize) const
 {
 	if (!center.IsValid() || !IsFinitePositive(targetPixelSize))
 	{
@@ -6351,8 +7157,8 @@ GB_Point2d QMainCanvas::ClampViewCenterForPixelSize(const GB_Point2d& center, do
 	}
 
 	const double safePixelSize = ClampPixelSizeForCurrentWidget(targetPixelSize);
-	const int canvasWidth = SafeWidgetWidth(this);
-	const int canvasHeight = SafeWidgetHeight(this);
+	const int canvasWidth = SafeWidgetWidth(owner);
+	const int canvasHeight = SafeWidgetHeight(owner);
 	const double halfWidth = static_cast<double>(canvasWidth) * safePixelSize * 0.5;
 	const double halfHeight = static_cast<double>(canvasHeight) * safePixelSize * 0.5;
 
@@ -6376,7 +7182,7 @@ GB_Point2d QMainCanvas::ClampViewCenterForPixelSize(const GB_Point2d& center, do
 	return GB_Point2d(ClampCenterCoordinate(center.x, halfWidth), ClampCenterCoordinate(center.y, halfHeight));
 }
 
-void QMainCanvas::UpdatePixelSizeFromViewExtent()
+void QMainCanvas::Impl::UpdatePixelSizeFromViewExtent()
 {
 	if (!viewExtent.IsValid())
 	{
@@ -6384,8 +7190,8 @@ void QMainCanvas::UpdatePixelSizeFromViewExtent()
 		return;
 	}
 
-	const int canvasWidth = SafeWidgetWidth(this);
-	const int canvasHeight = SafeWidgetHeight(this);
+	const int canvasWidth = SafeWidgetWidth(owner);
+	const int canvasHeight = SafeWidgetHeight(owner);
 	const double pixelSizeX = viewExtent.Width() / static_cast<double>(canvasWidth);
 	const double pixelSizeY = viewExtent.Height() / static_cast<double>(canvasHeight);
 	const double newPixelSize = std::max(pixelSizeX, pixelSizeY);
@@ -6399,14 +7205,14 @@ void QMainCanvas::UpdatePixelSizeFromViewExtent()
 	}
 }
 
-void QMainCanvas::UpdateViewExtentFromCenterAndPixelSize(const GB_Point2d& center)
+void QMainCanvas::Impl::UpdateViewExtentFromCenterAndPixelSize(const GB_Point2d& center)
 {
 	const double safePixelSize = ClampPixelSizeForCurrentWidget(IsFinitePositive(pixelSize) ? pixelSize : DefaultPixelSize);
 	viewExtent = MakeExtentByCenterAndPixelSize(center, safePixelSize);
 	pixelSize = safePixelSize;
 }
 
-GB_Rectangle QMainCanvas::MakeExtentByCenterAndPixelSize(const GB_Point2d& center, double targetPixelSize) const
+GB_Rectangle QMainCanvas::Impl::MakeExtentByCenterAndPixelSize(const GB_Point2d& center, double targetPixelSize) const
 {
 	if (!center.IsValid() || !IsFinitePositive(targetPixelSize))
 	{
@@ -6420,14 +7226,14 @@ GB_Rectangle QMainCanvas::MakeExtentByCenterAndPixelSize(const GB_Point2d& cente
 		return GB_Rectangle::Invalid;
 	}
 
-	const int canvasWidth = SafeWidgetWidth(this);
-	const int canvasHeight = SafeWidgetHeight(this);
+	const int canvasWidth = SafeWidgetWidth(owner);
+	const int canvasHeight = SafeWidgetHeight(owner);
 	const double halfWidth = static_cast<double>(canvasWidth) * safePixelSize * 0.5;
 	const double halfHeight = static_cast<double>(canvasHeight) * safePixelSize * 0.5;
 	return GB_Rectangle(safeCenter.x - halfWidth, safeCenter.y - halfHeight, safeCenter.x + halfWidth, safeCenter.y + halfHeight);
 }
 
-GB_Rectangle QMainCanvas::NormalizeExtentForCurrentWidget(const GB_Rectangle& extent) const
+GB_Rectangle QMainCanvas::Impl::NormalizeExtentForCurrentWidget(const GB_Rectangle& extent) const
 {
 	GB_Rectangle usableExtent = EnsureUsableExtent(extent);
 	if (!usableExtent.IsValid())
@@ -6435,8 +7241,8 @@ GB_Rectangle QMainCanvas::NormalizeExtentForCurrentWidget(const GB_Rectangle& ex
 		return GB_Rectangle::Invalid;
 	}
 
-	const int canvasWidth = SafeWidgetWidth(this);
-	const int canvasHeight = SafeWidgetHeight(this);
+	const int canvasWidth = SafeWidgetWidth(owner);
+	const int canvasHeight = SafeWidgetHeight(owner);
 	const double pixelSizeX = usableExtent.Width() / static_cast<double>(canvasWidth);
 	const double pixelSizeY = usableExtent.Height() / static_cast<double>(canvasHeight);
 	const double targetPixelSize = std::max(pixelSizeX, pixelSizeY);
@@ -6445,7 +7251,7 @@ GB_Rectangle QMainCanvas::NormalizeExtentForCurrentWidget(const GB_Rectangle& ex
 	return MakeExtentByCenterAndPixelSize(usableExtent.Center(), safePixelSize);
 }
 
-GB_Rectangle QMainCanvas::EnsureUsableExtent(const GB_Rectangle& extent) const
+GB_Rectangle QMainCanvas::Impl::EnsureUsableExtent(const GB_Rectangle& extent) const
 {
 	if (!extent.IsValid())
 	{
@@ -6478,15 +7284,15 @@ GB_Rectangle QMainCanvas::EnsureUsableExtent(const GB_Rectangle& extent) const
 	return result;
 }
 
-void QMainCanvas::EmitViewExtentDisplayChangedIfNeeded(const GB_Rectangle& previousExtent)
+void QMainCanvas::Impl::EmitViewExtentDisplayChangedIfNeeded(const GB_Rectangle& previousExtent)
 {
 	if (!AreRectanglesNearlyEqual(viewExtent, previousExtent))
 	{
-		emit ViewExtentDisplayChanged(viewExtent);
+		emit owner->ViewExtentDisplayChanged(viewExtent);
 	}
 }
 
-bool QMainCanvas::SetMousePosition(const QPoint& position)
+bool QMainCanvas::Impl::SetMousePosition(const QPoint& position)
 {
 	const bool changed = !hasMousePosition || lastMousePosition != position;
 	hasMousePosition = true;
@@ -6499,7 +7305,7 @@ bool QMainCanvas::SetMousePosition(const QPoint& position)
 	return changed;
 }
 
-bool QMainCanvas::ClearMousePosition()
+bool QMainCanvas::Impl::ClearMousePosition()
 {
 	if (!hasMousePosition)
 	{
@@ -6512,19 +7318,19 @@ bool QMainCanvas::ClearMousePosition()
 	return true;
 }
 
-void QMainCanvas::EmitMousePositionChanged()
+void QMainCanvas::Impl::EmitMousePositionChanged()
 {
 	GB_Point2d mouseWorldPosition;
 	const bool hasPosition = TryGetCurrentMouseWorldPosition(mouseWorldPosition);
-	emit MousePositionChanged(mouseWorldPosition, hasPosition);
+	emit owner->MousePositionChanged(mouseWorldPosition, hasPosition);
 }
 
-void QMainCanvas::ScheduleViewStateChanged()
+void QMainCanvas::Impl::ScheduleViewStateChanged()
 {
 	ScheduleViewStateChangedWithDelay(ViewStateChangedDebounceIntervalMs);
 }
 
-void QMainCanvas::ScheduleViewStateChangedWithDelay(int debounceIntervalMs)
+void QMainCanvas::Impl::ScheduleViewStateChangedWithDelay(int debounceIntervalMs)
 {
 	if (!viewExtent.IsValid())
 	{
@@ -6536,14 +7342,14 @@ void QMainCanvas::ScheduleViewStateChangedWithDelay(int debounceIntervalMs)
 	viewStateChangedDebounceTimer.start(safeDebounceIntervalMs);
 }
 
-void QMainCanvas::ScheduleWheelZoomViewStateChanged()
+void QMainCanvas::Impl::ScheduleWheelZoomViewStateChanged()
 {
 	// Qt::ScrollBegin / Qt::ScrollEnd 并非所有平台都稳定提供。
 	// 对没有明确结束事件的平台，用一个更长的单次防抖定时器判定“一次连续缩放”结束。
 	ScheduleViewStateChangedWithDelay(WheelZoomEndDetectionIntervalMs);
 }
 
-void QMainCanvas::FlushPendingViewStateChanged()
+void QMainCanvas::Impl::FlushPendingViewStateChanged()
 {
 	if (!hasPendingViewStateChanged)
 	{
@@ -6554,7 +7360,7 @@ void QMainCanvas::FlushPendingViewStateChanged()
 	EmitViewStateChanged();
 }
 
-void QMainCanvas::EmitViewStateChanged()
+void QMainCanvas::Impl::EmitViewStateChanged()
 {
 	hasPendingViewStateChanged = false;
 	viewStateChangedDebounceTimer.stop();
@@ -6569,10 +7375,10 @@ void QMainCanvas::EmitViewStateChanged()
 	lastEmittedApproximateMetersPerPixel = approximateMetersPerPixel;
 	hasEmittedViewState = true;
 
-	emit ViewStateChanged(viewExtent, approximateMetersPerPixel);
+	emit owner->ViewStateChanged(viewExtent, approximateMetersPerPixel);
 }
 
-bool QMainCanvas::ShouldEmitViewStateChanged(double approximateMetersPerPixel) const
+bool QMainCanvas::Impl::ShouldEmitViewStateChanged(double approximateMetersPerPixel) const
 {
 	if (!hasEmittedViewState)
 	{
@@ -6583,7 +7389,7 @@ bool QMainCanvas::ShouldEmitViewStateChanged(double approximateMetersPerPixel) c
 		!AreNearlyEqual(approximateMetersPerPixel, lastEmittedApproximateMetersPerPixel);
 }
 
-double QMainCanvas::CalculateApproximateMetersPerPixel() const
+double QMainCanvas::Impl::CalculateApproximateMetersPerPixel() const
 {
 	if (!IsFinitePositive(pixelSize))
 	{
@@ -6599,7 +7405,7 @@ double QMainCanvas::CalculateApproximateMetersPerPixel() const
 	return pixelSize * metersPerUnit;
 }
 
-QRectF QMainCanvas::WorldRectangleToScreenRectangle(const GB_Rectangle& rect) const
+QRectF QMainCanvas::Impl::WorldRectangleToScreenRectangle(const GB_Rectangle& rect) const
 {
 	if (!rect.IsValid())
 	{

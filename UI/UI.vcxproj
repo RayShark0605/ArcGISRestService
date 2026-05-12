@@ -144,9 +144,11 @@
     <ClCompile Include="QMainCanvas.cpp" />
     <ClCompile Include="QServiceBrowserPanel.cpp" />
     <ClCompile Include="TileImageCache.cpp" />
+    <ClCompile Include="VectorCache.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="DataDef.h" />
+    <ClInclude Include="VectorCache.h" />
     <QtMoc Include="QCrsManagerWidget.h" />
     <QtMoc Include="QAddCustomCrsDialog.h" />
     <ClInclude Include="resource.h" />

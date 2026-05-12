@@ -7,6 +7,7 @@
 #include "GeoCrsTransform.h"
 #include "GeoCrsManager.h"
 #include "TileImageCache.h"
+#include "VectorCache.h"
 #include "GeoVectorGeometry.h"
 #include "GeoBase/GB_Crypto.h"
 #include "GeoBase/GB_FormatParser.h"
@@ -149,23 +150,10 @@ namespace
 		}
 	}
 
-	bool CanImportNodeAsImage(const LayerImportRequestInfo& request)
+	bool IsArcGISRestVectorLayerNodeType(ArcGISRestServiceTreeNode::NodeType nodeType)
 	{
-		return request.serviceNodeType == ArcGISRestServiceTreeNode::NodeType::MapService ||
-			request.serviceNodeType == ArcGISRestServiceTreeNode::NodeType::ImageService;
-	}
-
-	bool CanImportNodeAsVector(const LayerImportRequestInfo& request)
-	{
-		if (request.serviceNodeType != ArcGISRestServiceTreeNode::NodeType::FeatureService)
+		switch (nodeType)
 		{
-			return false;
-		}
-
-		switch (request.nodeType)
-		{
-		case ArcGISRestServiceTreeNode::NodeType::FeatureService:
-		case ArcGISRestServiceTreeNode::NodeType::AllLayers:
 		case ArcGISRestServiceTreeNode::NodeType::UnknownVectorLayer:
 		case ArcGISRestServiceTreeNode::NodeType::PointVectorLayer:
 		case ArcGISRestServiceTreeNode::NodeType::LineVectorLayer:
@@ -176,11 +164,64 @@ namespace
 		case ArcGISRestServiceTreeNode::NodeType::Folder:
 		case ArcGISRestServiceTreeNode::NodeType::MapService:
 		case ArcGISRestServiceTreeNode::NodeType::ImageService:
+		case ArcGISRestServiceTreeNode::NodeType::FeatureService:
+		case ArcGISRestServiceTreeNode::NodeType::AllLayers:
 		case ArcGISRestServiceTreeNode::NodeType::RasterLayer:
 		case ArcGISRestServiceTreeNode::NodeType::Table:
 		default:
 			return false;
 		}
+	}
+
+	bool CanImportNodeAsVector(const LayerImportRequestInfo& request)
+	{
+		if (request.serviceNodeType == ArcGISRestServiceTreeNode::NodeType::FeatureService)
+		{
+			switch (request.nodeType)
+			{
+			case ArcGISRestServiceTreeNode::NodeType::FeatureService:
+			case ArcGISRestServiceTreeNode::NodeType::AllLayers:
+			case ArcGISRestServiceTreeNode::NodeType::UnknownVectorLayer:
+			case ArcGISRestServiceTreeNode::NodeType::PointVectorLayer:
+			case ArcGISRestServiceTreeNode::NodeType::LineVectorLayer:
+			case ArcGISRestServiceTreeNode::NodeType::PolygonVectorLayer:
+				return true;
+			case ArcGISRestServiceTreeNode::NodeType::Unknown:
+			case ArcGISRestServiceTreeNode::NodeType::Root:
+			case ArcGISRestServiceTreeNode::NodeType::Folder:
+			case ArcGISRestServiceTreeNode::NodeType::MapService:
+			case ArcGISRestServiceTreeNode::NodeType::ImageService:
+			case ArcGISRestServiceTreeNode::NodeType::RasterLayer:
+			case ArcGISRestServiceTreeNode::NodeType::Table:
+			default:
+				return false;
+			}
+		}
+
+		if (request.serviceNodeType == ArcGISRestServiceTreeNode::NodeType::MapService)
+		{
+			// MapServer 可以同时包含影像类图层和 Feature Layer。
+			// 当用户导入的是具体点/线/面子图层时，应走 /MapServer/<layerId>/query 矢量刷新路径，
+			// 不能因为所属服务是 MapServer 就退回 export/tile 影像刷新路径。
+			return IsArcGISRestVectorLayerNodeType(request.nodeType);
+		}
+
+		return false;
+	}
+
+	bool CanImportNodeAsImage(const LayerImportRequestInfo& request)
+	{
+		if (request.serviceNodeType == ArcGISRestServiceTreeNode::NodeType::ImageService)
+		{
+			return true;
+		}
+
+		if (request.serviceNodeType == ArcGISRestServiceTreeNode::NodeType::MapService)
+		{
+			return !CanImportNodeAsVector(request);
+		}
+
+		return false;
 	}
 
 	bool CanImportNodeAsDrawable(const LayerImportRequestInfo& request)
@@ -190,14 +231,15 @@ namespace
 
 	bool ShouldHoldForPreciseFeatureLayerMetadata(const LayerImportRequestInfo& request)
 	{
-		if (request.serviceNodeType != ArcGISRestServiceTreeNode::NodeType::FeatureService)
-		{
-			return false;
-		}
+		const bool isFeatureServiceChildLayer = request.serviceNodeType == ArcGISRestServiceTreeNode::NodeType::FeatureService &&
+			request.nodeType != ArcGISRestServiceTreeNode::NodeType::FeatureService &&
+			request.nodeType != ArcGISRestServiceTreeNode::NodeType::AllLayers &&
+			request.nodeType != ArcGISRestServiceTreeNode::NodeType::Table;
 
-		if (request.nodeType == ArcGISRestServiceTreeNode::NodeType::FeatureService ||
-			request.nodeType == ArcGISRestServiceTreeNode::NodeType::AllLayers ||
-			request.nodeType == ArcGISRestServiceTreeNode::NodeType::Table)
+		const bool isMapServiceVectorChildLayer = request.serviceNodeType == ArcGISRestServiceTreeNode::NodeType::MapService &&
+			IsArcGISRestVectorLayerNodeType(request.nodeType);
+
+		if (!isFeatureServiceChildLayer && !isMapServiceVectorChildLayer)
 		{
 			return false;
 		}
@@ -1606,6 +1648,21 @@ namespace
 		return nullptr;
 	}
 
+	const ArcGISRestLayerOrTableInfo* FindImportRequestLayerOrTableInfoById(const LayerImportRequestInfo& request, const ArcGISRestServiceInfo& serviceInfo, const std::string& layerId)
+	{
+		const ArcGISRestServiceInfo* requestNodeInfo = GetImportRequestNodeInfo(request);
+		if (requestNodeInfo != nullptr && requestNodeInfo->resourceType == ArcGISRestResourceType::LayerOrTable)
+		{
+			const ArcGISRestLayerOrTableInfo& layerOrTableInfo = requestNodeInfo->layerOrTable;
+			if (layerId.empty() || layerOrTableInfo.id.empty() || layerOrTableInfo.id == layerId)
+			{
+				return &layerOrTableInfo;
+			}
+		}
+
+		return FindLayerOrTableInfoById(serviceInfo, layerId);
+	}
+
 	const ArcGISMapServiceLayerEntry* FindSummaryLayerById(const ArcGISRestServiceInfo& serviceInfo, const std::string& layerId)
 	{
 		for (const ArcGISMapServiceLayerEntry& layerEntry : serviceInfo.layers)
@@ -1667,9 +1724,9 @@ namespace
 		return GeoVectorGeometryType::Unknown;
 	}
 
-	std::string GetVectorGeometryTypeText(const ArcGISRestServiceInfo& serviceInfo, const std::string& layerId)
+	std::string GetVectorGeometryTypeText(const LayerImportRequestInfo& request, const ArcGISRestServiceInfo& serviceInfo, const std::string& layerId)
 	{
-		const ArcGISRestLayerOrTableInfo* layerInfo = FindLayerOrTableInfoById(serviceInfo, layerId);
+		const ArcGISRestLayerOrTableInfo* layerInfo = FindImportRequestLayerOrTableInfoById(request, serviceInfo, layerId);
 		if (layerInfo != nullptr && !layerInfo->geometryType.empty())
 		{
 			return layerInfo->geometryType;
@@ -1688,9 +1745,9 @@ namespace
 		return std::string();
 	}
 
-	std::string GetVectorRequestWkt(const ArcGISRestServiceInfo& serviceInfo, const std::string& layerId)
+	std::string GetVectorRequestWkt(const LayerImportRequestInfo& request, const ArcGISRestServiceInfo& serviceInfo, const std::string& layerId)
 	{
-		const ArcGISRestLayerOrTableInfo* layerInfo = FindLayerOrTableInfoById(serviceInfo, layerId);
+		const ArcGISRestLayerOrTableInfo* layerInfo = FindImportRequestLayerOrTableInfoById(request, serviceInfo, layerId);
 		if (layerInfo != nullptr)
 		{
 			if (layerInfo->hasSourceSpatialReference)
@@ -1715,9 +1772,9 @@ namespace
 		return GetServiceFallbackWkt(serviceInfo);
 	}
 
-	int GetPreferredLayerSpatialReferenceCode(const ArcGISRestServiceInfo& serviceInfo, const std::string& layerId)
+	int GetPreferredLayerSpatialReferenceCode(const LayerImportRequestInfo& request, const ArcGISRestServiceInfo& serviceInfo, const std::string& layerId)
 	{
-		const ArcGISRestLayerOrTableInfo* layerInfo = FindLayerOrTableInfoById(serviceInfo, layerId);
+		const ArcGISRestLayerOrTableInfo* layerInfo = FindImportRequestLayerOrTableInfoById(request, serviceInfo, layerId);
 		if (layerInfo != nullptr)
 		{
 			if (layerInfo->hasSourceSpatialReference)
@@ -1759,9 +1816,9 @@ namespace
 		return 0;
 	}
 
-	bool GetLayerSupportsPagination(const ArcGISRestServiceInfo& serviceInfo, const std::string& layerId)
+	bool GetLayerSupportsPagination(const LayerImportRequestInfo& request, const ArcGISRestServiceInfo& serviceInfo, const std::string& layerId)
 	{
-		const ArcGISRestLayerOrTableInfo* layerInfo = FindLayerOrTableInfoById(serviceInfo, layerId);
+		const ArcGISRestLayerOrTableInfo* layerInfo = FindImportRequestLayerOrTableInfoById(request, serviceInfo, layerId);
 		if (layerInfo != nullptr && layerInfo->hasAdvancedQueryCapabilities)
 		{
 			return layerInfo->advancedQueryCapabilities.supportsPagination;
@@ -1769,9 +1826,9 @@ namespace
 		return false;
 	}
 
-	int GetLayerMaxRecordCount(const ArcGISRestServiceInfo& serviceInfo, const std::string& layerId)
+	int GetLayerMaxRecordCount(const LayerImportRequestInfo& request, const ArcGISRestServiceInfo& serviceInfo, const std::string& layerId)
 	{
-		const ArcGISRestLayerOrTableInfo* layerInfo = FindLayerOrTableInfoById(serviceInfo, layerId);
+		const ArcGISRestLayerOrTableInfo* layerInfo = FindImportRequestLayerOrTableInfoById(request, serviceInfo, layerId);
 		if (layerInfo != nullptr)
 		{
 			const int layerMaxRecordCount = GetIntValue(layerInfo->rawJsonMap, "maxRecordCount", 0);
@@ -2573,14 +2630,14 @@ private:
 
 		for (const std::string& layerId : layerIds)
 		{
-			const std::string geometryTypeText = GetVectorGeometryTypeText(serviceInfo, layerId);
+			const std::string geometryTypeText = GetVectorGeometryTypeText(layer.importRequest, serviceInfo, layerId);
 			const GeoVectorGeometryType geometryType = GeometryTypeFromArcGISStringForRefresh(geometryTypeText);
 			if (geometryType == GeoVectorGeometryType::Unknown)
 			{
 				continue;
 			}
 
-			const std::string requestWkt = GetVectorRequestWkt(serviceInfo, layerId);
+			const std::string requestWkt = GetVectorRequestWkt(layer.importRequest, serviceInfo, layerId);
 			if (!SetCanvasCrsIfNeeded(requestWkt))
 			{
 				continue;
@@ -2598,10 +2655,10 @@ private:
 				continue;
 			}
 
-			const bool supportsPagination = GetLayerSupportsPagination(serviceInfo, layerId);
-			const int rawPageSize = GetLayerMaxRecordCount(serviceInfo, layerId);
+			const bool supportsPagination = GetLayerSupportsPagination(layer.importRequest, serviceInfo, layerId);
+			const int rawPageSize = GetLayerMaxRecordCount(layer.importRequest, serviceInfo, layerId);
 			const int pageSize = GB_Clamp(rawPageSize > 0 ? rawPageSize : DefaultFeatureQueryPageSize, 1, MaxFeatureQueryPageSize);
-			const int inputSpatialReferenceCode = GetPreferredLayerSpatialReferenceCode(serviceInfo, layerId);
+			const int inputSpatialReferenceCode = GetPreferredLayerSpatialReferenceCode(layer.importRequest, serviceInfo, layerId);
 			const std::string requestUrl = BuildFeatureQueryBaseUrl(layer.importRequest.serviceUrl, layerId, requestViewExtent, inputSpatialReferenceCode, supportsPagination, pageSize);
 			if (requestUrl.empty())
 			{
@@ -3106,6 +3163,49 @@ private:
 		return TileImageCacheKey(cacheRequestItem, task.sourceWktUtf8, std::string(), BuildRawImageCacheExtraKey(task));
 	}
 
+	std::string BuildRawVectorCacheExtraKey(const TileTask& task) const
+	{
+		std::string keyText;
+		keyText.reserve(512);
+		keyText += "version=1\n";
+		keyText += "referer=";
+		keyText += task.networkOptions.refererUtf8;
+		keyText += "\n";
+
+		for (const std::string& header : task.networkOptions.headersUtf8)
+		{
+			keyText += "header=";
+			keyText += header;
+			keyText += "\n";
+		}
+
+		if (!task.connectionSettings.username.empty() || !task.connectionSettings.password.empty())
+		{
+			keyText += "credentialsHash=";
+			keyText += GB_Md5Hash(task.connectionSettings.username + "\n" + task.connectionSettings.password);
+			keyText += "\n";
+		}
+
+		return "LayerRefresherRawVectorCacheV1:" + GB_Md5Hash(keyText);
+	}
+
+	VectorCacheKey BuildRawVectorCacheKey(const TileTask& task, const std::string& downloadUrl) const
+	{
+		VectorCacheKey cacheKey;
+		cacheKey.serviceUrl = task.vectorRequestItem.serviceUrl;
+		cacheKey.layerId = task.vectorRequestItem.layerId;
+		cacheKey.requestUrl = downloadUrl;
+		cacheKey.queryExtent = task.vectorRequestItem.queryExtent;
+		cacheKey.geometryTypeText = task.vectorRequestItem.geometryTypeText;
+
+		// 这里缓存的是服务端原始 Feature Query JSON，而不是已重投影后的显示 Drawable。
+		// 因此 targetWktUtf8 留空，使同一原始查询结果可被不同目标 CRS 的画布复用。
+		cacheKey.sourceWktUtf8 = task.sourceWktUtf8;
+		cacheKey.targetWktUtf8.clear();
+		cacheKey.extraKeyUtf8 = BuildRawVectorCacheExtraKey(task);
+		return cacheKey;
+	}
+
 	std::string GuessPreferredCacheFileExt(const TileTask& task, const GB_NetworkDownloadedFile& downloadedFile) const
 	{
 		std::string fileExt = GuessFileExtFromContentType(downloadedFile.contentTypeUtf8);
@@ -3499,13 +3599,23 @@ private:
 		}
 	}
 
-	bool FetchVectorPage(const TileTask& task, const std::string& requestUrl, size_t featureBaseIndex, VectorResult& result, bool& outExceededTransferLimit, size_t& outFeatureCount)
+	bool TryLoadRawVectorJsonFromCacheOrNetwork(const TileTask& task, const std::string& requestUrl, std::string& outJsonText) const
 	{
-		outExceededTransferLimit = false;
-		outFeatureCount = 0;
+		outJsonText.clear();
 
 		const std::string downloadUrl = PrefixRequestUrlIfNeeded(requestUrl, task.connectionSettings);
 		if (downloadUrl.empty())
+		{
+			return false;
+		}
+
+		const VectorCacheKey cacheKey = BuildRawVectorCacheKey(task, downloadUrl);
+		if (VectorCache::TryReadData(cacheKey, outJsonText) && !outJsonText.empty())
+		{
+			return true;
+		}
+
+		if (!IsTaskGenerationCurrent(task.generation))
 		{
 			return false;
 		}
@@ -3516,9 +3626,25 @@ private:
 			return false;
 		}
 
+		outJsonText = response.body;
+		VectorCache::PutData(cacheKey, response.body, ".json");
+		return true;
+	}
+
+	bool FetchVectorPage(const TileTask& task, const std::string& requestUrl, size_t featureBaseIndex, VectorResult& result, bool& outExceededTransferLimit, size_t& outFeatureCount)
+	{
+		outExceededTransferLimit = false;
+		outFeatureCount = 0;
+
+		std::string jsonText;
+		if (!TryLoadRawVectorJsonFromCacheOrNetwork(task, requestUrl, jsonText))
+		{
+			return false;
+		}
+
 		GB_VariantMap rootMap;
 		std::string errorMessage;
-		if (!GB_JsonParser::ParseToVariantMap(response.body, rootMap, &errorMessage) || HasArcGISRestError(rootMap))
+		if (!GB_JsonParser::ParseToVariantMap(jsonText, rootMap, &errorMessage) || HasArcGISRestError(rootMap))
 		{
 			return false;
 		}
