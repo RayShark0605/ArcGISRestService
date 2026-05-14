@@ -485,6 +485,18 @@ namespace
 		return itemsToDelete;
 	}
 
+	bool IsUidDeferredDeleteNoLock(const CacheState& state, const std::string& uid)
+	{
+		for (const CacheItem& item : state.deferredDeleteItems)
+		{
+			if (item.uid == uid)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
 	void EndActiveOperation(CacheState& state, const std::string& uid)
 	{
 		std::vector<CacheItem> itemsToDelete;
@@ -505,10 +517,6 @@ namespace
 
 			state.activeOperationsByUid.erase(iter);
 			itemsToDelete = TakeDeferredDeleteItemsForUidNoLock(state, uid);
-			for (const CacheItem& item : itemsToDelete)
-			{
-				SubtractCacheSizeNoLock(state, GetItemTotalSize(item));
-			}
 		}
 
 		for (const CacheItem& item : itemsToDelete)
@@ -605,13 +613,11 @@ namespace
 		}
 
 		const size_t itemSize = GetItemTotalSize(iter->second);
-		bool deleteDeferred = false;
 		if (deleteFiles)
 		{
 			if (IsUidActiveNoLock(state, uid))
 			{
 				state.deferredDeleteItems.push_back(iter->second);
-				deleteDeferred = true;
 			}
 			else
 			{
@@ -619,13 +625,10 @@ namespace
 			}
 		}
 
-		if (!deleteDeferred)
+		SubtractCacheSizeNoLock(state, itemSize);
+		if (removedBytes != nullptr)
 		{
-			SubtractCacheSizeNoLock(state, itemSize);
-			if (removedBytes != nullptr)
-			{
-				*removedBytes += itemSize;
-			}
+			*removedBytes += itemSize;
 		}
 
 		state.itemsByUid.erase(iter);
@@ -672,6 +675,11 @@ namespace
 
 			CacheItem item;
 			if (!TryReadMetadata(filePath, item))
+			{
+				continue;
+			}
+
+			if (IsUidDeferredDeleteNoLock(state, item.uid))
 			{
 				continue;
 			}

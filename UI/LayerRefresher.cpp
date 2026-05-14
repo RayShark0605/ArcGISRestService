@@ -1841,6 +1841,179 @@ namespace
 		return serviceInfo.maxRecordCount > 0 ? serviceInfo.maxRecordCount : DefaultFeatureQueryPageSize;
 	}
 
+	bool IsSafeArcGISObjectIdText(const std::string& objectIdText)
+	{
+		const std::string trimmedText = TrimmedStdString(objectIdText);
+		if (trimmedText.empty())
+		{
+			return false;
+		}
+
+		for (char ch : trimmedText)
+		{
+			if (!std::isdigit(static_cast<unsigned char>(ch)))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool TryReadObjectIdText(const GB_Variant& value, std::string& outObjectIdText)
+	{
+		outObjectIdText.clear();
+
+		bool okSigned = false;
+		const long long signedValue = value.ToInt64(&okSigned);
+		if (okSigned && signedValue >= 0)
+		{
+			outObjectIdText = std::to_string(signedValue);
+			return true;
+		}
+
+		bool okUnsigned = false;
+		const unsigned long long unsignedValue = value.ToUInt64(&okUnsigned);
+		if (okUnsigned)
+		{
+			outObjectIdText = std::to_string(unsignedValue);
+			return true;
+		}
+
+		bool okString = false;
+		const std::string text = value.ToString(&okString);
+		if (okString && IsSafeArcGISObjectIdText(text))
+		{
+			outObjectIdText = TrimmedStdString(text);
+			return true;
+		}
+
+		return false;
+	}
+
+	std::string BuildFeatureQueryObjectIdsUrl(const std::string& baseQueryUrl)
+	{
+		if (baseQueryUrl.empty())
+		{
+			return std::string();
+		}
+
+		std::string queryUrl = baseQueryUrl;
+		queryUrl = GB_UrlOperator::SetUrlQueryValue(queryUrl, "returnIdsOnly", "true");
+		queryUrl = GB_UrlOperator::SetUrlQueryValue(queryUrl, "returnGeometry", "false");
+		queryUrl = GB_UrlOperator::SetUrlQueryValue(queryUrl, "returnCountOnly", "false");
+		queryUrl = GB_UrlOperator::SetUrlQueryValue(queryUrl, "f", "json");
+		return queryUrl;
+	}
+
+	std::string BuildFeatureQueryObjectIdBatchUrl(const std::string& baseQueryUrl, const std::string& objectIdsText)
+	{
+		if (baseQueryUrl.empty() || objectIdsText.empty())
+		{
+			return std::string();
+		}
+
+		std::string queryUrl = baseQueryUrl;
+		queryUrl = GB_UrlOperator::SetUrlQueryValue(queryUrl, "objectIds", objectIdsText);
+		queryUrl = GB_UrlOperator::SetUrlQueryValue(queryUrl, "returnIdsOnly", "false");
+		queryUrl = GB_UrlOperator::SetUrlQueryValue(queryUrl, "returnGeometry", "true");
+		queryUrl = GB_UrlOperator::SetUrlQueryValue(queryUrl, "f", "json");
+		return queryUrl;
+	}
+
+	std::vector<std::string> BuildObjectIdBatchTexts(const std::vector<std::string>& objectIds, size_t maxIdsPerBatch, size_t maxCharsPerBatch)
+	{
+		std::vector<std::string> batchTexts;
+		if (objectIds.empty())
+		{
+			return batchTexts;
+		}
+
+		if (maxIdsPerBatch == 0)
+		{
+			maxIdsPerBatch = 1;
+		}
+		if (maxCharsPerBatch < 32)
+		{
+			maxCharsPerBatch = 32;
+		}
+
+		std::string currentBatch;
+		size_t currentBatchCount = 0;
+		for (const std::string& objectId : objectIds)
+		{
+			if (objectId.empty())
+			{
+				continue;
+			}
+
+			const size_t appendSize = objectId.size() + (currentBatch.empty() ? 0 : 1);
+			if (!currentBatch.empty() && (currentBatchCount >= maxIdsPerBatch || currentBatch.size() + appendSize > maxCharsPerBatch))
+			{
+				batchTexts.push_back(currentBatch);
+				currentBatch.clear();
+				currentBatchCount = 0;
+			}
+
+			if (!currentBatch.empty())
+			{
+				currentBatch.push_back(',');
+			}
+			currentBatch += objectId;
+			currentBatchCount++;
+		}
+
+		if (!currentBatch.empty())
+		{
+			batchTexts.push_back(currentBatch);
+		}
+		return batchTexts;
+	}
+
+	bool TryBuildClampedVectorQueryExtent(const LayerImportRequestInfo& request, const ArcGISRestServiceInfo& serviceInfo, const std::string& requestWkt, const GB_Rectangle& requestViewExtent, GB_Rectangle& outQueryExtent)
+	{
+		outQueryExtent = GB_Rectangle::Invalid;
+		if (!requestViewExtent.IsValid())
+		{
+			return false;
+		}
+
+		outQueryExtent = requestViewExtent;
+
+		GeoBoundingBox layerBoundingBox;
+		if (!TryGetLayerBoundingBox(request, serviceInfo, layerBoundingBox) || !layerBoundingBox.IsValid())
+		{
+			return true;
+		}
+
+		if (!IsCrsDefinitionValid(layerBoundingBox.wktUtf8) || !IsCrsDefinitionValid(requestWkt))
+		{
+			return true;
+		}
+
+		GB_Rectangle layerRectInRequestCrs = layerBoundingBox.rect;
+		if (!AreCrsEquivalent(layerBoundingBox.wktUtf8, requestWkt))
+		{
+			if (!TryTransformRectangleBetweenCrs(layerBoundingBox.wktUtf8, requestWkt, layerBoundingBox.rect, layerRectInRequestCrs))
+			{
+				return true;
+			}
+		}
+
+		if (!layerRectInRequestCrs.IsValid())
+		{
+			return true;
+		}
+
+		const GB_Rectangle intersectedExtent = requestViewExtent.Intersected(layerRectInRequestCrs);
+		if (!intersectedExtent.IsValid())
+		{
+			return false;
+		}
+
+		outQueryExtent = intersectedExtent;
+		return true;
+	}
+
 	std::string BuildFeatureQueryBaseUrl(const std::string& serviceUrl, const std::string& layerId, const GB_Rectangle& requestExtent, int inputSpatialReferenceCode, bool supportsPagination, int pageSize)
 	{
 		if (serviceUrl.empty() || layerId.empty() || !requestExtent.IsValid())
@@ -2655,11 +2828,17 @@ private:
 				continue;
 			}
 
+			GB_Rectangle queryExtent;
+			if (!TryBuildClampedVectorQueryExtent(layer.importRequest, serviceInfo, requestWkt, requestViewExtent, queryExtent))
+			{
+				continue;
+			}
+
 			const bool supportsPagination = GetLayerSupportsPagination(layer.importRequest, serviceInfo, layerId);
 			const int rawPageSize = GetLayerMaxRecordCount(layer.importRequest, serviceInfo, layerId);
 			const int pageSize = GB_Clamp(rawPageSize > 0 ? rawPageSize : DefaultFeatureQueryPageSize, 1, MaxFeatureQueryPageSize);
 			const int inputSpatialReferenceCode = GetPreferredLayerSpatialReferenceCode(layer.importRequest, serviceInfo, layerId);
-			const std::string requestUrl = BuildFeatureQueryBaseUrl(layer.importRequest.serviceUrl, layerId, requestViewExtent, inputSpatialReferenceCode, supportsPagination, pageSize);
+			const std::string requestUrl = BuildFeatureQueryBaseUrl(layer.importRequest.serviceUrl, layerId, queryExtent, inputSpatialReferenceCode, supportsPagination, pageSize);
 			if (requestUrl.empty())
 			{
 				continue;
@@ -2669,7 +2848,7 @@ private:
 			requestItem.serviceUrl = layer.importRequest.serviceUrl;
 			requestItem.layerId = layerId;
 			requestItem.requestUrl = requestUrl;
-			requestItem.queryExtent = requestViewExtent;
+			requestItem.queryExtent = queryExtent;
 			requestItem.geometryTypeText = geometryTypeText;
 			requestItem.geometryType = geometryType;
 			requestItem.supportsPagination = supportsPagination;
@@ -3440,26 +3619,33 @@ private:
 				return false;
 			}
 
-			size_t partIndex = 0;
-			for (const GB_Variant& pointVariant : *pointVariants)
+			std::vector<GB_Point2d> points;
+			std::vector<size_t> originalPartIndexes;
+			points.reserve(pointVariants->size());
+			originalPartIndexes.reserve(pointVariants->size());
+			for (size_t partIndex = 0; partIndex < pointVariants->size(); partIndex++)
 			{
 				GB_Point2d point;
-				if (!TryReadPointFromArrayVariant(pointVariant, point))
+				if (TryReadPointFromArrayVariant((*pointVariants)[partIndex], point))
 				{
-					partIndex++;
-					continue;
+					points.push_back(point);
+					originalPartIndexes.push_back(partIndex);
 				}
+			}
 
-				std::vector<GB_Point2d> points;
-				points.push_back(point);
-				if (!TransformPointsForDisplay(points, task.sourceWktUtf8, task.targetWktUtf8, task.needsReprojection))
-				{
-					partIndex++;
-					continue;
-				}
+			if (points.empty())
+			{
+				return false;
+			}
 
-				AppendPointDrawable(result.points, result.drawableUids, task.vectorTargetUid, points.front(), featureIndex, partIndex, task.layerNumber);
-				partIndex++;
+			if (!TransformPointsForDisplay(points, task.sourceWktUtf8, task.targetWktUtf8, task.needsReprojection))
+			{
+				return false;
+			}
+
+			for (size_t pointIndex = 0; pointIndex < points.size(); pointIndex++)
+			{
+				AppendPointDrawable(result.points, result.drawableUids, task.vectorTargetUid, points[pointIndex], featureIndex, originalPartIndexes[pointIndex], task.layerNumber);
 				if (CountVectorResultDrawables(result) >= MaxFeatureDrawableCountPerRefresh)
 				{
 					break;
@@ -3687,6 +3873,101 @@ private:
 		return true;
 	}
 
+	bool FetchVectorObjectIds(const TileTask& task, std::vector<std::string>& outObjectIds)
+	{
+		outObjectIds.clear();
+
+		const std::string idsUrl = BuildFeatureQueryObjectIdsUrl(task.vectorRequestItem.requestUrl);
+		if (idsUrl.empty())
+		{
+			return false;
+		}
+
+		std::string jsonText;
+		if (!TryLoadRawVectorJsonFromCacheOrNetwork(task, idsUrl, jsonText))
+		{
+			return false;
+		}
+
+		GB_VariantMap rootMap;
+		std::string errorMessage;
+		if (!GB_JsonParser::ParseToVariantMap(jsonText, rootMap, &errorMessage) || HasArcGISRestError(rootMap))
+		{
+			return false;
+		}
+
+		const GB_Variant* objectIdsValue = FindVariantValue(rootMap, "objectIds");
+		if (objectIdsValue == nullptr)
+		{
+			return false;
+		}
+
+		const GB_VariantList* objectIdVariants = TryGetVariantList(*objectIdsValue);
+		if (objectIdVariants == nullptr)
+		{
+			return false;
+		}
+
+		outObjectIds.reserve(objectIdVariants->size());
+		for (const GB_Variant& objectIdVariant : *objectIdVariants)
+		{
+			std::string objectIdText;
+			if (TryReadObjectIdText(objectIdVariant, objectIdText))
+			{
+				outObjectIds.push_back(std::move(objectIdText));
+			}
+		}
+
+		std::sort(outObjectIds.begin(), outObjectIds.end());
+		outObjectIds.erase(std::unique(outObjectIds.begin(), outObjectIds.end()), outObjectIds.end());
+		return true;
+	}
+
+	bool FetchVectorByObjectIds(const TileTask& task, VectorResult& result)
+	{
+		std::vector<std::string> objectIds;
+		if (!FetchVectorObjectIds(task, objectIds))
+		{
+			return false;
+		}
+
+		if (objectIds.empty())
+		{
+			return true;
+		}
+
+		const size_t maxIdsPerBatch = static_cast<size_t>(GB_Clamp(task.vectorRequestItem.pageSize, 1, MaxFeatureQueryPageSize));
+		const std::vector<std::string> batchTexts = BuildObjectIdBatchTexts(objectIds, maxIdsPerBatch, 6000);
+		size_t featureBaseIndex = 0;
+		for (const std::string& batchText : batchTexts)
+		{
+			if (!IsTaskGenerationCurrent(task.generation))
+			{
+				return false;
+			}
+
+			const std::string batchUrl = BuildFeatureQueryObjectIdBatchUrl(task.vectorRequestItem.requestUrl, batchText);
+			if (batchUrl.empty())
+			{
+				continue;
+			}
+
+			bool exceededTransferLimit = false;
+			size_t pageFeatureCount = 0;
+			if (!FetchVectorPage(task, batchUrl, featureBaseIndex, result, exceededTransferLimit, pageFeatureCount))
+			{
+				return CountVectorResultDrawables(result) > 0;
+			}
+
+			featureBaseIndex += pageFeatureCount;
+			if (CountVectorResultDrawables(result) >= MaxFeatureDrawableCountPerRefresh)
+			{
+				break;
+			}
+		}
+		return true;
+	}
+
 	bool ProcessVectorRequest(const TileTask& task, VectorResult& result)
 	{
 		result.generation = task.generation;
@@ -3698,6 +3979,31 @@ private:
 		if (task.vectorRequestItem.requestUrl.empty())
 		{
 			return false;
+		}
+
+		if (!task.vectorRequestItem.supportsPagination)
+		{
+			bool exceededTransferLimit = false;
+			size_t pageFeatureCount = 0;
+			if (!FetchVectorPage(task, task.vectorRequestItem.requestUrl, 0, result, exceededTransferLimit, pageFeatureCount))
+			{
+				return CountVectorResultDrawables(result) > 0;
+			}
+
+			if (exceededTransferLimit && CountVectorResultDrawables(result) < MaxFeatureDrawableCountPerRefresh)
+			{
+				VectorResult objectIdResult;
+				objectIdResult.generation = task.generation;
+				objectIdResult.vectorTargetUid = task.vectorTargetUid;
+				objectIdResult.layerUid = task.layerUid;
+				objectIdResult.layerId = task.vectorRequestItem.layerId;
+				objectIdResult.layerNumber = task.layerNumber;
+				if (FetchVectorByObjectIds(task, objectIdResult))
+				{
+					result = std::move(objectIdResult);
+				}
+			}
+			return true;
 		}
 
 		size_t featureBaseIndex = 0;
